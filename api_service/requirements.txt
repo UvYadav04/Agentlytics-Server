@@ -1,0 +1,3 @@
+-r ../shared/requirements.txt
+fastapi
+uvicorn[standard]

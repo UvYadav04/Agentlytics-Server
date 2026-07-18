@@ -1,0 +1,8 @@
+pydantic>=2
+python-dotenv
+motor
+redis
+arq
+boto3
+pyjwt
+google-auth
