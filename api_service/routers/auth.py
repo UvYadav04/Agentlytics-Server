@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 
@@ -9,6 +11,8 @@ from shared.models.user import COLLECTION as USERS
 from shared.models.user import User
 from shared.models.workspace import COLLECTION as WORKSPACES
 from shared.models.workspace import Workspace
+
+logger = logging.getLogger("api.auth")
 
 router = APIRouter(tags=["auth"])
 
@@ -48,7 +52,13 @@ def _set_auth_cookie(response: Response, token: str) -> None:
 async def google_login(body: GoogleLoginRequest, response: Response):
     try:
         profile = verify_google_id_token(body.id_token)
-    except Exception:
+    except Exception as exc:
+        # The client only ever sees the generic 401 below (don't leak verifier
+        # internals) - but log the real reason, since "invalid token" collapses
+        # a handful of very different root causes (wrong/missing
+        # GOOGLE_CLIENT_ID, expired token, clock skew, wrong token type) into
+        # one message that's impossible to debug blind.
+        logger.warning("Google ID token verification failed: %s", exc)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid Google token")
 
     db = get_db()

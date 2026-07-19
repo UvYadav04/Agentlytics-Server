@@ -98,7 +98,7 @@ async def cancel_upload(file_id: str, user: User = Depends(get_current_user)):
     file = await get_owned_file(file_id, user)
 
     await get_db()[FILES].update_one({"_id": file.id}, {"$set": {"status": "cancelled"}})
-    file.status = "cancelled"
+    file.status = "cancelled"   
 
     # Best-effort cleanup of whatever was (partially) uploaded.
     try:

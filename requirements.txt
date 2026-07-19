@@ -1,0 +1,4 @@
+-r shared/requirements.txt
+-r analyzerEngine/requirements.txt
+-r worker_service/requirements.txt
+-r api_service/requirements.txt

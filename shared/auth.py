@@ -59,7 +59,9 @@ def verify_google_id_token(token: str) -> GoogleProfile:
     Raises ValueError (via google-auth) on an invalid/expired/wrong-audience
     token - callers turn that into a 401."""
     client_id = get_settings().get("GOOGLE_CLIENT_ID")
+    print(client_id)
     idinfo = google_id_token.verify_oauth2_token(token, google_requests.Request(), client_id)
+    print(idinfo)
     return GoogleProfile(
         google_id=idinfo["sub"],
         email=idinfo["email"],

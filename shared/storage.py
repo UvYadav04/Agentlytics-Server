@@ -1,12 +1,14 @@
-"""Cloudflare R2 access for api_service (raw file uploads, chart/report
-downloads). R2 is S3-compatible, so this is a thin boto3 wrapper.
+"""AWS S3 access for api_service (raw file uploads, chart/report
+downloads). Thin boto3 wrapper.
 
 This is separate from Server/analyzerEngine/ingestion/storage/r2_store.py,
 which implements the engine's BaseObjectStore interface (write/read a
 pandas DataFrame as Parquet) and is only used inside worker_service when
-constructing the IngestionManager. This module deals in raw bytes/URLs and
-is used for the upload/download flow in Phase 3, plus chart/report file
-storage in Phase 7.
+constructing the IngestionManager. That module is currently unused
+(worker_service uses LocalParquetStore instead) - if you want the engine's
+Parquet storage on S3 too, wire up an S3ParquetStore there separately. This
+module deals in raw bytes/URLs and is used for the upload/download flow in
+Phase 3, plus chart/report file storage in Phase 7.
 """
 import uuid
 
@@ -22,19 +24,22 @@ def get_s3_client():
     global _s3_client
     if _s3_client is None:
         settings = get_settings()
+        print("AWS_ACCESS_KEY: ", settings.get("AWS_ACCESS_KEY"))
+        print("AWS_ACCESS_SECRET: ", settings.get("AWS_ACCESS_SECRET"))
+        print("AWS_REGION: ", settings.get("AWS_REGION"))
+        print("AWS_BUCKET: ", settings.get("AWS_BUCKET"))
         _s3_client = boto3.client(
             "s3",
-            endpoint_url=settings.get("R2_ENDPOINT_URL"),
-            aws_access_key_id=settings.get("R2_ACCESS_KEY_ID"),
-            aws_secret_access_key=settings.get("R2_SECRET_ACCESS_KEY"),
+            aws_access_key_id=settings.get("AWS_ACCESS_KEY"),
+            aws_secret_access_key=settings.get("AWS_ACCESS_SECRET"),
+            region_name=settings.get("AWS_REGION"),
             config=BotoConfig(signature_version="s3v4"),
-            region_name="auto",
         )
     return _s3_client
 
 
 def get_bucket_name() -> str:
-    return get_settings().get("R2_BUCKET_NAME", "data-analyzer")
+    return get_settings().get("AWS_BUCKET", "data-analyzer")
 
 
 def build_upload_key(workspace_id: str, file_id: str, filename: str) -> str:

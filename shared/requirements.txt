@@ -6,3 +6,4 @@ arq
 boto3
 pyjwt
 google-auth
+requests

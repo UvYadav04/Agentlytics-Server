@@ -21,7 +21,7 @@ class Settings:
         self.load_env()
         self._initialized = True
 
-    def __load_env(self):
+    def load_env(self):
         if os.path.exists(self.env_path):
             try:
                 with open(self.env_path, 'r', encoding='utf-8') as f:

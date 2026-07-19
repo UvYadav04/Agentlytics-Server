@@ -1,0 +1,58 @@
+# Build context for api_service and worker_service is Server/
+# (see docker-compose.yml / `docker build -f <service>/Dockerfile .`).
+# Anything listed here is excluded from that build context.
+
+# Virtual environments
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+
+# Python bytecode / caches
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+.tox/
+.coverage
+htmlcov/
+
+# Env / secrets - never bake these into an image layer
+.env
+**/.env
+.env.*
+!**/.env.example
+
+# Version control / editor / OS cruft
+.git/
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and local data
+*.log
+logs/
+*.sqlite3
+*.db
+
+# Docs / non-runtime files not needed in the image
+*.md
+!README.md
+
+# Docker-related files themselves
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+# Node artifacts (not used by Python services, but keep context clean if present)
+node_modules/

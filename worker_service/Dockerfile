@@ -11,8 +11,7 @@
 FROM python:3.12-slim
 
 # docker CLI client (talks to the mounted host socket) + build tools some
-# analyzerEngine deps (docling, sentence-transformers, chromadb) need at
-# install time.
+# analyzerEngine deps (docling, chromadb) need at install time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl ca-certificates \
     && curl -fsSL https://get.docker.com | sh \
@@ -23,6 +22,25 @@ WORKDIR /app
 COPY shared/requirements.txt shared/requirements.txt
 COPY analyzerEngine/requirements.txt analyzerEngine/requirements.txt
 COPY worker_service/requirements.txt worker_service/requirements.txt
+
+# docling's layout/OCR/chart-extraction models pull in torch (and, via
+# transformers' image processing, torchvision) transitively. The default PyPI
+# wheels drag along the full CUDA runtime (nvidia-cublas/cudnn/nccl/... several
+# GB) even though this container has no GPU. Install CPU-only torch AND
+# torchvision together, from the same index, in one command - torchvision's
+# compiled ops must match the exact torch build they're loaded against, or you
+# get "operator torchvision::nms does not exist" at import time. Installing
+# them separately (or torch here + torchvision resolved later from PyPI by
+# docling's own dependency chain) breaks that pairing.
+# (The reranker itself no longer needs torch - it now calls the Hugging Face
+# Inference API instead of running a local sentence-transformers model.)
+#
+# Also make the CPU index available for the *rest* of the install below - if
+# docling's own version constraints don't match what we just installed, pip
+# would otherwise silently re-resolve torch/torchvision from default PyPI
+# (bringing the CUDA wheels back) instead of picking a compatible CPU build.
+ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r worker_service/requirements.txt
 
 COPY shared/ shared/

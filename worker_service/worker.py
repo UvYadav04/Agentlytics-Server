@@ -21,6 +21,16 @@ from shared.redis_client import close_redis, get_arq_redis_settings
 
 logging.basicConfig(level=logging.INFO)
 
+# autogen_core's own structured-tracing logger (distinct from our compact
+# agents/logger.py output) dumps one full LLMCall record per model call -
+# every tool's complete JSON schema plus the whole accumulated message
+# history so far, repeated in full on every iteration. At INFO it inherits
+# root's level from basicConfig above and floods the terminal/log file with
+# that, growing every call. Silence just this logger so our own "[tool
+# call] ..." / "[tool result] ..." / assistant text lines (see
+# analyzerEngine/agents/logger.py) stay the only per-step activity logged.
+logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
+
 
 async def on_startup(ctx):
     await ensure_indexes()
