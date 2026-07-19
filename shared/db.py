@@ -51,6 +51,8 @@ async def ensure_indexes() -> None:
     await db["dashboards"].create_index("workspace_id")
     await db["reports"].create_index("workspace_id")
     await db["usage"].create_index("user_id", unique=True)
+    await db["query_shadow_logs"].create_index("chat_id")
+    await db["query_shadow_logs"].create_index([("tier", 1), ("created_at", -1)])
 
 
 async def close_client() -> None:

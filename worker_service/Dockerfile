@@ -11,9 +11,16 @@
 FROM python:3.12-slim
 
 # docker CLI client (talks to the mounted host socket) + build tools some
-# analyzerEngine deps (docling, chromadb) need at install time.
+# analyzerEngine deps (docling, chromadb) need at install time, plus the
+# graphics libs docling's layout/table-structure models need at RUNTIME:
+# they pull in opencv-python (via docling-ibm-models), and cv2 dynamically
+# links against libGL/libglib even though nothing here ever renders
+# anything - python:3.12-slim has neither, so `import cv2` fails with
+# "libGL.so.1: cannot open shared object file" the moment a PDF is
+# ingested, not at container build/pip-install time (that's why this only
+# ever surfaces here, not in `pip install`'s own output).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates \
+    build-essential curl ca-certificates libgl1 libglib2.0-0 \
     && curl -fsSL https://get.docker.com | sh \
     && rm -rf /var/lib/apt/lists/*
 

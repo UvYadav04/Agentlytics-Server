@@ -7,3 +7,8 @@ boto3
 pyjwt
 google-auth
 requests
+
+# Optional - only needed if QUERY_ROUTER_HF_ENABLED=true (see
+# shared/query_router.py). Left commented out so the HF tier stays fully
+# optional/lazy; uncomment once you're ready to enable it.
+# sentence-transformers

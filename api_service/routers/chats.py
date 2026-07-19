@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -14,10 +15,61 @@ from shared.models.investigation import COLLECTION as INVESTIGATIONS
 from shared.models.investigation import Investigation
 from shared.models.message import COLLECTION as MESSAGES
 from shared.models.message import Message
+from shared.models.query_shadow_log import COLLECTION as QUERY_SHADOW_LOGS
+from shared.models.query_shadow_log import QueryShadowLog
 from shared.models.user import User
+from shared.query_router import classify as classify_query
 from shared.redis_client import get_arq_pool, get_redis, investigation_channel
 
 logger = logging.getLogger("api.chats")
+shadow_logger = logging.getLogger("query_router.shadow")
+
+# Shadow-test only: classification never gates the real request, so it runs
+# fire-and-forget. Keep a reference to each task so it isn't garbage
+# collected mid-flight (a known asyncio footgun for "unawaited" tasks).
+_shadow_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_shadow_classification(
+    *, chat_id: str, message_id: str, user_id: str, query: str, has_prior_context: bool,
+) -> None:
+    task = asyncio.create_task(
+        _shadow_classify_and_log(chat_id, message_id, user_id, query, has_prior_context)
+    )
+    _shadow_tasks.add(task)
+    task.add_done_callback(_shadow_tasks.discard)
+
+
+async def _shadow_classify_and_log(
+    chat_id: str, message_id: str, user_id: str, query: str, has_prior_context: bool,
+) -> None:
+    try:
+        result = classify_query(query, has_prior_context)
+        shadow_logger.info(
+            "chat=%s message=%s tier=%s intent=%s score=%.3f prior_context=%s "
+            "context_gated=%s would_shortcircuit=%s latency_ms=%.2f",
+            chat_id, message_id, result.tier, result.intent, result.score,
+            has_prior_context, result.context_gated, result.would_shortcircuit, result.latency_ms,
+        )
+        log = QueryShadowLog(
+            chat_id=chat_id,
+            message_id=message_id,
+            user_id=user_id,
+            query=query,
+            normalized=result.normalized,
+            tier=result.tier,
+            intent=result.intent,
+            score=result.score,
+            has_prior_context=has_prior_context,
+            context_gated=result.context_gated,
+            would_shortcircuit=result.would_shortcircuit,
+            latency_ms=result.latency_ms,
+            error=result.error,
+        )
+        await get_db()[QUERY_SHADOW_LOGS].insert_one(log.to_mongo())
+    except Exception:
+        # Shadow logging must never affect the real request path.
+        shadow_logger.exception("shadow classification failed for message %s", message_id)
 
 router = APIRouter(tags=["chats"])
 
@@ -111,6 +163,9 @@ async def active_investigation(chat_id: str, user: User = Depends(get_current_us
 @router.post("/chats/{chat_id}/messages", response_model=SendMessageResponse)
 async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depends(get_current_user)):
     chat = await get_owned_chat(chat_id, user)
+    # Computed before either message insert below, so it reflects prior
+    # turns only - not the message we're about to write.
+    has_prior_context = await get_db()[MESSAGES].count_documents({"chat_id": chat_id}) > 0
 
     if not await usage.has_message_capacity(user.id):
         message = Message(chat_id=chat_id, role="user", content=body.content)
@@ -121,6 +176,15 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
 
     message = Message(chat_id=chat_id, role="user", content=body.content)
     await get_db()[MESSAGES].insert_one(message.to_mongo())
+    # Shadow test only - classifies the query and logs the decision, but
+    # never affects routing: the arq enqueue below always runs regardless.
+    _schedule_shadow_classification(
+        chat_id=chat_id,
+        message_id=message.id,
+        user_id=user.id,
+        query=body.content,
+        has_prior_context=has_prior_context,
+    )
 
     investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
     await get_db()[INVESTIGATIONS].insert_one(investigation.to_mongo())

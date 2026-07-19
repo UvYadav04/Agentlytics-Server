@@ -22,15 +22,17 @@ from worker_service import engine_bootstrap  # noqa: F401
 
 from analyzerEngine.agents.orchestrator.agent import InvestigationCancelled, OrchestratorAgent
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
-from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog
+from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog, table_catalog_entry
 from analyzerEngine.tools.orchestrator.memory import LongTermMemory
 from analyzerEngine.tools.orchestrator.models import FileCatalogEntry
+from analyzerEngine.tools.orchestrator.thread_summary import update_summary
 from analyzerEngine.vectordb.chroma_store import ChromaVectorStore
 
 from shared import usage
 from shared.db import get_db
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
+from shared.models.chat import COLLECTION as CHATS
 from shared.models.file import COLLECTION as FILES
 from shared.models.investigation import COLLECTION as INVESTIGATIONS
 from shared.models.investigation import InvestigationEvent
@@ -40,6 +42,13 @@ from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.redis_client import get_redis, investigation_channel
 from shared.storage import build_chart_key, build_report_key, get_bucket_name, get_s3_client, new_file_id
+
+# recent_turns keeps the last this-many {query, response} pairs verbatim on
+# the Chat doc; anything older only survives through Chat.summary (see
+# _update_chat_continuity). files_used/files_created are capped separately
+# so a very long chat's lists can't grow without bound either.
+RECENT_TURNS_LIMIT = 5
+FILE_LIST_LIMIT = 30
 
 logger = logging.getLogger("worker.investigation")
 
@@ -64,16 +73,12 @@ async def _build_catalog(db, workspace_id: str) -> FileCatalog:
             columns=doc.get("columns"),
         ))
         for table in doc.get("extracted_tables") or []:
-            catalog.add_entry(FileCatalogEntry(
-                file_id=table["file_id"],
-                filename=f"{doc['filename']} (table, page {table.get('page')})",
-                file_type="table",
+            catalog.add_entry(table_catalog_entry(
+                table,
+                source_id=doc["_id"],
+                source_filename=doc["filename"],
+                source_file_type=doc["file_type"],
                 uploaded_at=doc["uploaded_at"],
-                size_bytes=0,
-                output_ref=table["output_ref"],
-                row_count=table.get("row_count"),
-                columns=table.get("columns"),
-                tags=["from_pdf", f"source:{doc['_id']}"],
             ))
     return catalog
 
@@ -91,6 +96,64 @@ async def _append_event(db, investigation_id: str, event_type: str, message: str
 async def _is_cancelled(db, investigation_id: str) -> bool:
     doc = await db[INVESTIGATIONS].find_one({"_id": investigation_id}, {"cancel_requested": 1})
     return bool(doc and doc.get("cancel_requested"))
+
+
+async def _thread_context(db, chat_id: str) -> dict:
+    """Read side of thread continuity - handed to OrchestratorAgent.run() as
+    `thread_context` so this investigation's task prompt includes what
+    happened earlier in this same chat. See _update_chat_continuity for the
+    write side."""
+    doc = await db[CHATS].find_one(
+        {"_id": chat_id}, {"summary": 1, "recent_turns": 1, "files_used": 1, "files_created": 1},
+    ) or {}
+    return {
+        "summary": doc.get("summary", ""),
+        "recent_turns": doc.get("recent_turns", []),
+        "files_used": doc.get("files_used", []),
+        "files_created": doc.get("files_created", []),
+    }
+
+
+def _merge_capped(existing: list, new_items: list, cap: int) -> list:
+    merged = list(existing)
+    for item in new_items or []:
+        if item not in merged:
+            merged.append(item)
+    return merged[-cap:]
+
+
+async def _update_chat_continuity(db, chat_id: str, query: str, result) -> None:
+    """Write side of thread continuity - called AFTER the investigation's own
+    completion is already recorded and broadcast (see call site in
+    run_investigation), so the summary LLM call below never delays the user
+    seeing their answer. A failure here only means the next message in this
+    chat starts from a slightly stale summary, never that this investigation
+    itself fails - see the try/except around the LLM call."""
+    doc = await db[CHATS].find_one(
+        {"_id": chat_id}, {"summary": 1, "recent_turns": 1, "files_used": 1, "files_created": 1},
+    ) or {}
+
+    recent_turns = (doc.get("recent_turns", []) + [{"query": query, "response": result.final_answer}])
+    recent_turns = recent_turns[-RECENT_TURNS_LIMIT:]
+
+    files_used = _merge_capped(doc.get("files_used", []), result.files_used, FILE_LIST_LIMIT)
+    files_created = _merge_capped(doc.get("files_created", []), result.artifact_refs, FILE_LIST_LIMIT)
+
+    try:
+        new_summary = await update_summary(doc.get("summary", ""), query, result.final_answer)
+    except Exception:
+        logger.exception("failed to update chat summary for chat %s - keeping previous summary", chat_id)
+        new_summary = doc.get("summary", "")
+
+    await db[CHATS].update_one(
+        {"_id": chat_id},
+        {"$set": {
+            "summary": new_summary,
+            "files_used": files_used,
+            "files_created": files_created,
+            "recent_turns": recent_turns,
+        }},
+    )
 
 
 def _artifact_kind(path: str) -> str | None:
@@ -199,8 +262,10 @@ async def run_investigation(
     )
 
     try:
+        thread_context = await _thread_context(db, chat_id)
         result = await orchestrator.run(
-            query, workspace_id=workspace_id, on_event=on_event, cancel_check=cancel_check,
+            query, workspace_id=workspace_id, thread_context=thread_context,
+            on_event=on_event, cancel_check=cancel_check,
         )
     except InvestigationCancelled:
         await db[INVESTIGATIONS].update_one(
@@ -242,3 +307,8 @@ async def run_investigation(
         {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id},
     )
     logger.info("investigation %s completed", investigation_id)
+
+    # Strictly after the above - the user already has their answer (SSE
+    # "completed" event just went out) before this starts, so the summary
+    # LLM call's latency is never on the user-facing critical path.
+    await _update_chat_continuity(db, chat_id, query, result)
