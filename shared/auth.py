@@ -57,11 +57,22 @@ def verify_google_id_token(token: str) -> GoogleProfile:
     """Verifies a Google-issued ID token (from the frontend's client-side
     Google Sign-In flow) against Google's public keys + our client ID.
     Raises ValueError (via google-auth) on an invalid/expired/wrong-audience
-    token - callers turn that into a 401."""
+    token - callers turn that into a 401.
+
+    clock_skew_in_seconds=10: google-auth's verify_oauth2_token() defaults this to 0 - no
+    tolerance at all for the verifying machine's clock running behind Google's. In a
+    container (or a Docker Desktop/WSL2 VM, whose clock is a common source of drift after
+    the host sleeps/resumes) even a few seconds of skew then hard-fails every login with
+    "Token used too early" (the `iat` claim, timestamped by Google's clock, looks like it's
+    in the future relative to ours). 10s matches google-auth's own long-standing internal
+    default skew elsewhere (_CLOCK_SKEW_SECS) and is what this parameter exists for -
+    this doesn't fix a genuinely wrong clock, it just stops small/transient drift from
+    taking login down. If this error keeps recurring, check the host/VM's clock sync
+    (`wsl --shutdown` + restart Docker Desktop resyncs the WSL2 VM's clock on Windows)."""
     client_id = get_settings().get("GOOGLE_CLIENT_ID")
-    print(client_id)
-    idinfo = google_id_token.verify_oauth2_token(token, google_requests.Request(), client_id)
-    print(idinfo)
+    idinfo = google_id_token.verify_oauth2_token(
+        token, google_requests.Request(), client_id, clock_skew_in_seconds=10,
+    )
     return GoogleProfile(
         google_id=idinfo["sub"],
         email=idinfo["email"],

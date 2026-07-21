@@ -57,6 +57,22 @@ PARQUET_ROOT = _env_or_default("PARQUET_ROOT", _DATA_DIR / "parquet")
 # LongTermMemory (store_user_info/recall_user_info) is one JSON file per
 # scope - we scope it per-user (see tasks/investigation.py) so preferences
 # don't leak across users, since the engine's default is a single global file.
+#
+# IMPORTANT if you containerize worker_service (docker-compose.yml): the
+# `_DATA_DIR / "memory"` default below lives on the container's own writable
+# layer, which is thrown away on every rebuild/redeploy/recreation - unlike
+# PARQUET_ROOT above, nothing backs it with a real host directory unless you
+# set MEMORY_ROOT explicitly to a bind-mounted path (see docker-compose.yml's
+# /data/memory mount) the same way PARQUET_ROOT is set. Deliberately NOT
+# defaulted to a subfolder of PARQUET_ROOT: PythonSandbox bind-mounts the
+# entirety of `root_dir` (== PARQUET_ROOT) read-write into every sandboxed
+# code execution (see tools/tabular/sandbox_executor.py) - nesting per-user
+# memory files under there would hand model-generated code read/write access
+# to every user's stored preferences, not just the parquet tables it was
+# assigned. Keeping MEMORY_ROOT a sibling path (its own bind mount) avoids
+# that exposure entirely. Running worker_service as a bare process (not
+# containerized) sidesteps the whole issue, same as PARQUET_ROOT's note above
+# - the default below is already on real, persistent local disk in that case.
 MEMORY_ROOT = _env_or_default("MEMORY_ROOT", _DATA_DIR / "memory")
 
 # Scratch space for report/dashboard/csv generation (ReportingTools writes

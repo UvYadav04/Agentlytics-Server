@@ -9,17 +9,24 @@ from pydantic import BaseModel
 from api_service.deps import get_current_user, get_owned_chat, get_owned_investigation, get_owned_workspace
 from shared import usage
 from shared.db import get_db
+from shared.models.chart import COLLECTION as CHARTS
+from shared.models.chart import Chart
 from shared.models.chat import COLLECTION as CHATS
 from shared.models.chat import Chat
+from shared.models.file import COLLECTION as FILES
+from shared.models.file import File
 from shared.models.investigation import COLLECTION as INVESTIGATIONS
 from shared.models.investigation import Investigation
 from shared.models.message import COLLECTION as MESSAGES
 from shared.models.message import Message
 from shared.models.query_shadow_log import COLLECTION as QUERY_SHADOW_LOGS
 from shared.models.query_shadow_log import QueryShadowLog
+from shared.models.report import COLLECTION as REPORTS
+from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
 from shared.redis_client import get_arq_pool, get_redis, investigation_channel
+from shared.storage import delete_object
 
 logger = logging.getLogger("api.chats")
 shadow_logger = logging.getLogger("query_router.shadow")
@@ -100,8 +107,15 @@ class CreateChatRequest(BaseModel):
     title: str = "New chat"
 
 
+class UpdateChatRequest(BaseModel):
+    title: str
+
+
 class SendMessageRequest(BaseModel):
     content: str
+    # File ids the user explicitly referenced via "@" in the client's message
+    # composer (see InputBar.tsx) - passed through to the worker job below.
+    file_ids: list[str] = []
 
 
 class SendMessageResponse(BaseModel):
@@ -137,6 +151,102 @@ async def list_chats(workspace_id: str, user: User = Depends(get_current_user)):
     cursor = get_db()[CHATS].find({"workspace_id": workspace_id}).sort("created_at", -1)
     docs = await cursor.to_list(length=500)
     return [_chat_out(Chat.from_mongo(d)) for d in docs]
+
+
+@router.patch("/chats/{chat_id}", response_model=ChatOut)
+async def rename_chat(chat_id: str, body: UpdateChatRequest, user: User = Depends(get_current_user)):
+    chat = await get_owned_chat(chat_id, user)
+    title = body.title.strip() or "New chat"
+    await get_db()[CHATS].update_one({"_id": chat.id}, {"$set": {"title": title}})
+    chat.title = title
+    return _chat_out(chat)
+
+
+@router.delete("/chats/{chat_id}")
+async def delete_chat(chat_id: str, user: User = Depends(get_current_user)):
+    """Deleting a chat cascades to everything it produced: its messages, the
+    investigations behind them, and the charts/reports those investigations
+    generated (all keyed by message_id, so they're never shared with another
+    chat - safe to hard-delete outright).
+
+    Files are the one exception: they're workspace-level (see shared/models/file.py -
+    no chat_id) and can be reused across chats via Chat.files_used/files_created,
+    so we only hard-delete the ones this chat touched that no *other* chat in
+    the same workspace still references. Otherwise deleting one chat could
+    silently pull a file out from under another chat's history.
+    """
+    chat = await get_owned_chat(chat_id, user)
+    db = get_db()
+
+    message_docs = await db[MESSAGES].find({"chat_id": chat_id}, {"_id": 1}).to_list(length=5000)
+    message_ids = [d["_id"] for d in message_docs]
+
+    chart_docs = (
+        await db[CHARTS].find({"message_id": {"$in": message_ids}}).to_list(length=5000)
+        if message_ids else []
+    )
+    for doc in chart_docs:
+        try:
+            delete_object(Chart.from_mongo(doc).storage_key)
+        except Exception:
+            pass
+    if chart_docs:
+        await db[CHARTS].delete_many({"_id": {"$in": [d["_id"] for d in chart_docs]}})
+
+    report_docs = (
+        await db[REPORTS].find({"message_id": {"$in": message_ids}}).to_list(length=5000)
+        if message_ids else []
+    )
+    for doc in report_docs:
+        report = Report.from_mongo(doc)
+        if report.storage_key:
+            try:
+                delete_object(report.storage_key)
+            except Exception:
+                pass
+    if report_docs:
+        await db[REPORTS].delete_many({"_id": {"$in": [d["_id"] for d in report_docs]}})
+
+    candidate_file_ids = set(chat.files_used) | set(chat.files_created)
+    if candidate_file_ids:
+        other_chats = await db[CHATS].find(
+            {
+                "workspace_id": chat.workspace_id,
+                "_id": {"$ne": chat.id},
+                "$or": [
+                    {"files_used": {"$in": list(candidate_file_ids)}},
+                    {"files_created": {"$in": list(candidate_file_ids)}},
+                ],
+            },
+            {"files_used": 1, "files_created": 1},
+        ).to_list(length=5000)
+        still_referenced: set = set()
+        for doc in other_chats:
+            still_referenced.update(doc.get("files_used", []))
+            still_referenced.update(doc.get("files_created", []))
+        orphaned_file_ids = candidate_file_ids - still_referenced
+
+        if orphaned_file_ids:
+            file_docs = await db[FILES].find({"_id": {"$in": list(orphaned_file_ids)}}).to_list(length=5000)
+            for doc in file_docs:
+                file = File.from_mongo(doc)
+                try:
+                    delete_object(file.storage_key)
+                except Exception:
+                    pass
+                if file.output_ref:
+                    try:
+                        delete_object(file.output_ref)
+                    except Exception:
+                        pass
+            await db[FILES].delete_many({"_id": {"$in": list(orphaned_file_ids)}})
+
+    await db[INVESTIGATIONS].delete_many({"chat_id": chat_id})
+    await db[QUERY_SHADOW_LOGS].delete_many({"chat_id": chat_id})
+    await db[MESSAGES].delete_many({"chat_id": chat_id})
+    await db[CHATS].delete_one({"_id": chat.id})
+
+    return {"ok": True}
 
 
 @router.get("/chats/{chat_id}/messages", response_model=list[MessageOut])
@@ -197,6 +307,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         workspace_id=chat.workspace_id,
         user_id=user.id,
         query=body.content,
+        file_ids=body.file_ids,
     )
 
     return SendMessageResponse(message_id=message.id, investigation_id=investigation.id)

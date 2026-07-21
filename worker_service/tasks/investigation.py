@@ -1,4 +1,4 @@
-"""arq job: run_investigation(ctx, investigation_id, chat_id, workspace_id, user_id, query).
+"""arq job: run_investigation(ctx, investigation_id, chat_id, workspace_id, user_id, query, file_ids).
 
 Rebuilds a shallow FileCatalog from Mongo (only "ready" files, see
 agent_tools_specification.md Section 1.4), runs the engine's
@@ -33,6 +33,8 @@ from shared.db import get_db
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
 from shared.models.chat import COLLECTION as CHATS
+from shared.models.dashboard import COLLECTION as DASHBOARDS
+from shared.models.dashboard import ChartConfig, Dashboard
 from shared.models.file import COLLECTION as FILES
 from shared.models.investigation import COLLECTION as INVESTIGATIONS
 from shared.models.investigation import InvestigationEvent
@@ -57,10 +59,73 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _build_catalog(db, workspace_id: str) -> FileCatalog:
+def _looks_like_local_parquet_ref(ref: str) -> bool:
+    """Not every ingestor's main output_ref is a real LocalParquetStore path: csv/json write
+    one parquet per file and store a real path there, but PDFIngestor's output_ref is a
+    vector-store pointer ("workspace_{id}", not a filesystem path at all) and XLSXIngestor's
+    is deliberately "" - a workbook has no single "whole file" artifact, only its per-table
+    entries do (see xlsx_ingestor.py's comment). storage.exists() on either of those against
+    local disk is always False, which - before this check - flipped every freshly-ingested
+    PDF/xlsx file to "failed" on its very first investigation even though nothing was
+    actually missing (see the false positive this fixes: 'Product-Sales-Region.xlsx' marked
+    missing seconds after ingesting it successfully). Every extracted_tables[i].output_ref,
+    by contrast, always IS a real LocalParquetStore path regardless of file_type, so those
+    are still checked unconditionally below - this only gates the main file-level ref."""
+    return bool(ref) and ref.endswith(".parquet")
+
+
+async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> tuple[FileCatalog, list[str]]:
+    """Rebuilds the FileCatalog from Mongo's "ready" files - but doesn't trust Mongo blindly.
+    `status: "ready"` only means the parquet existed on disk at ingestion time. PARQUET_ROOT
+    (docker-compose.yml's /data/parquet bind mount, see engine_bootstrap.py) is a persistent
+    HOST directory that survives container rebuilds/redeploys/recreation, so in normal
+    operation this disk and Mongo - cloud Atlas, also durable - stay in agreement. This check
+    exists for the remaining edge cases where they don't (the host directory was deleted or
+    repointed outside of a normal deploy, a fresh machine/dev environment doesn't have the
+    volume populated yet, etc.) - Mongo has no way to know about any of that on its own.
+    Previously we handed those file_ids straight to the orchestrator and only found out via an
+    IO Error deep inside invoke_tabular_agent (see the "No files found that match the pattern
+    ..." failures this replaces).
+
+    So every output_ref (the main file's and each extracted table's) is checked against this
+    disk before being added to the catalog. Anything missing is flipped back to "failed" here -
+    once, cheaply - so it stops being offered to every future investigation until the user
+    re-uploads it, and its filename is returned so the caller can tell the user why it's absent.
+    """
     catalog = FileCatalog()
+    stale_ids: list[str] = []
+    skipped_filenames: list[str] = []
+
     cursor = db[FILES].find({"workspace_id": workspace_id, "status": "ready"})
     async for doc in cursor:
+        output_ref = doc.get("output_ref") or ""
+        if _looks_like_local_parquet_ref(output_ref) and not storage.exists(output_ref):
+            stale_ids.append(doc["_id"])
+            skipped_filenames.append(doc["filename"])
+            continue
+
+        table_entries = []
+        tables_ok = True
+        # for table in doc.get("extracted_tables") or []:
+        #     if not storage.exists(table.get("output_ref") or ""):
+        #         tables_ok = False
+        #         break
+        #     table_entries.append(table_catalog_entry(
+        #         table,
+        #         source_id=doc["_id"],
+        #         source_filename=doc["filename"],
+        #         source_file_type=doc["file_type"],
+        #         uploaded_at=doc["uploaded_at"],
+        #     ))
+
+        if not tables_ok:
+            # Same disk, same ingestion run as the main file - if one table's parquet is
+            # gone the rest almost certainly are too. Drop the whole file rather than
+            # handing the orchestrator a partial, inconsistent table set.
+            stale_ids.append(doc["_id"])
+            skipped_filenames.append(doc["filename"])
+            continue
+
         catalog.add_entry(FileCatalogEntry(
             file_id=doc["_id"],
             filename=doc["filename"],
@@ -72,15 +137,33 @@ async def _build_catalog(db, workspace_id: str) -> FileCatalog:
             page_count=doc.get("page_count"),
             columns=doc.get("columns"),
         ))
-        for table in doc.get("extracted_tables") or []:
-            catalog.add_entry(table_catalog_entry(
-                table,
-                source_id=doc["_id"],
-                source_filename=doc["filename"],
-                source_file_type=doc["file_type"],
-                uploaded_at=doc["uploaded_at"],
-            ))
-    return catalog
+        for entry in table_entries:
+            catalog.add_entry(entry)
+
+    # if stale_ids:
+        # Safe to persist this back to Mongo (previously left commented out): PARQUET_ROOT is
+        # a confirmed-persistent bind mount (see docstring above and docker-compose.yml), so a
+        # missing output_ref reliably means the file is genuinely gone, not just a transient
+        # artifact of a redeploy. Marking it "failed" once here - rather than leaving Mongo
+        # saying "ready" forever - stops every future investigation from silently re-doing this
+        # same disk check and re-reporting the same skipped file to the user on every turn.
+        # await db[FILES].update_many(
+        #     {"_id": {"$in": stale_ids}},
+        #     {"$set": {
+        #         "status": "failed",
+        #         "error": (
+        #             "Parquet output missing from local storage - the file's disk data is gone "
+        #             "even though the persistent PARQUET_ROOT volume is intact. Please re-upload "
+        #             "this file."
+        #         ),
+        #     }},
+        # )
+        # logger.warning(
+        #     "workspace %s: %d file(s) marked failed - output_ref missing on disk: %s",
+        #     workspace_id, len(stale_ids), skipped_filenames,
+        # )
+
+    return catalog, skipped_filenames
 
 
 async def _append_event(db, investigation_id: str, event_type: str, message: str, data: dict = None) -> None:
@@ -157,6 +240,11 @@ async def _update_chat_continuity(db, chat_id: str, query: str, result) -> None:
 
 
 def _artifact_kind(path: str) -> str | None:
+    # A real-time dashboard (ReportingTools.generate_realtime_dashboard_bundle) returns its
+    # manifest.json path instead of an .html path specifically so it's distinguishable here
+    # from an ordinary single chart - see _persist_dashboard_bundle below.
+    if os.path.basename(path) == "manifest.json":
+        return "dashboard_bundle"
     ext = os.path.splitext(path)[1].lower()
     if ext == ".html":
         return "chart"
@@ -170,12 +258,86 @@ def _artifact_title(path: str) -> str:
     return name or "Untitled"
 
 
+async def _persist_dashboard_bundle(
+    db, s3, bucket: str, workspace_id: str, investigation_id: str, message_id: str, user_id: str, manifest_path: str,
+) -> list:
+    """Handles the "dashboard_bundle" artifact kind - see ReportingTools.
+    generate_realtime_dashboard_bundle() and _artifact_kind() above. Uploads one HTML file
+    per chart (each gets its own Chart doc, same chart-capacity gating as an ordinary
+    chart), then - only if at least one chart actually made it past that gate - writes the
+    Dashboard doc that ties them together with the transform_script/file_ids a later
+    refresh needs. Returns the chart_ids it created, the same shape _persist_artifacts
+    already returns for a plain chart, so its caller doesn't need to know real-time
+    dashboards are a different code path."""
+    folder = os.path.dirname(manifest_path)
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    chart_ids: list = []
+    chart_configs: list[ChartConfig] = []
+
+    for chart_meta in manifest.get("charts", []):
+        if not await usage.has_chart_capacity(user_id):
+            await _append_event(
+                db, investigation_id, "status",
+                "Chart limit reached - some dashboard charts generated but not saved.",
+            )
+            break
+
+        html_path = os.path.join(folder, chart_meta["html_filename"])
+        if not os.path.isfile(html_path):
+            continue
+
+        chart_id = new_file_id()
+        key = build_chart_key(workspace_id, chart_id)
+        s3.upload_file(html_path, bucket, key, ExtraArgs={"ContentType": "text/html"})
+        chart = Chart(
+            id=chart_id, workspace_id=workspace_id, message_id=message_id,
+            title=chart_meta.get("title") or "Untitled chart", storage_key=key,
+        )
+        await db[CHARTS].insert_one(chart.to_mongo())
+        await usage.increment_charts(user_id)
+        chart_ids.append(chart_id)
+        chart_configs.append(ChartConfig(
+            chart_id=chart_id,
+            name=chart_meta["name"],
+            chart_type=chart_meta.get("chart_type", "bar"),
+            title=chart_meta.get("title"),
+            label_column=chart_meta.get("label_column"),
+            value_columns=chart_meta.get("value_columns"),
+            time_column=chart_meta.get("time_column"),
+            series_column=chart_meta.get("series_column"),
+            value_column=chart_meta.get("value_column"),
+            x_column=chart_meta.get("x_column"),
+            y_column=chart_meta.get("y_column"),
+            z_column=chart_meta.get("z_column"),
+        ))
+
+    if not chart_configs:
+        # Every chart hit the cap (or the bundle came in empty) - nothing to tie
+        # together, so don't create an empty, unrefreshable Dashboard doc.
+        return chart_ids
+
+    dashboard = Dashboard(
+        workspace_id=workspace_id,
+        name=manifest.get("title") or "Untitled dashboard",
+        chart_ids=chart_ids,
+        real_time=True,
+        file_ids=manifest.get("file_ids") or [],
+        transform_script=manifest.get("transform_script"),
+        charts=chart_configs,
+        last_refreshed_at=datetime.now(timezone.utc),
+    )
+    await db[DASHBOARDS].insert_one(dashboard.to_mongo())
+    return chart_ids
+
+
 async def _persist_artifacts(
     db, workspace_id: str, investigation_id: str, message_id: str, user_id: str, artifact_refs: list,
 ) -> tuple[list, str | None]:
     """Uploads local files the orchestrator produced (dashboards/reports/csv
     exports - see tools/reporting/reporting_tools.py) to R2 and creates
-    Chart/Report docs, respecting the free-tier caps. Hitting a cap doesn't
+    Chart/Report/Dashboard docs, respecting the free-tier caps. Hitting a cap doesn't
     delete the generated file or the answer text that already mentions it -
     it just skips creating the Mongo doc/R2 upload for that one artifact, so
     it won't be persisted/browsable but the user's answer is unaffected."""
@@ -209,6 +371,10 @@ async def _persist_artifacts(
                 await db[CHARTS].insert_one(chart.to_mongo())
                 await usage.increment_charts(user_id)
                 chart_ids.append(chart.id)
+            elif kind == "dashboard_bundle":
+                chart_ids.extend(await _persist_dashboard_bundle(
+                    db, s3, bucket, workspace_id, investigation_id, message_id, user_id, ref,
+                ))
             else:
                 if not await usage.has_report_capacity(user_id):
                     await _append_event(
@@ -243,7 +409,15 @@ async def _persist_artifacts(
 
 async def run_investigation(
     ctx, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str,
+    file_ids: list[str] | None = None,
 ) -> None:
+    # File ids the user referenced via "@" in the client's message composer
+    # (see api_service/routers/chats.py's SendMessageRequest.file_ids). Just
+    # extracted here for now - not yet wired into the catalog/orchestrator.
+    mentioned_file_ids = file_ids or []
+    if mentioned_file_ids:
+        logger.info("investigation %s: received %d @-mentioned file id(s): %s",
+                    investigation_id, len(mentioned_file_ids), mentioned_file_ids)
     db = get_db()
 
     async def on_event(event: dict) -> None:
@@ -252,14 +426,24 @@ async def run_investigation(
     async def cancel_check() -> bool:
         return await _is_cancelled(db, investigation_id)
 
-    catalog = await _build_catalog(db, workspace_id)
     storage = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
+    catalog, skipped_files = await _build_catalog(db, workspace_id, storage)
     vector_store = ChromaVectorStore()
     memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
     orchestrator = OrchestratorAgent(
         catalog, vector_store=vector_store, memory=memory, storage=storage,
         reports_dir=engine_bootstrap.REPORTS_ROOT,
     )
+
+    if skipped_files:
+        await on_event({
+            "type": "status",
+            "message": (
+                f"{len(skipped_files)} file(s) need to be re-uploaded (missing from local "
+                f"storage) and were excluded from this investigation: {', '.join(skipped_files)}"
+            ),
+            "data": {"skipped_files": skipped_files},
+        })
 
     try:
         thread_context = await _thread_context(db, chat_id)

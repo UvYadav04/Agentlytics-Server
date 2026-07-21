@@ -13,6 +13,7 @@ Phase 5).
 import logging
 
 from worker_service import engine_bootstrap  # noqa: F401  (sys.path setup, see module docstring)
+from worker_service.tasks.dashboard_refresh import refresh_dashboard
 from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation
 
@@ -43,14 +44,24 @@ async def on_shutdown(ctx):
 
 
 class WorkerSettings:
-    functions = [run_ingestion, run_investigation]
+    functions = [run_ingestion, run_investigation, refresh_dashboard]
     redis_settings = get_arq_redis_settings()
     on_startup = on_startup
     on_shutdown = on_shutdown
     # Investigations run a multi-agent tool-calling loop (up to 25
     # orchestrator iterations, each possibly delegating to a subagent with
     # its own loop) - the default 300s arq job timeout is too tight.
-    job_timeout = 900
+    # PDF ingestion needs headroom too: docling's CPU layout/table pipeline measured
+    # 858.79s for a single dense SEC-filing PDF (see pdf_ingestor.py's _convert_cached -
+    # before that fix, ingestion ran that conversion twice per file, which is what
+    # actually blew the old 900s ceiling). One conversion alone can still land close to
+    # 900s on a big enough document, so this leaves real margin instead of a near-exact
+    # race. asyncio.to_thread work (docling conversion) isn't actually killable on
+    # timeout - the awaiting coroutine gets cancelled but the OS thread runs on orphaned
+    # - so a tighter timeout doesn't fail faster/cheaper, it just fails messier (see the
+    # "No such file or directory" secondary error from the temp file being cleaned up out
+    # from under the still-running thread). Better to just not hit it.
+    job_timeout = 1800
     # Ingestion (esp. PDF/docling) and investigations are both
     # CPU/LLM-latency heavy, not memory-cheap - keep concurrency modest by
     # default; raise once you've checked memory headroom.
