@@ -98,6 +98,7 @@ async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> t
 
     cursor = db[FILES].find({"workspace_id": workspace_id, "status": "ready"})
     async for doc in cursor:
+        print("doc : ",doc)
         output_ref = doc.get("output_ref") or ""
         if _looks_like_local_parquet_ref(output_ref) and not storage.exists(output_ref):
             stale_ids.append(doc["_id"])
@@ -428,6 +429,9 @@ async def run_investigation(
 
     storage = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
     catalog, skipped_files = await _build_catalog(db, workspace_id, storage)
+
+    print("catalog : ",catalog)
+
     vector_store = ChromaVectorStore()
     memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
     orchestrator = OrchestratorAgent(

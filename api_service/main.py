@@ -2,11 +2,15 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from api_service.routers import auth, charts, chats, dashboards, feedback, files, reports, usage, workspaces
 from shared.config import get_settings
 from shared.db import close_client, ensure_indexes
+from shared.logging_config import configure_logging
 from shared.redis_client import close_redis
+
+configure_logging("api_service")
 
 
 @asynccontextmanager
@@ -18,6 +22,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Data Analyzer API", lifespan=lifespan)
+
+# Exposes GET /metrics (request count/latency/status codes, broken down by
+# path+method) for Prometheus to scrape - see ../../observability/prometheus/prometheus.yml.
+Instrumentator().instrument(app).expose(app)
 
 frontend_origin = get_settings().get("FRONTEND_ORIGIN", "http://localhost:3000")
 app.add_middleware(

@@ -8,6 +8,15 @@ pyjwt
 google-auth
 requests
 
+# --- Observability (shared by api_service + worker_service) ---
+# Pushes logging.info/error records straight to Loki over HTTP - see
+# shared/logging_config.py. Console output is unaffected either way.
+python-logging-loki
+# Metrics registry/exposition used by both services: api_service exposes it
+# via prometheus-fastapi-instrumentator (its own requirements.txt), worker_service
+# opens its own metrics-only HTTP server with this directly (see worker.py).
+prometheus-client
+
 # Optional - only needed if QUERY_ROUTER_HF_ENABLED=true (see
 # shared/query_router.py). Left commented out so the HF tier stays fully
 # optional/lazy; uncomment once you're ready to enable it.

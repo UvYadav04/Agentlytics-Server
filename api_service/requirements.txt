@@ -1,3 +1,7 @@
 -r ../shared/requirements.txt
 fastapi
 uvicorn[standard]
+
+# Auto-instruments FastAPI with request count/latency/status-code metrics
+# and exposes them at GET /metrics for Prometheus to scrape - see main.py.
+prometheus-fastapi-instrumentator

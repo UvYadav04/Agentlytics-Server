@@ -11,6 +11,7 @@ stream (see the "Refresh-safety" note in full_application_build_plan.md
 Phase 5).
 """
 import logging
+import os
 
 from worker_service import engine_bootstrap  # noqa: F401  (sys.path setup, see module docstring)
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
@@ -18,16 +19,21 @@ from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation
 
 from shared.db import close_client, ensure_indexes
+from shared.logging_config import configure_logging
+from shared.observability import start_prometheus_metrics_server
 from shared.redis_client import close_redis, get_arq_redis_settings
 
-logging.basicConfig(level=logging.INFO)
+# Console + Loki (if LOKI_URL is set - see docker-compose.yml) instead of
+# the old bare logging.basicConfig().
+configure_logging("worker_service")
 
 # autogen_core's own structured-tracing logger (distinct from our compact
 # agents/logger.py output) dumps one full LLMCall record per model call -
 # every tool's complete JSON schema plus the whole accumulated message
 # history so far, repeated in full on every iteration. At INFO it inherits
-# root's level from basicConfig above and floods the terminal/log file with
-# that, growing every call. Silence just this logger so our own "[tool
+# root's level from configure_logging() above (and would now also ship to
+# Loki) and floods the terminal/log file with that, growing every call.
+# Silence just this logger so our own "[tool
 # call] ..." / "[tool result] ..." / assistant text lines (see
 # analyzerEngine/agents/logger.py) stay the only per-step activity logged.
 logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
@@ -35,6 +41,14 @@ logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
 
 async def on_startup(ctx):
     await ensure_indexes()
+
+    # arq has no HTTP server of its own, so Prometheus has nothing to scrape
+    # here unless we open one ourselves. No-op if PROMETHEUS_METRICS_PORT
+    # isn't set (e.g. running this worker bare, outside docker-compose).
+    metrics_port = os.environ.get("PROMETHEUS_METRICS_PORT")
+    if metrics_port:
+        start_prometheus_metrics_server(int(metrics_port))
+
     logging.getLogger("worker").info("worker started, engine loaded from %s", engine_bootstrap.ENGINE_DIR)
 
 
