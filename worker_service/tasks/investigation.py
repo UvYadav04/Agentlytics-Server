@@ -22,11 +22,11 @@ from worker_service import engine_bootstrap  # noqa: F401
 
 from analyzerEngine.agents.orchestrator.agent import InvestigationCancelled, OrchestratorAgent
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
+from analyzerEngine.llm_provider.errors import classify_llm_error
 from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog, table_catalog_entry
 from analyzerEngine.tools.orchestrator.memory import LongTermMemory
 from analyzerEngine.tools.orchestrator.models import FileCatalogEntry
 from analyzerEngine.tools.orchestrator.thread_summary import update_summary
-from analyzerEngine.vectordb.chroma_store import ChromaVectorStore
 
 from shared import usage
 from shared.db import get_db
@@ -107,17 +107,17 @@ async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> t
 
         table_entries = []
         tables_ok = True
-        # for table in doc.get("extracted_tables") or []:
-        #     if not storage.exists(table.get("output_ref") or ""):
-        #         tables_ok = False
-        #         break
-        #     table_entries.append(table_catalog_entry(
-        #         table,
-        #         source_id=doc["_id"],
-        #         source_filename=doc["filename"],
-        #         source_file_type=doc["file_type"],
-        #         uploaded_at=doc["uploaded_at"],
-        #     ))
+        for table in doc.get("extracted_tables") or []:
+            if not storage.exists(table.get("output_ref") or ""):
+                tables_ok = False
+                break
+            table_entries.append(table_catalog_entry(
+                table,
+                source_id=doc["_id"],
+                source_filename=doc["filename"],
+                source_file_type=doc["file_type"],
+                uploaded_at=doc["uploaded_at"],
+            ))
 
         if not tables_ok:
             # Same disk, same ingestion run as the main file - if one table's parquet is
@@ -427,12 +427,15 @@ async def run_investigation(
     async def cancel_check() -> bool:
         return await _is_cancelled(db, investigation_id)
 
-    storage = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
+    # Built once at worker startup (see worker.py's on_startup), not per-job - ChromaVectorStore()
+    # in particular opens a real network connection to Chroma Cloud, which every job used to pay
+    # for individually.
+    storage = ctx["storage"]
     catalog, skipped_files = await _build_catalog(db, workspace_id, storage)
 
     print("catalog : ",catalog)
 
-    vector_store = ChromaVectorStore()
+    vector_store = ctx["vector_store"]
     memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
     orchestrator = OrchestratorAgent(
         catalog, vector_store=vector_store, memory=memory, storage=storage,
@@ -462,14 +465,28 @@ async def run_investigation(
         logger.info("investigation %s cancelled", investigation_id)
         return
     except Exception as exc:
+        # Full raw exception (incl. any provider-internal detail like quota numbers/org ids)
+        # still goes to the logs/Loki via logger.exception - it just doesn't reach the user.
         logger.exception("investigation %s failed", investigation_id)
-        await _append_event(db, investigation_id, "error", f"Investigation failed: {exc}")
+        error_info = classify_llm_error(exc)
+        # "unknown" is classify_llm_error's catch-all for anything that ISN'T a recognizable
+        # LLM-provider HTTP error (rate limit/auth/connection/server all require a status code or
+        # exception-name match) - that's most likely a real bug in our own code, not an LLM
+        # provider hiccup, so keep the original str(exc) behavior for those instead of masking it
+        # behind a generic "trouble talking to the AI provider" message that would misdirect
+        # anyone debugging it later.
+        user_facing = (
+            error_info.user_message
+            if error_info.kind != "unknown"
+            else f"Something went wrong while investigating: {exc}"
+        )
+        await _append_event(db, investigation_id, "error", user_facing)
         await db[INVESTIGATIONS].update_one(
             {"_id": investigation_id}, {"$set": {"status": "failed", "completed_at": _now()}},
         )
         message = Message(
             chat_id=chat_id, role="assistant",
-            content=f"Something went wrong while investigating: {exc}",
+            content=user_facing,
             investigation_id=investigation_id,
         )
         await db[MESSAGES].insert_one(message.to_mongo())

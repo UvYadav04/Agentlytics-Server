@@ -18,6 +18,9 @@ from worker_service.tasks.dashboard_refresh import refresh_dashboard
 from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation
 
+from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
+from analyzerEngine.vectordb.chroma_store import ChromaVectorStore
+
 from shared.db import close_client, ensure_indexes
 from shared.logging_config import configure_logging
 from shared.observability import start_prometheus_metrics_server
@@ -48,6 +51,18 @@ async def on_startup(ctx):
     metrics_port = os.environ.get("PROMETHEUS_METRICS_PORT")
     if metrics_port:
         start_prometheus_metrics_server(int(metrics_port))
+
+    # Built ONCE per worker process, not once per job - run_ingestion/run_investigation used to
+    # construct a fresh LocalParquetStore + ChromaVectorStore on every single call. LocalParquetStore
+    # itself is cheap (just stores a path), but ChromaVectorStore's __init__ opens a
+    # chromadb.CloudClient(...) - a real network handshake to Chroma Cloud - so that cost was being
+    # paid on every job instead of once at startup. `ctx` is arq's per-process dict, shared across
+    # every job this worker runs (and passed as each job function's first argument) - see
+    # https://arq-docs.helpmanual.io/#usage for on_startup/ctx. If ChromaVectorStore() fails here
+    # (e.g. bad/missing CHROMA_* credentials), the worker refuses to start rather than having every
+    # job fail individually once it gets deep into a run - fail fast, once, loudly.
+    ctx["storage"] = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
+    ctx["vector_store"] = ChromaVectorStore()
 
     logging.getLogger("worker").info("worker started, engine loaded from %s", engine_bootstrap.ENGINE_DIR)
 

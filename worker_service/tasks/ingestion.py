@@ -21,8 +21,6 @@ import tempfile
 from worker_service import engine_bootstrap  # noqa: F401
 
 from analyzerEngine.ingestion.manager import IngestionManager
-from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
-from analyzerEngine.vectordb.chroma_store import ChromaVectorStore
 
 from shared.db import get_db
 from shared.models.file import COLLECTION as FILES
@@ -61,9 +59,9 @@ async def run_ingestion(ctx, file_id: str) -> None:
             await _mark_failed(db, file, f"Failed to download uploaded file from storage: {exc}")
             return
 
-        storage = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
-        vector_store = ChromaVectorStore()
-        manager = IngestionManager(storage=storage, vector_store=vector_store)
+        # Built once at worker startup (see worker.py's on_startup), not per-job - see the
+        # comment there for why (ChromaVectorStore() opens a real network connection).
+        manager = IngestionManager(storage=ctx["storage"], vector_store=ctx["vector_store"])
 
         # ingest_file() is fully synchronous (pandas/docling/chromadb calls) -
         # run it off the event loop so it doesn't block other jobs or the
