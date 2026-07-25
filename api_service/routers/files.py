@@ -1,15 +1,20 @@
+import logging
 import os
+import time
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_owned_file, get_owned_workspace
 from shared.db import get_db
+from shared.job_timing import now_iso
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
 from shared.models.user import User
 from shared.redis_client import get_arq_pool
 from shared.storage import build_upload_key, delete_object, new_file_id, presign_put
+
+logger = logging.getLogger("api.files")
 
 router = APIRouter(tags=["files"])
 
@@ -81,14 +86,25 @@ async def presign_upload(
 
 @router.post("/files/{file_id}/confirm", response_model=FileOut)
 async def confirm_upload(file_id: str, user: User = Depends(get_current_user)):
+    request_received_at = now_iso()
+    t0 = time.perf_counter()
+    logger.info("confirm_upload: request arrived at %s (file_id=%s, user_id=%s)",
+                request_received_at, file_id, user.id)
+
     file = await get_owned_file(file_id, user)
 
     await get_db()[FILES].update_one({"_id": file.id}, {"$set": {"status": "processing", "error": None}})
     file.status = "processing"
     file.error = None
+    logger.info("confirm_upload: file %s marked processing at +%.1fms",
+                file.id, (time.perf_counter() - t0) * 1000)
 
     pool = await get_arq_pool()
-    await pool.enqueue_job("run_ingestion", file_id=file.id)
+    job = await pool.enqueue_job("run_ingestion", file_id=file.id, requested_at=request_received_at)
+    logger.info(
+        "confirm_upload: file %s enqueued as arq job %s at +%.1fms total",
+        file.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000,
+    )
 
     return _out(file)
 

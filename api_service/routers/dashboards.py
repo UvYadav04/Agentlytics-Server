@@ -1,14 +1,20 @@
+import logging
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_owned_file, get_owned_workspace
 from shared.db import get_db
+from shared.job_timing import now_iso
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.dashboard import COLLECTION as DASHBOARDS
 from shared.models.dashboard import Dashboard
 from shared.models.user import User
 from shared.redis_client import get_arq_pool
 from shared.storage import presign_get
+
+logger = logging.getLogger("api.dashboards")
 
 router = APIRouter(tags=["dashboards"])
 
@@ -126,12 +132,21 @@ async def refresh_dashboard(dashboard_id: str, user: User = Depends(get_current_
     update its charts in place. Enqueues the same arq job the relink endpoint below triggers
     automatically after swapping a data source - returns immediately, the dashboard's
     last_refreshed_at updates once the worker job finishes (poll GET /dashboards/{id})."""
+    request_received_at = now_iso()
+    t0 = time.perf_counter()
+    logger.info("refresh_dashboard route: request arrived at %s (dashboard_id=%s, user_id=%s)",
+                request_received_at, dashboard_id, user.id)
+
     dashboard = await _get_owned_dashboard(dashboard_id, user)
     if not dashboard.real_time:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This dashboard isn't real-time - nothing to refresh")
 
     pool = await get_arq_pool()
-    await pool.enqueue_job("refresh_dashboard", dashboard_id=dashboard.id)
+    job = await pool.enqueue_job("refresh_dashboard", dashboard_id=dashboard.id, requested_at=request_received_at)
+    logger.info(
+        "refresh_dashboard route: dashboard %s enqueued as arq job %s at +%.1fms",
+        dashboard.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000,
+    )
     return {"ok": True}
 
 
@@ -144,6 +159,11 @@ async def relink_dashboard_file(
     trigger a refresh so the dashboard picks up the new data. Deliberately does NOT delete
     old_file_id itself - only this dashboard's reference to it moves, so a bad swap can be
     undone and anything else still pointing at old_file_id is unaffected."""
+    request_received_at = now_iso()
+    t0 = time.perf_counter()
+    logger.info("relink_dashboard_file: request arrived at %s (dashboard_id=%s, user_id=%s)",
+                request_received_at, dashboard_id, user.id)
+
     dashboard = await _get_owned_dashboard(dashboard_id, user)
     if not dashboard.real_time:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This dashboard isn't real-time - nothing to relink")
@@ -159,7 +179,13 @@ async def relink_dashboard_file(
     updated_file_ids = [body.new_file_id if fid == body.old_file_id else fid for fid in dashboard.file_ids]
     await get_db()[DASHBOARDS].update_one({"_id": dashboard.id}, {"$set": {"file_ids": updated_file_ids}})
     dashboard.file_ids = updated_file_ids
+    logger.info("relink_dashboard_file: dashboard %s file_ids updated at +%.1fms",
+                dashboard.id, (time.perf_counter() - t0) * 1000)
 
     pool = await get_arq_pool()
-    await pool.enqueue_job("refresh_dashboard", dashboard_id=dashboard.id)
+    job = await pool.enqueue_job("refresh_dashboard", dashboard_id=dashboard.id, requested_at=request_received_at)
+    logger.info(
+        "relink_dashboard_file: dashboard %s enqueued as arq job %s at +%.1fms total",
+        dashboard.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000,
+    )
     return _out(dashboard)

@@ -12,10 +12,12 @@ This job is entirely independent of any HTTP connection - it keeps running
 and writing progress regardless of whether anyone is currently subscribed
 to the investigation's SSE stream (refresh-safety, see the build plan).
 """
+import asyncio
 import json
 import logging
 import os
 import shutil
+import time
 from datetime import datetime, timezone
 
 from worker_service import engine_bootstrap  # noqa: F401
@@ -23,13 +25,15 @@ from worker_service import engine_bootstrap  # noqa: F401
 from analyzerEngine.agents.orchestrator.agent import InvestigationCancelled, OrchestratorAgent
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
 from analyzerEngine.llm_provider.errors import classify_llm_error
-from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog, table_catalog_entry
+from analyzerEngine.sandbox.path_resolver import InvalidArtifactIdError, get_parquet_path
+from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog, is_tabular_output_ref, table_catalog_entry
 from analyzerEngine.tools.orchestrator.memory import LongTermMemory
 from analyzerEngine.tools.orchestrator.models import FileCatalogEntry
 from analyzerEngine.tools.orchestrator.thread_summary import update_summary
 
 from shared import usage
 from shared.db import get_db
+from shared.job_timing import log_job_finished, log_job_picked_up
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
 from shared.models.chat import COLLECTION as CHATS
@@ -59,48 +63,54 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _looks_like_local_parquet_ref(ref: str) -> bool:
-    """Not every ingestor's main output_ref is a real LocalParquetStore path: csv/json write
-    one parquet per file and store a real path there, but PDFIngestor's output_ref is a
-    vector-store pointer ("workspace_{id}", not a filesystem path at all) and XLSXIngestor's
-    is deliberately "" - a workbook has no single "whole file" artifact, only its per-table
-    entries do (see xlsx_ingestor.py's comment). storage.exists() on either of those against
-    local disk is always False, which - before this check - flipped every freshly-ingested
-    PDF/xlsx file to "failed" on its very first investigation even though nothing was
-    actually missing (see the false positive this fixes: 'Product-Sales-Region.xlsx' marked
-    missing seconds after ingesting it successfully). Every extracted_tables[i].output_ref,
-    by contrast, always IS a real LocalParquetStore path regardless of file_type, so those
-    are still checked unconditionally below - this only gates the main file-level ref."""
-    return bool(ref) and ref.endswith(".parquet")
+def _artifact_exists(storage: LocalParquetStore, workspace_id: str, file_id: str) -> bool:
+    """True when file_id resolves to a real parquet artifact under this workspace. Builds the
+    path itself via get_parquet_path (workspace_id/file_id, both validated) rather than trusting
+    a caller-supplied path - there's no path left in a Mongo doc to trust or mistrust anymore."""
+    if not file_id:
+        return False
+    try:
+        path = get_parquet_path(storage.root_dir, workspace_id, file_id)
+    except InvalidArtifactIdError:
+        return False
+    return storage.exists(path)
 
 
 async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> tuple[FileCatalog, list[str]]:
-    """Rebuilds the FileCatalog from Mongo's "ready" files - but doesn't trust Mongo blindly.
-    `status: "ready"` only means the parquet existed on disk at ingestion time. PARQUET_ROOT
-    (docker-compose.yml's /data/parquet bind mount, see engine_bootstrap.py) is a persistent
-    HOST directory that survives container rebuilds/redeploys/recreation, so in normal
-    operation this disk and Mongo - cloud Atlas, also durable - stay in agreement. This check
-    exists for the remaining edge cases where they don't (the host directory was deleted or
-    repointed outside of a normal deploy, a fresh machine/dev environment doesn't have the
-    volume populated yet, etc.) - Mongo has no way to know about any of that on its own.
-    Previously we handed those file_ids straight to the orchestrator and only found out via an
-    IO Error deep inside invoke_tabular_agent (see the "No files found that match the pattern
-    ..." failures this replaces).
 
-    So every output_ref (the main file's and each extracted table's) is checked against this
-    disk before being added to the catalog. Anything missing is flipped back to "failed" here -
-    once, cheaply - so it stops being offered to every future investigation until the user
-    re-uploads it, and its filename is returned so the caller can tell the user why it's absent.
-    """
     catalog = FileCatalog()
     stale_ids: list[str] = []
     skipped_filenames: list[str] = []
 
-    cursor = db[FILES].find({"workspace_id": workspace_id, "status": "ready"})
-    async for doc in cursor:
-        print("doc : ",doc)
+    t0 = time.perf_counter()
+    docs = await db[FILES].find({"workspace_id": workspace_id, "status": "ready"}).to_list(length=None)
+
+    # Every ref (main file + every extracted table) that needs an existence check, deduped -
+    # two files could theoretically share a table ref only in corrupted data, but deduping is
+    # free and avoids doing the same stat() twice regardless.
+    refs_to_check: set[str] = set()
+    for doc in docs:
         output_ref = doc.get("output_ref") or ""
-        if _looks_like_local_parquet_ref(output_ref) and not storage.exists(output_ref):
+        if is_tabular_output_ref(output_ref):
+            refs_to_check.add(output_ref)
+        for table in doc.get("extracted_tables") or []:
+            refs_to_check.add(table.get("output_ref") or "")
+
+    existence_results = await asyncio.gather(
+        *(asyncio.to_thread(_artifact_exists, storage, workspace_id, ref) for ref in refs_to_check)
+    )
+    exists_by_ref = dict(zip(refs_to_check, existence_results))
+    logger.debug(
+        "_build_catalog: checked %d file(s) on disk in %.1fms (workspace=%s)",
+        len(refs_to_check), (time.perf_counter() - t0) * 1000, workspace_id,
+    )
+
+    for doc in docs:
+        output_ref = doc.get("output_ref") or ""
+        # is_tabular_output_ref filters out the "" xlsx-workbook-main sentinel and the
+        # "workspace_{id}" PDF/TXT vector-store pointer - neither is a parquet artifact, so
+        # there's nothing on disk to check for those.
+        if is_tabular_output_ref(output_ref) and not exists_by_ref.get(output_ref, False):
             stale_ids.append(doc["_id"])
             skipped_filenames.append(doc["filename"])
             continue
@@ -108,7 +118,7 @@ async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> t
         table_entries = []
         tables_ok = True
         for table in doc.get("extracted_tables") or []:
-            if not storage.exists(table.get("output_ref") or ""):
+            if not exists_by_ref.get(table.get("output_ref") or "", False):
                 tables_ok = False
                 break
             table_entries.append(table_catalog_entry(
@@ -410,8 +420,60 @@ async def _persist_artifacts(
 
 async def run_investigation(
     ctx, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str,
-    file_ids: list[str] | None = None,
+    file_ids: list[str] | None = None, requested_at: str | None = None,
 ) -> None:
+    # First line, always - logs when this worker actually started running the job, plus
+    # queue_wait/request_to_worker latency (requested_at comes from chats.py's send_message,
+    # the moment the original HTTP request arrived - see shared/job_timing.py).
+    picked_up_at = log_job_picked_up(
+        logger, ctx, "run_investigation", requested_at=requested_at,
+        investigation_id=investigation_id, chat_id=chat_id,
+    )
+
+    # Kick off this investigation's persistent sandbox container NOW, in the background, so its
+    # ~2-3s Docker create + health-check wait (see sandbox/sandbox_manager.py) overlaps with the
+    # catalog build and the orchestrator's own LLM calls below instead of being paid synchronously
+    # whenever the Tabular Agent's first run_python() call eventually happens. SandboxManager.
+    # get_or_create is keyed + locked by investigation_id, so that later call just finds (or
+    # briefly waits on) this same in-flight/cached container - it never races to create a second
+    # one. Fire-and-forget except for the `finally` block below, which always waits for this task
+    # before releasing, so cleanup can never run concurrently with creation.
+    #
+    # ctx["sandbox_manager"] - built ONCE in worker.py's on_startup - not get_sandbox_manager()
+    # called fresh here: the module-level singleton getter is keyed by import path
+    # (`analyzerEngine.sandbox.sandbox_manager`, which this file uses, vs the bare
+    # `sandbox.sandbox_manager` analyzerEngine's own internal modules use, resolve to two
+    # different sys.modules entries with two independent singletons - see
+    # sandbox_manager.get_manager's docstring). Using ctx's instance and threading it explicitly
+    # into OrchestratorAgent below (which passes it all the way down to PythonSandbox) guarantees
+    # this pre-warm, the real run_python() execution, and the release() call at the end of this
+    # function all agree on the exact same SandboxManager - otherwise the pre-warmed container
+    # sits unused in one singleton's cache while the real call creates a second one in the other.
+    sandbox_manager = ctx["sandbox_manager"]
+    prewarm_start = time.perf_counter()
+    sandbox_prewarm_task = asyncio.create_task(
+        asyncio.to_thread(sandbox_manager.get_or_create, investigation_id)
+    )
+
+    def _log_prewarm_result(task: asyncio.Task, _start=prewarm_start) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()  # also marks the exception as "retrieved" - no asyncio warning
+        if exc is not None:
+            logger.warning(
+                "investigation %s: sandbox pre-warm failed after %.1fms (the first run_python "
+                "call will just create it synchronously instead, same as before this change): %s",
+                investigation_id, (time.perf_counter() - _start) * 1000, exc,
+            )
+        else:
+            logger.info(
+                "investigation %s: sandbox pre-warmed in %.1fms (overlapped with catalog build "
+                "and the orchestrator's own LLM calls, not added on top of them)",
+                investigation_id, (time.perf_counter() - _start) * 1000,
+            )
+
+    sandbox_prewarm_task.add_done_callback(_log_prewarm_result)
+
     # File ids the user referenced via "@" in the client's message composer
     # (see api_service/routers/chats.py's SendMessageRequest.file_ids). Just
     # extracted here for now - not yet wired into the catalog/orchestrator.
@@ -431,15 +493,20 @@ async def run_investigation(
     # in particular opens a real network connection to Chroma Cloud, which every job used to pay
     # for individually.
     storage = ctx["storage"]
+    catalog_start = time.perf_counter()
     catalog, skipped_files = await _build_catalog(db, workspace_id, storage)
-
-    print("catalog : ",catalog)
+    logger.info(
+        "investigation %s: catalog built in %.1fms (%d file(s), %d skipped)",
+        investigation_id, (time.perf_counter() - catalog_start) * 1000,
+        len(catalog.entries), len(skipped_files),
+    )
 
     vector_store = ctx["vector_store"]
     memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
     orchestrator = OrchestratorAgent(
         catalog, vector_store=vector_store, memory=memory, storage=storage,
-        reports_dir=engine_bootstrap.REPORTS_ROOT,
+        reports_dir=engine_bootstrap.REPORTS_ROOT, investigation_id=investigation_id,
+        sandbox_manager=sandbox_manager,
     )
 
     if skipped_files:
@@ -453,67 +520,98 @@ async def run_investigation(
         })
 
     try:
-        thread_context = await _thread_context(db, chat_id)
-        result = await orchestrator.run(
-            query, workspace_id=workspace_id, thread_context=thread_context,
-            on_event=on_event, cancel_check=cancel_check,
-        )
-    except InvestigationCancelled:
-        await db[INVESTIGATIONS].update_one(
-            {"_id": investigation_id}, {"$set": {"status": "cancelled", "completed_at": _now()}},
-        )
-        logger.info("investigation %s cancelled", investigation_id)
-        return
-    except Exception as exc:
-        # Full raw exception (incl. any provider-internal detail like quota numbers/org ids)
-        # still goes to the logs/Loki via logger.exception - it just doesn't reach the user.
-        logger.exception("investigation %s failed", investigation_id)
-        error_info = classify_llm_error(exc)
-        # "unknown" is classify_llm_error's catch-all for anything that ISN'T a recognizable
-        # LLM-provider HTTP error (rate limit/auth/connection/server all require a status code or
-        # exception-name match) - that's most likely a real bug in our own code, not an LLM
-        # provider hiccup, so keep the original str(exc) behavior for those instead of masking it
-        # behind a generic "trouble talking to the AI provider" message that would misdirect
-        # anyone debugging it later.
-        user_facing = (
-            error_info.user_message
-            if error_info.kind != "unknown"
-            else f"Something went wrong while investigating: {exc}"
-        )
-        await _append_event(db, investigation_id, "error", user_facing)
-        await db[INVESTIGATIONS].update_one(
-            {"_id": investigation_id}, {"$set": {"status": "failed", "completed_at": _now()}},
-        )
+        try:
+            thread_context = await _thread_context(db, chat_id)
+            result = await orchestrator.run(
+                query, workspace_id=workspace_id, thread_context=thread_context,
+                on_event=on_event, cancel_check=cancel_check,
+            )
+        except InvestigationCancelled:
+            await db[INVESTIGATIONS].update_one(
+                {"_id": investigation_id}, {"$set": {"status": "cancelled", "completed_at": _now()}},
+            )
+            logger.info("investigation %s cancelled", investigation_id)
+            return
+        except Exception as exc:
+            # Full raw exception (incl. any provider-internal detail like quota numbers/org ids)
+            # still goes to the logs/Loki via logger.exception - it just doesn't reach the user.
+            logger.exception("investigation %s failed", investigation_id)
+            error_info = classify_llm_error(exc)
+            # "unknown" is classify_llm_error's catch-all for anything that ISN'T a recognizable
+            # LLM-provider HTTP error (rate limit/auth/connection/server all require a status code or
+            # exception-name match) - that's most likely a real bug in our own code, not an LLM
+            # provider hiccup, so keep the original str(exc) behavior for those instead of masking it
+            # behind a generic "trouble talking to the AI provider" message that would misdirect
+            # anyone debugging it later.
+            user_facing = (
+                error_info.user_message
+                if error_info.kind != "unknown"
+                else f"Something went wrong while investigating: {exc}"
+            )
+            await _append_event(db, investigation_id, "error", user_facing)
+            await db[INVESTIGATIONS].update_one(
+                {"_id": investigation_id}, {"$set": {"status": "failed", "completed_at": _now()}},
+            )
+            message = Message(
+                chat_id=chat_id, role="assistant",
+                content=user_facing,
+                investigation_id=investigation_id,
+            )
+            await db[MESSAGES].insert_one(message.to_mongo())
+            return
+
         message = Message(
-            chat_id=chat_id, role="assistant",
-            content=user_facing,
-            investigation_id=investigation_id,
+            chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
         )
+        chart_ids, report_id = await _persist_artifacts(
+            db, workspace_id, investigation_id, message.id, user_id, result.artifact_refs,
+        )
+        message.chart_ids = chart_ids
+        message.report_id = report_id
         await db[MESSAGES].insert_one(message.to_mongo())
-        return
 
-    message = Message(
-        chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
-    )
-    chart_ids, report_id = await _persist_artifacts(
-        db, workspace_id, investigation_id, message.id, user_id, result.artifact_refs,
-    )
-    message.chart_ids = chart_ids
-    message.report_id = report_id
-    await db[MESSAGES].insert_one(message.to_mongo())
+        await db[INVESTIGATIONS].update_one(
+            {"_id": investigation_id},
+            {"$set": {"status": "completed", "final_answer": result.final_answer, "completed_at": _now()}},
+        )
+        await usage.increment_messages(user_id)
+        await _append_event(
+            db, investigation_id, "completed", "Investigation complete.",
+            {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id},
+        )
+        logger.info("investigation %s completed", investigation_id)
 
-    await db[INVESTIGATIONS].update_one(
-        {"_id": investigation_id},
-        {"$set": {"status": "completed", "final_answer": result.final_answer, "completed_at": _now()}},
-    )
-    await usage.increment_messages(user_id)
-    await _append_event(
-        db, investigation_id, "completed", "Investigation complete.",
-        {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id},
-    )
-    logger.info("investigation %s completed", investigation_id)
+        # Strictly after the above - the user already has their answer (SSE
+        # "completed" event just went out) before this starts, so the summary
+        # LLM call's latency is never on the user-facing critical path.
+        await _update_chat_continuity(db, chat_id, query, result)
+    finally:
+        # Always wait for the pre-warm task kicked off at the top of this function to actually
+        # finish - success or failure - before releasing anything below. Without this, a fast
+        # investigation that never touched the Tabular Agent (so nothing else ever awaited this
+        # task) could reach release() while the background thread is still mid-`docker run`,
+        # racing container creation against its own teardown. The exception (if any) was already
+        # logged by _log_prewarm_result's done-callback, so this is just a rendezvous, not a
+        # second place that needs to report it.
+        try:
+            await sandbox_prewarm_task
+        except Exception:
+            pass
 
-    # Strictly after the above - the user already has their answer (SSE
-    # "completed" event just went out) before this starts, so the summary
-    # LLM call's latency is never on the user-facing critical path.
-    await _update_chat_continuity(db, chat_id, query, result)
+        # Runs on every exit path (completed/failed/cancelled/an exception this function itself
+        # doesn't catch) - this investigation is over either way, so its persistent sandbox
+        # container (see sandbox/sandbox_manager.py - one container per investigation_id, warm
+        # across every invoke_tabular_agent call this run made) is released now rather than left
+        # for the idle-timeout reaper to eventually notice. release() itself makes blocking
+        # Docker SDK calls (container stop/remove), so it's pushed off the event loop the same
+        # way PythonSandbox.run's own Docker calls already are elsewhere (see
+        # dashboard_refresh.py's asyncio.to_thread note).
+        try:
+            await asyncio.to_thread(sandbox_manager.release, investigation_id)
+        except Exception:
+            logger.exception("failed to release sandbox for investigation %s", investigation_id)
+        # Paired with log_job_picked_up above - total in-worker duration (excludes queue wait,
+        # which was already logged separately). The specific outcome (completed/failed/
+        # cancelled) is already logged with its own status a few lines up in each branch; this
+        # is just the closing timestamp for the job as a whole.
+        log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)

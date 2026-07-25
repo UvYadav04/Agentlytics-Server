@@ -22,7 +22,13 @@ class File(MongoModel):
 
     # Populated once ingestion completes - this is the shallow catalog the
     # orchestrator reads from (see agent_tools_specification.md Section 1.4).
-    output_ref: Optional[str] = None  # local parquet path (worker-local disk) or vector collection ref
+    # For tabular data (csv/json/xlsx-table/pdf-table): the artifact's file_id - the same id as
+    # this doc's own _id for a main file, or the table's own id for an extracted table (see
+    # analyzerEngine/sandbox/path_resolver.py; physical location is always derived as
+    # {workspace_id}/{file_id}.parquet, never stored as a path). For PDF/TXT main entries: a
+    # vector-store pointer ("workspace_{id}"), not a file_id. "" for an xlsx workbook's own
+    # main entry (no queryable data of its own - see xlsx_ingestor.py).
+    output_ref: Optional[str] = None
     schema_summary: Optional[dict] = None
     row_count: Optional[int] = None
     page_count: Optional[int] = None

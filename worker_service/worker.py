@@ -10,6 +10,7 @@ progress regardless of whether any client is currently connected to an SSE
 stream (see the "Refresh-safety" note in full_application_build_plan.md
 Phase 5).
 """
+import asyncio
 import logging
 import os
 
@@ -19,6 +20,7 @@ from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation
 
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
+from analyzerEngine.sandbox.sandbox_manager import get_manager as get_sandbox_manager
 from analyzerEngine.vectordb.chroma_store import ChromaVectorStore
 
 from shared.db import close_client, ensure_indexes
@@ -64,10 +66,25 @@ async def on_startup(ctx):
     ctx["storage"] = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
     ctx["vector_store"] = ChromaVectorStore()
 
+    # One persistent-sandbox manager per worker process, same reasoning as ChromaVectorStore
+    # above: this is a process-wide singleton (see sandbox_manager.get_manager's docstring), so
+    # calling it here - once, with the real socket_root - establishes it before any job runs.
+    # Every PythonSandbox instance any later job constructs calls get_manager() with no args and
+    # gets this exact same instance back.
+    ctx["sandbox_manager"] = get_sandbox_manager(socket_root=engine_bootstrap.SANDBOX_SOCKET_ROOT)
+
     logging.getLogger("worker").info("worker started, engine loaded from %s", engine_bootstrap.ENGINE_DIR)
 
 
 async def on_shutdown(ctx):
+    sandbox_manager = ctx.get("sandbox_manager")
+    if sandbox_manager is not None:
+        # Releases any sandbox container still cached (e.g. an investigation whose own
+        # finally-block cleanup never ran because the whole worker process is going down) before
+        # this process exits - avoids leaking containers/socket files across worker restarts.
+        # shutdown_all() makes blocking Docker SDK calls, same as release() elsewhere - pushed
+        # off the event loop rather than blocking on_shutdown itself.
+        await asyncio.to_thread(sandbox_manager.shutdown_all)
     await close_redis()
     await close_client()
 
@@ -93,5 +110,20 @@ class WorkerSettings:
     job_timeout = 1800
     # Ingestion (esp. PDF/docling) and investigations are both
     # CPU/LLM-latency heavy, not memory-cheap - keep concurrency modest by
-    # default; raise once you've checked memory headroom.
+    # default; raise once you've checked memory headroom. NOTE: this is also the #1 lever for
+    # "why is my message sitting in the queue" - if all `max_jobs` slots are already busy with
+    # other running investigations/ingestions, a new job queues until one frees, no matter how
+    # low poll_delay below is. Check the "queue_wait=...ms" figure logged by
+    # shared/job_timing.log_job_picked_up: if that's consistently high while this worker is
+    # otherwise idle, raise max_jobs (memory-permitting) or run more worker_service replicas
+    # (docker-compose up -d --scale worker_service=N - remove the fixed `container_name:` in
+    # docker-compose.yml first, since replicas can't share one).
     max_jobs = 4
+    # arq default is 0.5s - the worker polls Redis for newly-queued jobs at this interval when
+    # otherwise idle, so a job can sit for up to poll_delay seconds even with a completely free
+    # worker slot. Lowered here since that's pure dead time on top of every investigation's
+    # already-real LLM/agent latency - the added Redis load from polling 5x/sec instead of 2x/sec
+    # is negligible next to what a single LLM call costs. This only affects the "how fast does an
+    # idle worker notice a new job" component - see max_jobs above for the "all slots busy"
+    # component, which this does nothing for.
+    poll_delay = 0.1

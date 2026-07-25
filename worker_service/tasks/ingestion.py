@@ -23,6 +23,7 @@ from worker_service import engine_bootstrap  # noqa: F401
 from analyzerEngine.ingestion.manager import IngestionManager
 
 from shared.db import get_db
+from shared.job_timing import log_job_finished, log_job_picked_up
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
 from shared.storage import get_bucket_name, get_s3_client
@@ -35,57 +36,67 @@ async def _mark_failed(db, file: File, error: str) -> None:
     await db[FILES].update_one({"_id": file.id}, {"$set": {"status": "failed", "error": error}})
 
 
-async def run_ingestion(ctx, file_id: str) -> None:
-    db = get_db()
-    doc = await db[FILES].find_one({"_id": file_id})
-    if doc is None:
-        logger.warning("run_ingestion: file %s no longer exists, skipping", file_id)
-        return
-
-    file = File.from_mongo(doc)
-    if file.status == "cancelled":
-        logger.info("run_ingestion: file %s was cancelled before processing started", file_id)
-        return
-
-    tmp_dir = tempfile.mkdtemp(prefix="ingest_")
-    local_path = os.path.join(tmp_dir, file.filename)
-    s3 = get_s3_client()
-    bucket = get_bucket_name()
-
+async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> None:
+    picked_up_at = log_job_picked_up(logger, ctx, "run_ingestion", requested_at=requested_at, file_id=file_id)
+    status_for_log = "unknown"
     try:
-        try:
-            s3.download_file(bucket, file.storage_key, local_path)
-        except Exception as exc:
-            await _mark_failed(db, file, f"Failed to download uploaded file from storage: {exc}")
+        db = get_db()
+        doc = await db[FILES].find_one({"_id": file_id})
+        if doc is None:
+            logger.warning("run_ingestion: file %s no longer exists, skipping", file_id)
+            status_for_log = "skipped_missing"
             return
 
-        # Built once at worker startup (see worker.py's on_startup), not per-job - see the
-        # comment there for why (ChromaVectorStore() opens a real network connection).
-        manager = IngestionManager(storage=ctx["storage"], vector_store=ctx["vector_store"])
+        file = File.from_mongo(doc)
+        if file.status == "cancelled":
+            logger.info("run_ingestion: file %s was cancelled before processing started", file_id)
+            status_for_log = "skipped_cancelled"
+            return
 
-        # ingest_file() is fully synchronous (pandas/docling/chromadb calls) -
-        # run it off the event loop so it doesn't block other jobs or the
-        # worker's health checks.
-        result = await asyncio.to_thread(manager.ingest_file, local_path, file.workspace_id, file.id)
+        tmp_dir = tempfile.mkdtemp(prefix="ingest_")
+        local_path = os.path.join(tmp_dir, file.filename)
+        s3 = get_s3_client()
+        bucket = get_bucket_name()
+
+        try:
+            try:
+                s3.download_file(bucket, file.storage_key, local_path)
+            except Exception as exc:
+                await _mark_failed(db, file, f"Failed to download uploaded file from storage: {exc}")
+                status_for_log = "failed_download"
+                return
+
+            # Built once at worker startup (see worker.py's on_startup), not per-job - see the
+            # comment there for why (ChromaVectorStore() opens a real network connection).
+            manager = IngestionManager(storage=ctx["storage"], vector_store=ctx["vector_store"])
+
+            # ingest_file() is fully synchronous (pandas/docling/chromadb calls) -
+            # run it off the event loop so it doesn't block other jobs or the
+            # worker's health checks.
+            result = await asyncio.to_thread(manager.ingest_file, local_path, file.workspace_id, file.id)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if result.status == "failed":
+            await _mark_failed(db, file, "; ".join(result.errors) if result.errors else "Ingestion failed")
+            status_for_log = "failed"
+            return
+
+        schema_summary = result.schema_summary or {}
+        update = {
+            "status": "ready",
+            "output_ref": result.output_ref,
+            "schema_summary": schema_summary,
+            "row_count": result.row_count,
+            "page_count": schema_summary.get("page_count"),
+            "columns": schema_summary.get("columns"),
+            "extracted_tables": result.extracted_tables or [],
+            # status == "partial" (e.g. scanned PDF) still counts as ready, but
+            # keep the warning visible rather than silently dropping it.
+            "error": "; ".join(result.errors) if result.errors else None,
+        }
+        await db[FILES].update_one({"_id": file.id}, {"$set": update})
+        logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
+        status_for_log = result.status
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if result.status == "failed":
-        await _mark_failed(db, file, "; ".join(result.errors) if result.errors else "Ingestion failed")
-        return
-
-    schema_summary = result.schema_summary or {}
-    update = {
-        "status": "ready",
-        "output_ref": result.output_ref,
-        "schema_summary": schema_summary,
-        "row_count": result.row_count,
-        "page_count": schema_summary.get("page_count"),
-        "columns": schema_summary.get("columns"),
-        "extracted_tables": result.extracted_tables or [],
-        # status == "partial" (e.g. scanned PDF) still counts as ready, but
-        # keep the warning visible rather than silently dropping it.
-        "error": "; ".join(result.errors) if result.errors else None,
-    }
-    await db[FILES].update_one({"_id": file.id}, {"$set": update})
-    logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
+        log_job_finished(logger, "run_ingestion", picked_up_at, status=status_for_log, file_id=file_id)

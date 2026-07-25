@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -25,6 +26,7 @@ from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
+from shared.job_timing import now_iso
 from shared.redis_client import get_arq_pool, get_redis, investigation_channel
 from shared.storage import delete_object
 
@@ -38,19 +40,27 @@ _shadow_tasks: set[asyncio.Task] = set()
 
 
 def _schedule_shadow_classification(
-    *, chat_id: str, message_id: str, user_id: str, query: str, has_prior_context: bool,
+    *, chat_id: str, message_id: str, user_id: str, query: str,
 ) -> None:
     task = asyncio.create_task(
-        _shadow_classify_and_log(chat_id, message_id, user_id, query, has_prior_context)
+        _shadow_classify_and_log(chat_id, message_id, user_id, query)
     )
     _shadow_tasks.add(task)
     task.add_done_callback(_shadow_tasks.discard)
 
 
 async def _shadow_classify_and_log(
-    chat_id: str, message_id: str, user_id: str, query: str, has_prior_context: bool,
+    chat_id: str, message_id: str, user_id: str, query: str,
 ) -> None:
     try:
+        # Shadow test only, so this Mongo round-trip - previously done synchronously in
+        # send_message before the real work even started - happens here instead, off the
+        # request's critical path. Excludes the message we just inserted (by id, not a
+        # before/after ordering trick) so "does this chat have earlier turns" still means
+        # exactly what it always did, regardless of when this background task actually runs.
+        has_prior_context = await get_db()[MESSAGES].count_documents(
+            {"chat_id": chat_id, "_id": {"$ne": message_id}}
+        ) > 0
         result = classify_query(query, has_prior_context)
         shadow_logger.info(
             "chat=%s message=%s tier=%s intent=%s score=%.3f prior_context=%s "
@@ -272,20 +282,37 @@ async def active_investigation(chat_id: str, user: User = Depends(get_current_us
 
 @router.post("/chats/{chat_id}/messages", response_model=SendMessageResponse)
 async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depends(get_current_user)):
-    chat = await get_owned_chat(chat_id, user)
-    # Computed before either message insert below, so it reflects prior
-    # turns only - not the message we're about to write.
-    has_prior_context = await get_db()[MESSAGES].count_documents({"chat_id": chat_id}) > 0
+    # Captured before anything else in this handler runs - this is "when the request arrived"
+    # for timing purposes. request_received_at (ISO, ms precision) rides along as the
+    # `requested_at` job kwarg so run_investigation can log the full request -> worker pickup
+    # latency later (see shared/job_timing.py); t0 is just this process's own perf_counter for
+    # the elapsed-ms logging below.
+    request_received_at = now_iso()
+    t0 = time.perf_counter()
+    logger.info(
+        "send_message: request arrived at %s (chat_id=%s, user_id=%s)",
+        request_received_at, chat_id, user.id,
+    )
 
+    chat = await get_owned_chat(chat_id, user)
+                
     if not await usage.has_message_capacity(user.id):
         message = Message(chat_id=chat_id, role="user", content=body.content)
         await get_db()[MESSAGES].insert_one(message.to_mongo())
+        logger.info(
+            "send_message: rejected (message capacity reached) at +%.1fms (chat_id=%s)",
+            (time.perf_counter() - t0) * 1000, chat_id,
+        )
         return SendMessageResponse(
             message_id=message.id, investigation_id=None, limited=True, limit_message=LIMIT_MESSAGE,
         )
 
     message = Message(chat_id=chat_id, role="user", content=body.content)
     await get_db()[MESSAGES].insert_one(message.to_mongo())
+    logger.info(
+        "send_message: user message persisted at +%.1fms (chat_id=%s, message_id=%s)",
+        (time.perf_counter() - t0) * 1000, chat_id, message.id,
+    )
     # Shadow test only - classifies the query and logs the decision, but
     # never affects routing: the arq enqueue below always runs regardless.
     _schedule_shadow_classification(
@@ -293,14 +320,17 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         message_id=message.id,
         user_id=user.id,
         query=body.content,
-        has_prior_context=has_prior_context,
     )
 
     investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
     await get_db()[INVESTIGATIONS].insert_one(investigation.to_mongo())
+    logger.info(
+        "send_message: investigation %s created at +%.1fms (chat_id=%s)",
+        investigation.id, (time.perf_counter() - t0) * 1000, chat_id,
+    )
 
     pool = await get_arq_pool()
-    await pool.enqueue_job(
+    job = await pool.enqueue_job(
         "run_investigation",
         investigation_id=investigation.id,
         chat_id=chat_id,
@@ -308,6 +338,11 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         user_id=user.id,
         query=body.content,
         file_ids=body.file_ids,
+        requested_at=request_received_at,
+    )
+    logger.info(
+        "send_message: investigation %s enqueued as arq job %s at +%.1fms total (chat_id=%s)",
+        investigation.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000, chat_id,
     )
 
     return SendMessageResponse(message_id=message.id, investigation_id=investigation.id)

@@ -24,10 +24,6 @@ def get_s3_client():
     global _s3_client
     if _s3_client is None:
         settings = get_settings()
-        print("AWS_ACCESS_KEY: ", settings.get("AWS_ACCESS_KEY"))
-        print("AWS_ACCESS_SECRET: ", settings.get("AWS_ACCESS_SECRET"))
-        print("AWS_REGION: ", settings.get("AWS_REGION"))
-        print("AWS_BUCKET: ", settings.get("AWS_BUCKET"))
         _s3_client = boto3.client(
             "s3",
             aws_access_key_id=settings.get("AWS_ACCESS_KEY"),

@@ -1,3 +1,35 @@
 shared/.env
-*/__pycache__
-*/*/__pycache__
+*/.env
+*/*/.env
+
+# Virtual environments (Server/.venv, Server/analyzerEngine/.venv, ...) - each
+# already ships its own auto-generated "ignore everything" .gitignore too,
+# this is belt-and-suspenders in case one of those ever gets deleted/recreated
+# without it.
+.venv/
+**/.venv/
+venv/
+**/venv/
+
+# Python bytecode/caches - recursive, not just one or two levels deep like
+# before, so this actually covers every nested package/module directory.
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+**/logs/
