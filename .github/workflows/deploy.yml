@@ -27,14 +27,14 @@ jobs:
       - name: Build WORKER
         run: |
           docker build \
-            -t itzidineshyadav/data-analyzer:worker \
+            -t itzdineshyadav/data-analyzer:worker \
             -f worker_service/Dockerfile \
             .
 
       - name: Build API
         run: |
           docker build \
-            -t itzidineshyadav/data-analyzer:api \
+            -t itzdineshyadav/data-analyzer:api \
             -f api_service/Dockerfile \
             .
 
