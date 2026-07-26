@@ -41,10 +41,10 @@ jobs:
 
 
       - name: Push API
-        run: docker push itzidineshyadav/data-analyzer:api
+        run: docker push itzdineshyadav/data-analyzer:api
 
       - name: Push Worker
-        run: docker push itzidineshyadav/data-analyzer:worker
+        run: docker push itzdineshyadav/data-analyzer:worker
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.2.0
