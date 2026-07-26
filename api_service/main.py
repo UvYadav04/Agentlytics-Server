@@ -38,15 +38,22 @@ Instrumentator().instrument(app).expose(app)
 
 	
 
-app.include_router(auth.router)
-app.include_router(workspaces.router)
-app.include_router(files.router)
-app.include_router(chats.router)
-app.include_router(charts.router)
-app.include_router(reports.router)
-app.include_router(dashboards.router)
-app.include_router(usage.router)
-app.include_router(feedback.router)
+# "/api" prefix matches the client's NEXT_PUBLIC_API_URL in production (e.g.
+# https://agentlytics.duckdns.org/api - see Client/.env), which is forwarded to this service
+# path-and-all by the reverse proxy rather than stripped. /health below is deliberately NOT under
+# this prefix - it's for container/EC2-level liveness checks hitting the service directly on its
+# own port, not traffic coming through the public reverse proxy.
+API_PREFIX = "/api"
+
+app.include_router(auth.router, prefix=API_PREFIX)
+app.include_router(workspaces.router, prefix=API_PREFIX)
+app.include_router(files.router, prefix=API_PREFIX)
+app.include_router(chats.router, prefix=API_PREFIX)
+app.include_router(charts.router, prefix=API_PREFIX)
+app.include_router(reports.router, prefix=API_PREFIX)
+app.include_router(dashboards.router, prefix=API_PREFIX)
+app.include_router(usage.router, prefix=API_PREFIX)
+app.include_router(feedback.router, prefix=API_PREFIX)
 
 
 @app.get("/health")
