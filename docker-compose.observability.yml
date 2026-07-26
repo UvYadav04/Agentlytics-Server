@@ -1,0 +1,295 @@
+# Observability overlay - Langfuse (LLM tracing), Prometheus/node-exporter/
+# cAdvisor (server/system metrics), Loki/Promtail (logs), Grafana
+# (dashboards over both). Deferred for now; bring it up alongside the base
+# stack with:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
+#
+# Nothing in api_service/worker_service needs to change to use this later -
+# shared/logging_config.py's Loki handler and
+# analyzerEngine/llm_provider/langfuse_wrapper.py's tracing both already
+# check for LOKI_URL / LANGFUSE_HOST /  LANGFUSE_PUBLIC_KEY+SECRET_KEY at
+# runtime and no-op if unset, which is the state today with this file left
+# out. The `environment:` overrides below are the only thing that actually
+# turns them on.
+#
+# Secrets (Postgres/ClickHouse/MinIO/Redis passwords, Langfuse's
+# NEXTAUTH_SECRET/SALT/ENCRYPTION_KEY, Grafana admin password, and
+# optionally the LANGFUSE_INIT_* auto-provisioning values) come from a
+# root-level .env file (this directory, next to docker-compose.yml) - copy
+# .env.example to .env and fill in real values before bringing this overlay
+# up.
+
+services:
+  # --- Wire the base services into the observability stack ---
+  api_service:
+    environment:
+      # Loki push endpoint - shared/logging_config.py adds a LokiHandler
+      # pointed here (in addition to the console handler) when this is set.
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+      SERVICE_NAME: api_service
+      # Self-hosted Langfuse instance - internal compose network address,
+      # not the host-published one. Public/secret keys still come from
+      # shared/.env (see .env.example) - per-project credentials,
+      # not something a compose file can know in advance.
+      LANGFUSE_HOST: http://langfuse-web:3000
+    depends_on:
+      - loki
+
+  worker_service:
+    environment:
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+      SERVICE_NAME: worker_service
+      LANGFUSE_HOST: http://langfuse-web:3000
+      # prometheus_client.start_http_server() port opened in worker.py's
+      # on_startup - arq has no HTTP server of its own, so this is the only
+      # way Prometheus has anything to scrape here. Container-internal only;
+      # Prometheus reaches it at worker_service:9100 over the compose network.
+      PROMETHEUS_METRICS_PORT: "9100"
+    depends_on:
+      - loki
+
+  # ---------------------------------------------------------------------
+  # Langfuse (self-hosted v3) - LLM call tracing/cost/token monitoring.
+  # Own Postgres/ClickHouse/Redis/MinIO below, all name-prefixed langfuse-*
+  # so nothing collides with the app's own `redis` service in
+  # docker-compose.yml. Adapted from the official reference at
+  # https://github.com/langfuse/langfuse/blob/main/docker-compose.yml.
+  # ---------------------------------------------------------------------
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    container_name: langfuse-web
+    restart: always
+    depends_on: &langfuse-depends-on
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    ports:
+      # Published to the host so you can open the Langfuse UI at
+      - "3001:3000"
+    environment: &langfuse-env
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3001}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?set NEXTAUTH_SECRET in .env - see .env.example}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@langfuse-postgres:5432/${POSTGRES_DB:-postgres}
+      SALT: ${SALT:?set SALT in .env - see .env.example}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set ENCRYPTION_KEY in .env - generate via `openssl rand -hex 32`}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${REDIS_AUTH:?set REDIS_AUTH in .env}
+      REDIS_TLS_ENABLED: "false"
+      # Auto-create your first org/project/user on first boot so you don't
+      # have to click through Langfuse's signup flow - all optional, leave
+      # blank in .env to skip and sign up manually instead. See
+      # https://langfuse.com/self-hosting/administration/headless-initialization
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    container_name: langfuse-worker
+    restart: always
+    depends_on: *langfuse-depends-on
+    environment:
+      <<: *langfuse-env
+
+  langfuse-postgres:
+    image: docker.io/postgres:${POSTGRES_VERSION:-17}
+    container_name: langfuse-postgres
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server
+    container_name: langfuse-clickhouse
+    restart: always
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  langfuse-minio:
+    image: docker.io/minio/minio
+    container_name: langfuse-minio
+    restart: always
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      # MinIO console, for poking at stored trace media/exports directly.
+      - "127.0.0.1:9091:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  langfuse-redis:
+    image: docker.io/redis:7-alpine
+    container_name: langfuse-redis
+    restart: always
+    command: >
+      --requirepass ${REDIS_AUTH:?set REDIS_AUTH in .env}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Prometheus + node-exporter + cAdvisor - server/system metrics.
+  # ---------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: data-analyzer-prometheus
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "9090:9090"
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: data-analyzer-node-exporter
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: data-analyzer-cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+
+  # ---------------------------------------------------------------------
+  # Loki + Promtail - log aggregation. Promtail tails every container's
+  # Docker logs (zero per-service config needed); api_service/worker_service
+  # additionally push their own structured logs straight to Loki's HTTP
+  # push API via shared/logging_config.py for proper service/level labels.
+  # ---------------------------------------------------------------------
+  loki:
+    image: grafana/loki:latest
+    container_name: data-analyzer-loki
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+
+  promtail:
+    image: grafana/promtail:latest
+    container_name: data-analyzer-promtail
+    volumes:
+      - ./observability/promtail/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
+
+  # ---------------------------------------------------------------------
+  # Grafana - dashboards over Prometheus (metrics) + Loki (logs). Both
+  # datasources are auto-provisioned from ./observability/grafana on boot.
+  # ---------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: data-analyzer-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3002:3000"
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:

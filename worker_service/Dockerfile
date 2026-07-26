@@ -47,7 +47,6 @@ COPY worker_service/requirements.txt worker_service/requirements.txt
 # would otherwise silently re-resolve torch/torchvision from default PyPI
 # (bringing the CUDA wheels back) instead of picking a compatible CPU build.
 ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r worker_service/requirements.txt
 
 COPY shared/ shared/

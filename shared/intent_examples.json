@@ -1,0 +1,56 @@
+{
+  "_comment": "Representative example phrases per intent for shared/intent_router.py's embedding-similarity classifier. Add more phrases any time to improve routing - no code change or retraining needed, the app just re-embeds this file's contents at next startup. Keep phrases short (2-6 words) and keyword-heavy for semantic coverage rather than natural sentences. Every one of intent_classifier.CANDIDATE_LABELS must have at least one phrase here.",
+
+  "greeting": [
+    "hi",
+    "hello",
+    "hey there",
+    "good morning",
+    "how are you",
+    "how are you doing",
+    "what are you doing",
+    "thank you",
+    "thanks",
+    "good bye",
+    "see you later"
+  ],
+
+  "tabular": [
+    "show sales trends",
+    "plot monthly revenue",
+    "calculate total sales",
+    "group by region",
+    "average revenue",
+    "top customers",
+    "sales dashboard",
+    "find missing values",
+    "summarize spreadsheet",
+    "analyze csv data"
+  ],
+
+  "document": [
+    "summarize document",
+    "analyze pdf",
+    "extract key points",
+    "search this report",
+    "read uploaded pdf",
+    "explain contract",
+    "find document summary",
+    "answer from pdf",
+    "extract table information",
+    "review report"
+  ],
+
+  "orchestrator": [
+    "compare pdf with csv",
+    "combine document data",
+    "analyze all files",
+    "cross reference reports",
+    "investigate business problem",
+    "correlate sales reports",
+    "summarize all uploads",
+    "multiple source analysis",
+    "combine spreadsheet report",
+    "complete investigation"
+  ]
+}

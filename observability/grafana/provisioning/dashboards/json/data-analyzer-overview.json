@@ -1,0 +1,61 @@
+{
+  "title": "Data Analyzer Overview",
+  "uid": "data-analyzer-overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Service up",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "up{job=~\"api_service|worker_service\"}", "legendFormat": "{{job}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "API request rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(http_requests_total{job=\"api_service\"}[5m])) by (handler, status)", "legendFormat": "{{handler}} [{{status}}]" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "API p95 latency",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=\"api_service\"}[5m])) by (le, handler))", "legendFormat": "{{handler}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Container CPU usage",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "sum(rate(container_cpu_usage_seconds_total{name=~\"data-analyzer-.*\"}[5m])) by (name)", "legendFormat": "{{name}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "api_service + worker_service logs",
+      "type": "logs",
+      "datasource": "Loki",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "{service=~\"api_service|worker_service\"}" }
+      ]
+    }
+  ]
+}

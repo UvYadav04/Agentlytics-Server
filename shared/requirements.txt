@@ -7,6 +7,11 @@ boto3
 pyjwt
 google-auth
 requests
+openai
+# Vectorized cosine similarity for shared/intent_router.py's embedding classification tier -
+# a hard dependency (not optional like sentence-transformers below), since the hybrid router is
+# the default routing path, not an opt-in shadow test.
+numpy
 
 # --- Observability (shared by api_service + worker_service) ---
 # Pushes logging.info/error records straight to Loki over HTTP - see

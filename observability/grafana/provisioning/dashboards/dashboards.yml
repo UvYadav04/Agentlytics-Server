@@ -1,0 +1,15 @@
+# Tells Grafana to auto-load any dashboard JSON dropped in ./json alongside
+# this file - no manual "Import dashboard" click-through needed.
+apiVersion: 1
+
+providers:
+  - name: Data Analyzer
+    orgId: 1
+    folder: Data Analyzer
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+      foldersFromFilesStructure: false

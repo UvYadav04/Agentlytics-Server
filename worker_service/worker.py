@@ -52,7 +52,16 @@ async def on_startup(ctx):
     # isn't set (e.g. running this worker bare, outside docker-compose).
     metrics_port = os.environ.get("PROMETHEUS_METRICS_PORT")
     if metrics_port:
-        start_prometheus_metrics_server(int(metrics_port))
+        try:
+            start_prometheus_metrics_server(int(metrics_port))
+        except Exception:
+            # Metrics are additive, same contract as Loki/Langfuse - a bad port, a port already
+            # in use, or Prometheus itself never actually scraping this should never stop the
+            # worker from starting and picking up jobs.
+            logging.getLogger("worker").exception(
+                "failed to start Prometheus metrics server on port %s - continuing without it",
+                metrics_port,
+            )
 
     # Built ONCE per worker process, not once per job - run_ingestion/run_investigation used to
     # construct a fresh LocalParquetStore + ChromaVectorStore on every single call. LocalParquetStore

@@ -1,0 +1,36 @@
+# Scrape config for server/system metrics. Grafana reads from Prometheus as
+# a datasource (auto-provisioned - see ../grafana/provisioning/datasources).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus scraping itself.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Host-level system metrics: CPU, memory, disk, network.
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Per-container resource usage (CPU/mem/network/disk per container).
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  # api_service's FastAPI app metrics (request rate/latency/status codes),
+  # exposed at /metrics via prometheus-fastapi-instrumentator - see
+  # api_service/main.py.
+  - job_name: api_service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api_service:8000"]
+
+  # worker_service has no HTTP server of its own (arq), so it opens a
+  # dedicated metrics-only HTTP server via prometheus_client.start_http_server()
+  # in worker.py's on_startup - see PROMETHEUS_METRICS_PORT in docker-compose.yml.
+  - job_name: worker_service
+    static_configs:
+      - targets: ["worker_service:9100"]

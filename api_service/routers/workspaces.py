@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_owned_workspace
+from shared import usage
 from shared.db import get_db
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
@@ -11,6 +12,10 @@ from shared.models.workspace import Workspace
 from shared.storage import presign_get
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
+
+WORKSPACE_LIMIT_MESSAGE = (
+    "You've reached the free-tier limit of 2 workspaces. Upgrade to create more."
+)
 
 
 class ChartSummaryOut(BaseModel):
@@ -48,8 +53,14 @@ async def list_workspaces(user: User = Depends(get_current_user)):
 
 @router.post("", response_model=WorkspaceOut)
 async def create_workspace(body: CreateWorkspaceRequest, user: User = Depends(get_current_user)):
+    # Free-tier checkpoint: at most 2 workspaces per user (lifetime, tracked on
+    # Usage.workspaces_created - see shared/usage.py), checked before insert.
+    if not await usage.has_workspace_creation_capacity(user.id):
+        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, WORKSPACE_LIMIT_MESSAGE)
+
     workspace = Workspace(user_id=user.id, name=body.name)
     await get_db()[WORKSPACES].insert_one(workspace.to_mongo())
+    await usage.increment_workspaces(user.id)
     return _out(workspace)
 
 

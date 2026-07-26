@@ -57,6 +57,27 @@ def configure_logging(service_name: str, level: str | None = None) -> logging.Lo
     return root
 
 
+class _SafeLokiHandler:
+    """Mixin that swallows any emit()-time failure instead of letting it propagate.
+
+    Loki shipping is meant to be purely additive (see module docstring) - if Loki is down,
+    unreachable (NameResolutionError when the observability compose overlay isn't up), or just
+    slow, that must never take the console handler / the rest of the app down with it. The
+    underlying logging_loki.LokiHandler.emit() can raise requests.exceptions.ConnectionError
+    straight through; logging's own Handler.handleError() safety net only prints "--- Logging
+    error ---" and normally doesn't re-raise, but that's an extra assumption not worth relying on
+    (e.g. inside arq's worker loop, an exception raised while handling a log record during
+    on_startup has in practice taken the whole process down). Catch here explicitly so the
+    contract is "never raises," full stop, not "probably doesn't raise."
+    """
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except Exception:
+            pass
+
+
 def _attach_loki_handler(root: logging.Logger, loki_url: str, service_name: str, settings) -> None:
     try:
         import logging_loki
@@ -69,7 +90,10 @@ def _attach_loki_handler(root: logging.Logger, loki_url: str, service_name: str,
 
     environment = settings.get("ENVIRONMENT") or os.environ.get("ENVIRONMENT") or "development"
 
-    loki_handler = logging_loki.LokiHandler(
+    class SafeLokiHandler(_SafeLokiHandler, logging_loki.LokiHandler):
+        pass
+
+    loki_handler = SafeLokiHandler(
         url=loki_url,
         tags={"service": service_name, "environment": environment},
         version="1",

@@ -1,3 +1,4 @@
+.env
 shared/.env
 */.env
 */*/.env

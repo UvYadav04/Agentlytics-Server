@@ -1,3 +1,5 @@
 -r ../shared/requirements.txt
 -r ../analyzerEngine/requirements.txt
 arq
+torch==2.8.0
+torchvision==0.23.0

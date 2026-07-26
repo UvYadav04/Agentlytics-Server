@@ -1,12 +1,17 @@
-"""arq job: run_investigation(ctx, investigation_id, chat_id, workspace_id, user_id, query, file_ids).
+"""arq job: run_investigation(ctx, investigation_id, chat_id, workspace_id, user_id, query,
+file_ids, route).
 
 Rebuilds a shallow FileCatalog from Mongo (only "ready" files, see
-agent_tools_specification.md Section 1.4), runs the engine's
-OrchestratorAgent with streaming callbacks wired to Mongo (source of truth,
-Investigation.events[]) and Redis pub/sub (live tail for connected SSE
-clients - see full_application_build_plan.md Phase 5), and on completion
-creates the assistant Message plus any Chart/Report docs the investigation
-produced.
+agent_tools_specification.md Section 1.4), then either runs the engine's OrchestratorAgent
+(default) or - when `route` is "tabular"/"document" and file selection is unambiguous (see
+_select_direct_route_files) - skips the Orchestrator entirely and invokes the matching
+specialized agent directly (_run_tabular_direct/_run_document_direct). `route` comes from
+api_service/routers/chats.py's send_message, which classifies the query with
+shared/intent_router.py's hybrid embedding/LLM classifier BEFORE enqueueing this job - that's a
+real routing decision, not a shadow test (see that module's docstring). Either path streams
+callbacks to Mongo (source of truth, Investigation.events[]) and Redis pub/sub (live tail for
+connected SSE clients - see full_application_build_plan.md Phase 5), and on completion creates
+the assistant Message plus any Chart/Report docs the investigation produced.
 
 This job is entirely independent of any HTTP connection - it keeps running
 and writing progress regardless of whether anyone is currently subscribed
@@ -22,14 +27,18 @@ from datetime import datetime, timezone
 
 from worker_service import engine_bootstrap  # noqa: F401
 
+from analyzerEngine.agents.document.agent import DocumentAgent
 from analyzerEngine.agents.orchestrator.agent import InvestigationCancelled, OrchestratorAgent
+from analyzerEngine.agents.tabular.agent import TabularAgent
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
 from analyzerEngine.llm_provider.errors import classify_llm_error
 from analyzerEngine.sandbox.path_resolver import InvalidArtifactIdError, get_parquet_path
+from analyzerEngine.tools.document.metadata import build_document_metadata_brief
 from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog, is_tabular_output_ref, table_catalog_entry
 from analyzerEngine.tools.orchestrator.memory import LongTermMemory
-from analyzerEngine.tools.orchestrator.models import FileCatalogEntry
+from analyzerEngine.tools.orchestrator.models import FileCatalogEntry, FileRef, OrchestratorResult
 from analyzerEngine.tools.orchestrator.thread_summary import update_summary
+from analyzerEngine.tools.tabular.models import FileRef as TabularFileRef
 
 from shared import usage
 from shared.db import get_db
@@ -150,29 +159,6 @@ async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> t
         ))
         for entry in table_entries:
             catalog.add_entry(entry)
-
-    # if stale_ids:
-        # Safe to persist this back to Mongo (previously left commented out): PARQUET_ROOT is
-        # a confirmed-persistent bind mount (see docstring above and docker-compose.yml), so a
-        # missing output_ref reliably means the file is genuinely gone, not just a transient
-        # artifact of a redeploy. Marking it "failed" once here - rather than leaving Mongo
-        # saying "ready" forever - stops every future investigation from silently re-doing this
-        # same disk check and re-reporting the same skipped file to the user on every turn.
-        # await db[FILES].update_many(
-        #     {"_id": {"$in": stale_ids}},
-        #     {"$set": {
-        #         "status": "failed",
-        #         "error": (
-        #             "Parquet output missing from local storage - the file's disk data is gone "
-        #             "even though the persistent PARQUET_ROOT volume is intact. Please re-upload "
-        #             "this file."
-        #         ),
-        #     }},
-        # )
-        # logger.warning(
-        #     "workspace %s: %d file(s) marked failed - output_ref missing on disk: %s",
-        #     workspace_id, len(stale_ids), skipped_filenames,
-        # )
 
     return catalog, skipped_filenames
 
@@ -418,9 +404,88 @@ async def _persist_artifacts(
     return chart_ids, report_id
 
 
+def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, kind: str) -> list | None:
+    """Files to hand a direct-routed Tabular/Document agent, or None if direct-routing isn't
+    safe here - the caller falls back to the full Orchestrator in that case, same as if route
+    had been None/"orchestrator" to begin with.
+
+    Only two cases count as safe:
+    - the user explicitly @-mentioned file_id(s) (SendMessageRequest.file_ids) that resolve to
+      at least one eligible file of the right kind, or
+    - the workspace has EXACTLY ONE eligible file, so there's nothing to disambiguate.
+
+    Anything else (zero eligible files, or more than one with no explicit mention) is NOT
+    direct-routed - guessing which file a request means is exactly the judgment call the
+    Orchestrator exists for, and this router makes no attempt to replace that judgment."""
+    if kind == "tabular":
+        eligible = [e for e in catalog.browsable() if is_tabular_output_ref(e.output_ref)]
+    else:
+        eligible = [e for e in catalog.browsable() if e.file_type in ("pdf", "txt")]
+
+    if not eligible:
+        return None
+
+    if mentioned_file_ids:
+        matched = [e for e in eligible if e.file_id in mentioned_file_ids]
+        return matched or None
+
+    if len(eligible) == 1:
+        return eligible
+
+    return None
+
+
+async def _run_tabular_direct(
+    catalog: FileCatalog, storage: LocalParquetStore, investigation_id: str, sandbox_manager,
+    workspace_id: str, query: str, mentioned_file_ids: list, on_event,
+) -> OrchestratorResult | None:
+    """Skips the Orchestrator entirely - builds a TabularAgent straight from the catalog and
+    runs it. Returns None (never raises for this reason) when file selection isn't unambiguous,
+    signaling the caller to fall back to the full Orchestrator instead."""
+    entries = _select_direct_route_files(catalog, mentioned_file_ids, "tabular")
+    if entries is None:
+        return None
+
+    assigned_files = [TabularFileRef(file_id=e.file_id, filename=e.filename) for e in entries]
+    agent = TabularAgent(
+        assigned_files, storage=storage, workspace_id=workspace_id,
+        investigation_id=investigation_id, sandbox_manager=sandbox_manager, direct_route=True,
+        reports_dir=engine_bootstrap.REPORTS_ROOT,
+    )
+    findings = await agent.run(query, constraints={}, on_event=on_event)
+    # findings.artifact_refs already includes any chart HTML paths create_visualizations wrote
+    # (see agents/tabular/agent.py's run()) - _persist_artifacts below picks those up exactly the
+    # same way it does for the full-Orchestrator path, no direct-route-specific handling needed.
+    return OrchestratorResult(
+        final_answer=findings.summary, artifact_refs=findings.artifact_refs,
+        open_questions=[], files_used=[e.file_id for e in entries],
+    )
+
+
+async def _run_document_direct(
+    catalog: FileCatalog, vector_store, query: str, mentioned_file_ids: list, on_event,
+) -> OrchestratorResult | None:
+    """Same shape as _run_tabular_direct above, for the Document Agent - targeted document
+    reasoning only (see agents/document/config.py's own scoping note), not whole-document
+    coverage. Returns None when file selection isn't unambiguous."""
+    entries = _select_direct_route_files(catalog, mentioned_file_ids, "document")
+    if entries is None:
+        return None
+
+    assigned_files = [FileRef(file_id=e.file_id) for e in entries]
+    # Deterministic backend lookup, never an LLM tool call - see tools/document/metadata.py.
+    metadata_brief = build_document_metadata_brief(catalog, vector_store, [e.file_id for e in entries])
+    agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True)
+    findings = await agent.run(query, constraints={}, on_event=on_event, metadata_brief=metadata_brief)
+    return OrchestratorResult(
+        final_answer=findings.summary, artifact_refs=findings.artifact_refs,
+        open_questions=[], files_used=[e.file_id for e in entries],
+    )
+
+
 async def run_investigation(
     ctx, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str,
-    file_ids: list[str] | None = None, requested_at: str | None = None,
+    file_ids: list[str] | None = None, requested_at: str | None = None, route: str | None = None,
 ) -> None:
     # First line, always - logs when this worker actually started running the job, plus
     # queue_wait/request_to_worker latency (requested_at comes from chats.py's send_message,
@@ -430,25 +495,6 @@ async def run_investigation(
         investigation_id=investigation_id, chat_id=chat_id,
     )
 
-    # Kick off this investigation's persistent sandbox container NOW, in the background, so its
-    # ~2-3s Docker create + health-check wait (see sandbox/sandbox_manager.py) overlaps with the
-    # catalog build and the orchestrator's own LLM calls below instead of being paid synchronously
-    # whenever the Tabular Agent's first run_python() call eventually happens. SandboxManager.
-    # get_or_create is keyed + locked by investigation_id, so that later call just finds (or
-    # briefly waits on) this same in-flight/cached container - it never races to create a second
-    # one. Fire-and-forget except for the `finally` block below, which always waits for this task
-    # before releasing, so cleanup can never run concurrently with creation.
-    #
-    # ctx["sandbox_manager"] - built ONCE in worker.py's on_startup - not get_sandbox_manager()
-    # called fresh here: the module-level singleton getter is keyed by import path
-    # (`analyzerEngine.sandbox.sandbox_manager`, which this file uses, vs the bare
-    # `sandbox.sandbox_manager` analyzerEngine's own internal modules use, resolve to two
-    # different sys.modules entries with two independent singletons - see
-    # sandbox_manager.get_manager's docstring). Using ctx's instance and threading it explicitly
-    # into OrchestratorAgent below (which passes it all the way down to PythonSandbox) guarantees
-    # this pre-warm, the real run_python() execution, and the release() call at the end of this
-    # function all agree on the exact same SandboxManager - otherwise the pre-warmed container
-    # sits unused in one singleton's cache while the real call creates a second one in the other.
     sandbox_manager = ctx["sandbox_manager"]
     prewarm_start = time.perf_counter()
     sandbox_prewarm_task = asyncio.create_task(
@@ -503,11 +549,14 @@ async def run_investigation(
 
     vector_store = ctx["vector_store"]
     memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
-    orchestrator = OrchestratorAgent(
-        catalog, vector_store=vector_store, memory=memory, storage=storage,
-        reports_dir=engine_bootstrap.REPORTS_ROOT, investigation_id=investigation_id,
-        sandbox_manager=sandbox_manager,
-    )
+
+    # route came from api_service/routers/chats.py's send_message classifying the query BEFORE
+    # enqueueing this job - "tabular"/"document" here means "try direct-routing", anything else
+    # (None, "orchestrator", or a value this worker doesn't recognize) means "run the full
+    # Orchestrator", same as today's only behavior before this feature existed. Restricted to
+    # exactly these two here (not trusting the string blindly) so a future new classifier label
+    # can never accidentally skip the Orchestrator without this file being updated to handle it.
+    direct_route = route if route in ("tabular", "document") else None
 
     if skipped_files:
         await on_event({
@@ -521,11 +570,50 @@ async def run_investigation(
 
     try:
         try:
-            thread_context = await _thread_context(db, chat_id)
-            result = await orchestrator.run(
-                query, workspace_id=workspace_id, thread_context=thread_context,
-                on_event=on_event, cancel_check=cancel_check,
-            )
+            result = None
+
+            if direct_route == "tabular":
+                result = await _run_tabular_direct(
+                    catalog, storage, investigation_id, sandbox_manager, workspace_id, query,
+                    mentioned_file_ids, on_event,
+                )
+                if result is None:
+                    logger.info(
+                        "investigation %s: tabular direct-route unsafe (no unambiguous file "
+                        "selection) - falling back to the Orchestrator", investigation_id,
+                    )
+            elif direct_route == "document":
+                result = await _run_document_direct(
+                    catalog, vector_store, query, mentioned_file_ids, on_event,
+                )
+                if result is None:
+                    logger.info(
+                        "investigation %s: document direct-route unsafe (no unambiguous file "
+                        "selection) - falling back to the Orchestrator", investigation_id,
+                    )
+
+            if result is not None:
+                logger.info(
+                    "investigation %s: handled directly by the %s agent (Orchestrator skipped)",
+                    investigation_id, direct_route,
+                )
+            else:
+                # Default path - either route was None/"orchestrator" to begin with, or a
+                # direct-route attempt above declined (ambiguous file selection) and fell
+                # through to here. NOTE: a direct-routed investigation does not currently
+                # support cancel_check mid-run - TabularAgent/DocumentAgent's own run() loops
+                # don't accept it the way OrchestratorAgent.run()'s outer loop does. Only the
+                # Orchestrator path below can be cancelled once it has started.
+                orchestrator = OrchestratorAgent(
+                    catalog, vector_store=vector_store, memory=memory, storage=storage,
+                    reports_dir=engine_bootstrap.REPORTS_ROOT, investigation_id=investigation_id,
+                    sandbox_manager=sandbox_manager,
+                )
+                thread_context = await _thread_context(db, chat_id)
+                result = await orchestrator.run(
+                    query, workspace_id=workspace_id, thread_context=thread_context,
+                    on_event=on_event, cancel_check=cancel_check,
+                )
         except InvestigationCancelled:
             await db[INVESTIGATIONS].update_one(
                 {"_id": investigation_id}, {"$set": {"status": "cancelled", "completed_at": _now()}},

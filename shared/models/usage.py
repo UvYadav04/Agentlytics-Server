@@ -12,4 +12,6 @@ class Usage(MongoModel):
     messages_sent: int = 0
     charts_created: int = 0
     reports_created: int = 0
+    chats_created: int = 0
+    workspaces_created: int = 0
     period_start: datetime = Field(default_factory=utcnow)

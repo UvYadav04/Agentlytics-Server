@@ -26,6 +26,7 @@ from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
+from shared.intent_router import route_query_intent
 from shared.job_timing import now_iso
 from shared.redis_client import get_arq_pool, get_redis, investigation_channel
 from shared.storage import delete_object
@@ -90,8 +91,24 @@ async def _shadow_classify_and_log(
 
 router = APIRouter(tags=["chats"])
 
+# Below this confidence, treat the classification as "unknown" and fall back to the full
+# Orchestrator (route=None) rather than trust a low-confidence direct route - a misroute here
+# means a wrong/incomplete answer, not just a slower one. run_investigation applies a second,
+# independent safety check on top of this (whether the file selection is actually unambiguous
+# for tabular/document routes - see its _select_direct_route_files), so this threshold only
+# needs to guard against the classifier itself being unsure.
+INTENT_ROUTE_CONFIDENCE_THRESHOLD = 0.7
+
 LIMIT_MESSAGE = (
     "You've used all 20 free messages. Upgrade for more, or check back once your plan resets."
+)
+
+CHAT_MESSAGE_LIMIT_MESSAGE = (
+    "This chat has reached the 8-message free-tier limit. Start a new chat to keep going."
+)
+
+CHAT_LIMIT_MESSAGE = (
+    "You've reached the free-tier limit of 2 chats. Upgrade to create more."
 )
 
 
@@ -150,8 +167,16 @@ def _message_out(m: Message) -> MessageOut:
 @router.post("/workspaces/{workspace_id}/chats", response_model=ChatOut)
 async def create_chat(workspace_id: str, body: CreateChatRequest, user: User = Depends(get_current_user)):
     await get_owned_workspace(workspace_id, user)
+
+    # Free-tier checkpoint: at most 2 chats per user (lifetime, tracked on Usage.chats_created -
+    # see shared/usage.py). Checked before insert, same "check before the gated action starts"
+    # pattern as send_message's message-capacity check below.
+    if not await usage.has_chat_creation_capacity(user.id):
+        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, CHAT_LIMIT_MESSAGE)
+
     chat = Chat(workspace_id=workspace_id, title=body.title)
     await get_db()[CHATS].insert_one(chat.to_mongo())
+    await usage.increment_chats(user.id)
     return _chat_out(chat)
 
 
@@ -295,7 +320,24 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     )
 
     chat = await get_owned_chat(chat_id, user)
-                
+
+    # Free-tier checkpoints, both checked before the user's message is persisted /
+    # anything is enqueued: (1) this specific chat's own 8-message cap, then (2) the
+    # user's lifetime 20-message cap across every chat (shared/usage.py). Either one
+    # being hit still persists the user's message (so it's visible in the transcript)
+    # but never enqueues an investigation for it.
+    if not await usage.has_chat_message_capacity(chat_id):
+        message = Message(chat_id=chat_id, role="user", content=body.content)
+        await get_db()[MESSAGES].insert_one(message.to_mongo())
+        logger.info(
+            "send_message: rejected (per-chat message capacity reached) at +%.1fms (chat_id=%s)",
+            (time.perf_counter() - t0) * 1000, chat_id,
+        )
+        return SendMessageResponse(
+            message_id=message.id, investigation_id=None, limited=True,
+            limit_message=CHAT_MESSAGE_LIMIT_MESSAGE,
+        )
+
     if not await usage.has_message_capacity(user.id):
         message = Message(chat_id=chat_id, role="user", content=body.content)
         await get_db()[MESSAGES].insert_one(message.to_mongo())
@@ -315,18 +357,55 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     )
     # Shadow test only - classifies the query and logs the decision, but
     # never affects routing: the arq enqueue below always runs regardless.
-    _schedule_shadow_classification(
-        chat_id=chat_id,
-        message_id=message.id,
-        user_id=user.id,
-        query=body.content,
-    )
+    # _schedule_shadow_classification(
+    #     chat_id=chat_id,
+    #     message_id=message.id,
+    #     user_id=user.id,
+    #     query=body.content,
+    # )
 
     investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
     await get_db()[INVESTIGATIONS].insert_one(investigation.to_mongo())
     logger.info(
         "send_message: investigation %s created at +%.1fms (chat_id=%s)",
         investigation.id, (time.perf_counter() - t0) * 1000, chat_id,
+    )
+
+    # Real routing decision now (was a foreground latency/accuracy test only - see
+    # shared/intent_classifier.py's module docstring). Called in the foreground, not
+    # fire-and-forget, because run_investigation needs the route BEFORE it's enqueued - there's
+    # no cheap way to decide this after the fact without adding a second job round trip.
+    #
+    # route_query_intent (shared/intent_router.py) is a hybrid classifier: embedding similarity
+    # first (near-instant, no LLM call), falling back to the LLM classifier only when the
+    # embedding result isn't confident - see that module's docstring. Only
+    # "tabular"/"document"/"orchestrator" are ever passed through as a real route; "greeting" and
+    # anything below confidence (including a classifier error, which reports top_score=0.0) fall
+    # back to route=None, which run_investigation treats as "run the full Orchestrator" - the
+    # always-safe default this feature must never regress on a low-confidence or failed
+    # classification.
+    route_result = await asyncio.to_thread(route_query_intent, body.content)
+    if route_result.method == "embedding":
+        # Already passed both the similarity AND margin confidence gates inside
+        # route_query_intent - trusted directly, no extra threshold needed here.
+        route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
+    else:
+        # method == "llm" (embedding wasn't confident) or "none" (no usable result at all) -
+        # same INTENT_ROUTE_CONFIDENCE_THRESHOLD gate the original LLM-only classifier always
+        # applied, kept here so a low-confidence LLM answer still falls back to the Orchestrator.
+        llm = route_result.llm_result
+        route = (
+            llm.top_label
+            if llm is not None and llm.top_label in ("tabular", "document", "orchestrator")
+            and llm.top_score >= INTENT_ROUTE_CONFIDENCE_THRESHOLD
+            else None
+        )
+    logger.info(
+        "send_message: intent_router method=%s top_intent=%s top_similarity=%.3f margin=%.3f "
+        "route=%s router_latency_ms=%.1f at +%.1fms total (chat_id=%s, error=%s)",
+        route_result.method, route_result.top_intent, route_result.top_similarity,
+        route_result.margin, route, route_result.latency_ms,
+        (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
     )
 
     pool = await get_arq_pool()
@@ -339,6 +418,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         query=body.content,
         file_ids=body.file_ids,
         requested_at=request_received_at,
+        route=route,
     )
     logger.info(
         "send_message: investigation %s enqueued as arq job %s at +%.1fms total (chat_id=%s)",

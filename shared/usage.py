@@ -1,10 +1,15 @@
-"""Free-tier usage limits (Phase 6): 20 messages, 4 charts/dashboards, 2
-reports, per user, tracked in the `usage` collection.
+"""Free-tier usage limits (Phase 6): 20 messages total, 3 charts/dashboards,
+2 reports, 2 chats created, 2 workspaces created - per user, tracked in the
+`usage` collection. On top of that, each individual chat is capped at 8
+messages (checked against the `messages` collection directly, scoped by
+chat_id, since that's a per-chat count rather than a lifetime per-user
+counter - see has_chat_message_capacity below).
 
 Checks happen before the gated action starts (POST /chats/{id}/messages
-checks before enqueueing); increments happen only after the action actually
-succeeds (a cancelled/failed investigation, or a chart/report that failed to
-generate, must not count against the limit).
+checks before enqueueing; POST /workspaces/{id}/chats and POST /workspaces
+check before inserting the new Chat/Workspace doc); increments happen only
+after the action actually succeeds (a cancelled/failed investigation, or a
+chart/report that failed to generate, must not count against the limit).
 
 Chart/report generation isn't its own enqueue step in this engine - the
 orchestrator decides autonomously, mid-investigation, whether to call
@@ -17,6 +22,7 @@ the cap - see worker_service/tasks/investigation.py.
 """
 from shared.config import get_settings
 from shared.db import get_db
+from shared.models.message import COLLECTION as MESSAGES
 from shared.models.usage import COLLECTION as USAGE
 from shared.models.usage import Usage
 
@@ -29,12 +35,24 @@ def messages_limit() -> int:
     return _limit("FREE_TIER_MESSAGES", 20)
 
 
+def messages_per_chat_limit() -> int:
+    return _limit("FREE_TIER_MESSAGES_PER_CHAT", 8)
+
+
 def charts_limit() -> int:
-    return _limit("FREE_TIER_CHARTS", 4)
+    return _limit("FREE_TIER_CHARTS", 3)
 
 
 def reports_limit() -> int:
     return _limit("FREE_TIER_REPORTS", 2)
+
+
+def chats_limit() -> int:
+    return _limit("FREE_TIER_CHATS", 2)
+
+
+def workspaces_limit() -> int:
+    return _limit("FREE_TIER_WORKSPACES", 2)
 
 
 async def get_or_create_usage(user_id: str) -> Usage:
@@ -52,6 +70,15 @@ async def has_message_capacity(user_id: str) -> bool:
     return usage.messages_sent < messages_limit()
 
 
+async def has_chat_message_capacity(chat_id: str) -> bool:
+    """Per-chat cap (default 8), independent of the per-user lifetime caps
+    above - counted directly off the `messages` collection (both roles)
+    rather than a Usage counter, since it naturally resets to 0 for every
+    new chat and needs no increment step of its own."""
+    count = await get_db()[MESSAGES].count_documents({"chat_id": chat_id})
+    return count < messages_per_chat_limit()
+
+
 async def has_chart_capacity(user_id: str) -> bool:
     usage = await get_or_create_usage(user_id)
     return usage.charts_created < charts_limit()
@@ -60,6 +87,16 @@ async def has_chart_capacity(user_id: str) -> bool:
 async def has_report_capacity(user_id: str) -> bool:
     usage = await get_or_create_usage(user_id)
     return usage.reports_created < reports_limit()
+
+
+async def has_chat_creation_capacity(user_id: str) -> bool:
+    usage = await get_or_create_usage(user_id)
+    return usage.chats_created < chats_limit()
+
+
+async def has_workspace_creation_capacity(user_id: str) -> bool:
+    usage = await get_or_create_usage(user_id)
+    return usage.workspaces_created < workspaces_limit()
 
 
 async def increment_messages(user_id: str) -> None:
@@ -75,3 +112,13 @@ async def increment_charts(user_id: str) -> None:
 async def increment_reports(user_id: str) -> None:
     await get_or_create_usage(user_id)
     await get_db()[USAGE].update_one({"user_id": user_id}, {"$inc": {"reports_created": 1}})
+
+
+async def increment_chats(user_id: str) -> None:
+    await get_or_create_usage(user_id)
+    await get_db()[USAGE].update_one({"user_id": user_id}, {"$inc": {"chats_created": 1}})
+
+
+async def increment_workspaces(user_id: str) -> None:
+    await get_or_create_usage(user_id)
+    await get_db()[USAGE].update_one({"user_id": user_id}, {"$inc": {"workspaces_created": 1}})

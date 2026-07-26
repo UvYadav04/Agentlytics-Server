@@ -26,7 +26,7 @@ from shared.db import get_db
 from shared.job_timing import log_job_finished, log_job_picked_up
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
-from shared.storage import get_bucket_name, get_s3_client
+from shared.storage import delete_object, get_bucket_name, get_s3_client
 
 logger = logging.getLogger("worker.ingestion")
 
@@ -98,5 +98,19 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
         await db[FILES].update_one({"_id": file.id}, {"$set": update})
         logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
         status_for_log = result.status
+
+        # Nothing reads the raw uploaded file back from S3 after this point - tabular files
+        # are queried through their parquet output_ref (LocalParquetStore) and PDFs are queried
+        # through their extracted chunks in the vector store, never through storage_key again.
+        # So the raw copy is dead weight in S3 the moment ingestion succeeds, regardless of file
+        # type. Best-effort: a delete failure here shouldn't turn a successful ingestion into a
+        # failed job - it just means one orphaned object to clean up later.
+        try:
+            await asyncio.to_thread(delete_object, file.storage_key)
+            logger.info("run_ingestion: deleted raw upload from S3 for file %s (key=%s)",
+                        file.id, file.storage_key)
+        except Exception:
+            logger.exception("run_ingestion: failed to delete raw upload from S3 for file %s (key=%s)",
+                              file.id, file.storage_key)
     finally:
         log_job_finished(logger, "run_ingestion", picked_up_at, status=status_for_log, file_id=file_id)
