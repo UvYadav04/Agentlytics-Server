@@ -49,7 +49,7 @@ app.add_middleware(
     allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  
 )
 
 # Exposes GET /metrics (request count/latency/status codes, broken down by
