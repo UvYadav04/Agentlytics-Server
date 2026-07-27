@@ -58,9 +58,10 @@ _DATA_DIR = Path(__file__).resolve().parent / "data"
 # deployment section.
 PARQUET_ROOT = _env_or_default("PARQUET_ROOT", _DATA_DIR / "parquet")
 
-# LongTermMemory (store_user_info/recall_user_info) is one JSON file per
-# scope - we scope it per-user (see tasks/investigation.py) so preferences
-# don't leak across users, since the engine's default is a single global file.
+# LongTermMemory (written by tasks/investigation.py's update_chat_memory job after each
+# completed turn, read by OrchestratorTools.recall_user_info) is one JSON file per scope - we
+# scope it per-user (see tasks/investigation.py) so preferences don't leak across users, since
+# the engine's default is a single global file.
 #
 # IMPORTANT if you containerize worker_service (docker-compose.yml): the
 # `_DATA_DIR / "memory"` default below lives on the container's own writable

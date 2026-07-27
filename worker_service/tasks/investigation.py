@@ -1,7 +1,12 @@
-"""arq job: run_investigation(ctx, investigation_id, chat_id, workspace_id, user_id, query,
-file_ids, route).
+"""Two arq jobs:
 
-Rebuilds a shallow FileCatalog from Mongo (only "ready" files, see
+- run_investigation(ctx, investigation_id, chat_id, workspace_id, user_id, query, file_ids,
+  route) - the main investigation job.
+- update_chat_memory(ctx, chat_id, user_id, query, response, files_used, files_created) -
+  enqueued by run_investigation right after it completes, decoupled so its own LLM-call latency
+  is never on the user-facing critical path (see its own docstring).
+
+run_investigation rebuilds a shallow FileCatalog from Mongo (only "ready" files, see
 agent_tools_specification.md Section 1.4), then either runs the engine's OrchestratorAgent
 (default) or - when `route` is "tabular"/"document" and file selection is unambiguous (see
 _select_direct_route_files) - skips the Orchestrator entirely and invokes the matching
@@ -13,9 +18,9 @@ callbacks to Mongo (source of truth, Investigation.events[]) and Redis pub/sub (
 connected SSE clients - see full_application_build_plan.md Phase 5), and on completion creates
 the assistant Message plus any Chart/Report docs the investigation produced.
 
-This job is entirely independent of any HTTP connection - it keeps running
-and writing progress regardless of whether anyone is currently subscribed
-to the investigation's SSE stream (refresh-safety, see the build plan).
+Both jobs are entirely independent of any HTTP connection - they keep running and writing
+progress regardless of whether anyone is currently subscribed to the investigation's SSE stream
+(refresh-safety, see the build plan).
 """
 import asyncio
 import json
@@ -36,13 +41,17 @@ from analyzerEngine.sandbox.path_resolver import InvalidArtifactIdError, get_par
 from analyzerEngine.tools.document.metadata import build_document_metadata_brief
 from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog, is_tabular_output_ref, table_catalog_entry
 from analyzerEngine.tools.orchestrator.memory import LongTermMemory
-from analyzerEngine.tools.orchestrator.models import FileCatalogEntry, FileRef, OrchestratorResult
-from analyzerEngine.tools.orchestrator.thread_summary import update_summary
+from analyzerEngine.tools.orchestrator.models import (
+    FileCatalogEntry, FileRef, FinalResultCollector, OrchestratorResult,
+)
+from analyzerEngine.tools.orchestrator.thread_summary import analyze_turn
 from analyzerEngine.tools.tabular.models import FileRef as TabularFileRef
+
+from arq import Retry
 
 from shared import usage
 from shared.db import get_db
-from shared.job_timing import log_job_finished, log_job_picked_up
+from shared.job_timing import log_job_finished, log_job_picked_up, now_iso
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
 from shared.models.chat import COLLECTION as CHATS
@@ -60,7 +69,7 @@ from shared.storage import build_chart_key, build_report_key, get_bucket_name, g
 
 # recent_turns keeps the last this-many {query, response} pairs verbatim on
 # the Chat doc; anything older only survives through Chat.summary (see
-# _update_chat_continuity). files_used/files_created are capped separately
+# update_chat_memory below). files_used/files_created are capped separately
 # so a very long chat's lists can't grow without bound either.
 RECENT_TURNS_LIMIT = 5
 FILE_LIST_LIMIT = 30
@@ -181,8 +190,8 @@ async def _is_cancelled(db, investigation_id: str) -> bool:
 async def _thread_context(db, chat_id: str) -> dict:
     """Read side of thread continuity - handed to OrchestratorAgent.run() as
     `thread_context` so this investigation's task prompt includes what
-    happened earlier in this same chat. See _update_chat_continuity for the
-    write side."""
+    happened earlier in this same chat. See update_chat_memory (below) for
+    the write side."""
     doc = await db[CHATS].find_one(
         {"_id": chat_id}, {"summary": 1, "recent_turns": 1, "files_used": 1, "files_created": 1},
     ) or {}
@@ -202,52 +211,91 @@ def _merge_capped(existing: list, new_items: list, cap: int) -> list:
     return merged[-cap:]
 
 
-async def _update_chat_continuity(db, chat_id: str, query: str, result) -> None:
-    """Write side of thread continuity - called AFTER the investigation's own
-    completion is already recorded and broadcast (see call site in
-    run_investigation), so the summary LLM call below never delays the user
-    seeing their answer. A failure here only means the next message in this
-    chat starts from a slightly stale summary, never that this investigation
-    itself fails - see the try/except around the LLM call."""
-    doc = await db[CHATS].find_one(
-        {"_id": chat_id}, {"summary": 1, "recent_turns": 1, "files_used": 1, "files_created": 1},
-    ) or {}
+async def update_chat_memory(
+    ctx, chat_id: str, user_id: str, query: str, response: str,
+    files_used: list, files_created: list, requested_at: str | None = None,
+) -> None:
+    """arq job - write side of thread continuity, PLUS long-term user-preference extraction.
+    Enqueued by run_investigation right after the investigation's own "completed" event/Message
+    are already persisted and broadcast (see call site there), so this job's own latency - one
+    LLM call, occasionally two concerns' worth (see thread_summary.analyze_turn) - is never on
+    the user-facing critical path: the user sees their answer the moment the SSE "completed"
+    event goes out, regardless of how long this job takes to actually run, or whether it needs
+    to retry.
 
-    recent_turns = (doc.get("recent_turns", []) + [{"query": query, "response": result.final_answer}])
-    recent_turns = recent_turns[-RECENT_TURNS_LIMIT:]
+    This also replaces the orchestrator's old store_user_info tool call: that used to cost a
+    full extra synchronous LLM round trip (tool call -> tool result -> continue) DURING the
+    investigation whenever the model decided something was worth remembering. The same
+    extraction now happens here instead, as a side effect of the summary call every completed
+    turn already schedules - zero added latency inside the investigation itself, at the cost of
+    the preference being "known" starting with the NEXT investigation rather than immediately
+    (acceptable - nothing mid-investigation ever depended on same-turn recall).
 
-    files_used = _merge_capped(doc.get("files_used", []), result.files_used, FILE_LIST_LIMIT)
-    files_created = _merge_capped(doc.get("files_created", []), result.artifact_refs, FILE_LIST_LIMIT)
+    Only fold turns into Chat.summary once they're about to age out of the raw recent_turns
+    window (RECENT_TURNS_LIMIT) - a chat with 5 or fewer turns has no overflow, so the
+    orchestrator's next task prompt gets recent_turns only, no summary (see
+    OrchestratorAgent._thread_context_brief, which already omits an empty summary line). Once a
+    chat passes 5 turns, each new turn evicts exactly one older turn from the window, which gets
+    folded into the summary right here before it's dropped.
+
+    Retries via arq's own Retry mechanism on any failure (Mongo hiccup, LLM provider hiccup, ...)
+    instead of silently keeping a stale summary the way the old inline version did - there's no
+    user-facing signal for this job succeeding or failing, so it needs to actually keep trying
+    rather than give up on the first transient error. See WorkerSettings.functions in worker.py
+    for this function's max_tries."""
+    picked_up_at = log_job_picked_up(
+        logger, ctx, "update_chat_memory", requested_at=requested_at, chat_id=chat_id,
+    )
+    db = get_db()
 
     try:
-        new_summary = await update_summary(doc.get("summary", ""), query, result.final_answer)
-    except Exception:
-        logger.exception("failed to update chat summary for chat %s - keeping previous summary", chat_id)
-        new_summary = doc.get("summary", "")
+        doc = await db[CHATS].find_one(
+            {"_id": chat_id}, {"summary": 1, "recent_turns": 1, "files_used": 1, "files_created": 1},
+        ) or {}
 
-    await db[CHATS].update_one(
-        {"_id": chat_id},
-        {"$set": {
-            "summary": new_summary,
-            "files_used": files_used,
-            "files_created": files_created,
-            "recent_turns": recent_turns,
-        }},
-    )
+        existing_turns = doc.get("recent_turns", [])
+        combined_turns = existing_turns + [{"query": query, "response": response}]
+        # Turns aging out of the raw window this update - almost always 0 (chat still <=
+        # RECENT_TURNS_LIMIT turns long) or 1 (one new turn pushed one old one out). Only these
+        # need folding into the summary - everything still inside recent_turns is already shown
+        # to the orchestrator verbatim, so summarizing it too would just be redundant, duplicated
+        # context on every turn of a short chat (see analyze_turn's own docstring).
+        overflow_turns = combined_turns[:-RECENT_TURNS_LIMIT] if len(combined_turns) > RECENT_TURNS_LIMIT else []
+        recent_turns = combined_turns[-RECENT_TURNS_LIMIT:]
 
+        new_summary, new_preferences = await analyze_turn(
+            doc.get("summary", ""), query, response, turns_to_fold=overflow_turns,
+        )
 
-def _artifact_kind(path: str) -> str | None:
-    # A real-time dashboard (ReportingTools.generate_realtime_dashboard_bundle) returns its
-    # manifest.json path instead of an .html path specifically so it's distinguishable here
-    # from an ordinary single chart - see _persist_dashboard_bundle below.
-    if os.path.basename(path) == "manifest.json":
-        return "dashboard_bundle"
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".html":
-        return "chart"
-    if ext in (".md", ".csv"):
-        return "report"
-    return None
+        merged_files_used = _merge_capped(doc.get("files_used", []), files_used, FILE_LIST_LIMIT)
+        merged_files_created = _merge_capped(doc.get("files_created", []), files_created, FILE_LIST_LIMIT)
+
+        await db[CHATS].update_one(
+            {"_id": chat_id},
+            {"$set": {
+                "summary": new_summary,
+                "files_used": merged_files_used,
+                "files_created": merged_files_created,
+                "recent_turns": recent_turns,
+            }},
+        )
+
+        if new_preferences:
+            memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
+            for fact in new_preferences:
+                memory.remember(fact)
+    except Exception as exc:
+        logger.exception(
+            "update_chat_memory failed for chat %s (job_try=%s) - retrying", chat_id, ctx.get("job_try"),
+        )
+        # Exponential-ish backoff (5s, 10s, 15s, ... for job_try 1, 2, 3, ...), same pattern arq's
+        # own docs recommend. Once max_tries is exceeded arq marks the job permanently failed and
+        # stops retrying - the Chat doc just keeps its last-good summary/turns forever in that
+        # case, a safe, non-corrupting failure mode (never a half-written/inconsistent doc, since
+        # the $set above is the only write and only happens after everything succeeded).
+        raise Retry(defer=ctx["job_try"] * 5) from exc
+
+    log_job_finished(logger, "update_chat_memory", picked_up_at, chat_id=chat_id)
 
 
 def _artifact_title(path: str) -> str:
@@ -259,7 +307,7 @@ async def _persist_dashboard_bundle(
     db, s3, bucket: str, workspace_id: str, investigation_id: str, message_id: str, user_id: str, manifest_path: str,
 ) -> list:
     """Handles the "dashboard_bundle" artifact kind - see ReportingTools.
-    generate_realtime_dashboard_bundle() and _artifact_kind() above. Uploads one HTML file
+    generate_realtime_dashboard_bundle() and FinalResultCollector's kind tagging. Uploads one HTML file
     per chart (each gets its own Chart doc, same chart-capacity gating as an ordinary
     chart), then - only if at least one chart actually made it past that gate - writes the
     Dashboard doc that ties them together with the transform_script/file_ids a later
@@ -330,45 +378,72 @@ async def _persist_dashboard_bundle(
 
 
 async def _persist_artifacts(
-    db, workspace_id: str, investigation_id: str, message_id: str, user_id: str, artifact_refs: list,
+    db, workspace_id: str, investigation_id: str, message_id: str, user_id: str,
+    chart_paths: list, artifacts: list,
 ) -> tuple[list, str | None]:
-    """Uploads local files the orchestrator produced (dashboards/reports/csv
-    exports - see tools/reporting/reporting_tools.py) to R2 and creates
-    Chart/Report/Dashboard docs, respecting the free-tier caps. Hitting a cap doesn't
-    delete the generated file or the answer text that already mentions it -
-    it just skips creating the Mongo doc/R2 upload for that one artifact, so
-    it won't be persisted/browsable but the user's answer is unaffected."""
+    """Uploads local files the orchestrator produced (charts/dashboards/reports/csv exports -
+    see tools/reporting/reporting_tools.py, tools/tabular/tabular_tools.py's
+    create_visualizations) to R2 and creates Chart/Report/Dashboard docs, respecting the
+    free-tier caps. Hitting a cap doesn't delete the generated file or the answer text that
+    already mentions it - it just skips creating the Mongo doc/R2 upload for that one artifact,
+    so it won't be persisted/browsable but the user's answer is unaffected.
+
+    Takes the typed FinalResultCollector output directly (chart_paths/artifacts, see its
+    docstring) instead of one flat path list - each entry already says what it is, so this
+    never has to re-guess "chart vs report vs dashboard" from a file extension the way the old
+    single-list version did. Called from both run_investigation's success path (the full
+    collector) and its except-Exception branch (whatever the collector had accumulated before
+    the crash) - see that function's docstring for why partial results are worth persisting."""
     s3 = get_s3_client()
     bucket = get_bucket_name()
     chart_ids: list = []
     report_id = None
 
-    for ref in artifact_refs:
+    for chart in chart_paths:
+        ref = chart.get("location")
         if not isinstance(ref, str) or not os.path.isfile(ref):
             continue
-        kind = _artifact_kind(ref)
-        if kind is None:
+        try:
+            if not await usage.has_chart_capacity(user_id):
+                await _append_event(
+                    db, investigation_id, "status",
+                    "Chart limit reached - a chart was generated but not saved.",
+                )
+                continue
+            chart_id = new_file_id()
+            key = build_chart_key(workspace_id, chart_id)
+            s3.upload_file(ref, bucket, key, ExtraArgs={"ContentType": "text/html"})
+            chart_doc = Chart(
+                id=chart_id, workspace_id=workspace_id, message_id=message_id,
+                title=chart.get("title") or _artifact_title(ref), storage_key=key,
+            )
+            await db[CHARTS].insert_one(chart_doc.to_mongo())
+            await usage.increment_charts(user_id)
+            chart_ids.append(chart_id)
+        except Exception:
+            logger.exception("failed to persist chart %s", ref)
+        finally:
+            # ReportingTools/TabularTools wrote to data/reports/{date}/{name}/... - clean up
+            # that scratch folder regardless of whether the upload succeeded, so failed uploads
+            # don't leak local disk forever.
+            shutil.rmtree(os.path.dirname(ref), ignore_errors=True)
+
+    for artifact in artifacts:
+        ref = artifact.get("ref")
+        kind = artifact.get("type")
+        # "table"/"document_artifact" entries are raw data refs (a save()'d parquet file_id, a
+        # PDF table_ref) already living in permanent workspace storage - not a scratch-space
+        # file waiting to be uploaded, and not something os.path.isfile() would even resolve
+        # (they're bare file_ids, never full paths - see TabularAgent._extract_refs). Nothing to
+        # do here for those; they're kept on the collector purely for the "files/artifacts this
+        # investigation touched" record, not for upload.
+        if kind not in ("report", "dashboard_bundle"):
+            continue
+        if not isinstance(ref, str) or not os.path.isfile(ref):
             continue
 
         try:
-            if kind == "chart":
-                if not await usage.has_chart_capacity(user_id):
-                    await _append_event(
-                        db, investigation_id, "status",
-                        "Chart limit reached - dashboard generated but not saved.",
-                    )
-                    continue
-                chart_id = new_file_id()
-                key = build_chart_key(workspace_id, chart_id)
-                s3.upload_file(ref, bucket, key, ExtraArgs={"ContentType": "text/html"})
-                chart = Chart(
-                    id=chart_id, workspace_id=workspace_id, message_id=message_id,
-                    title=_artifact_title(ref), storage_key=key,
-                )
-                await db[CHARTS].insert_one(chart.to_mongo())
-                await usage.increment_charts(user_id)
-                chart_ids.append(chart.id)
-            elif kind == "dashboard_bundle":
+            if kind == "dashboard_bundle":
                 chart_ids.extend(await _persist_dashboard_bundle(
                     db, s3, bucket, workspace_id, investigation_id, message_id, user_id, ref,
                 ))
@@ -396,9 +471,6 @@ async def _persist_artifacts(
         except Exception:
             logger.exception("failed to persist artifact %s", ref)
         finally:
-            # ReportingTools wrote to data/reports/{date}/{name}/... - clean
-            # up that scratch folder regardless of whether the upload
-            # succeeded, so failed uploads don't leak local disk forever.
             shutil.rmtree(os.path.dirname(ref), ignore_errors=True)
 
     return chart_ids, report_id
@@ -437,7 +509,7 @@ def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, k
 
 async def _run_tabular_direct(
     catalog: FileCatalog, storage: LocalParquetStore, investigation_id: str, sandbox_manager,
-    workspace_id: str, query: str, mentioned_file_ids: list, on_event,
+    workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
 ) -> OrchestratorResult | None:
     """Skips the Orchestrator entirely - builds a TabularAgent straight from the catalog and
     runs it. Returns None (never raises for this reason) when file selection isn't unambiguous,
@@ -453,17 +525,22 @@ async def _run_tabular_direct(
         reports_dir=engine_bootstrap.REPORTS_ROOT,
     )
     findings = await agent.run(query, constraints={}, on_event=on_event)
-    # findings.artifact_refs already includes any chart HTML paths create_visualizations wrote
-    # (see agents/tabular/agent.py's run()) - _persist_artifacts below picks those up exactly the
-    # same way it does for the full-Orchestrator path, no direct-route-specific handling needed.
+    # Same registration OrchestratorTools.invoke_tabular_agent uses for the full-Orchestrator
+    # path - splits findings.charts/artifact_refs into the collector's typed chart_paths/
+    # artifacts instead of the old flat list _persist_artifacts used to re-guess kinds from.
+    result_collector.add_tabular_findings(
+        findings, "invoke_tabular_agent", [e.file_id for e in entries],
+    )
     return OrchestratorResult(
-        final_answer=findings.summary, artifact_refs=findings.artifact_refs,
-        open_questions=[], files_used=[e.file_id for e in entries],
+        final_answer=findings.summary, chart_paths=result_collector.chart_paths,
+        artifacts=result_collector.artifacts, files_used=result_collector.files_used,
+        open_questions=[],
     )
 
 
 async def _run_document_direct(
     catalog: FileCatalog, vector_store, query: str, mentioned_file_ids: list, on_event,
+    result_collector: FinalResultCollector,
 ) -> OrchestratorResult | None:
     """Same shape as _run_tabular_direct above, for the Document Agent - targeted document
     reasoning only (see agents/document/config.py's own scoping note), not whole-document
@@ -477,9 +554,13 @@ async def _run_document_direct(
     metadata_brief = build_document_metadata_brief(catalog, vector_store, [e.file_id for e in entries])
     agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True)
     findings = await agent.run(query, constraints={}, on_event=on_event, metadata_brief=metadata_brief)
+    result_collector.add_document_findings(
+        findings, "invoke_document_agent", [e.file_id for e in entries],
+    )
     return OrchestratorResult(
-        final_answer=findings.summary, artifact_refs=findings.artifact_refs,
-        open_questions=[], files_used=[e.file_id for e in entries],
+        final_answer=findings.summary, chart_paths=result_collector.chart_paths,
+        artifacts=result_collector.artifacts, files_used=result_collector.files_used,
+        open_questions=[],
     )
 
 
@@ -529,6 +610,14 @@ async def run_investigation(
                     investigation_id, len(mentioned_file_ids), mentioned_file_ids)
     db = get_db()
 
+    # Created once, right here, and threaded down through every path below (direct-route
+    # helpers, OrchestratorAgent -> OrchestratorTools) so every sub-agent/tool call that
+    # actually produces something registers into the SAME collector the moment its own result
+    # comes back - see FinalResultCollector's docstring. Read again in the except-Exception
+    # branch below: whatever's already in here at the moment a LATER step raises is still real
+    # work this investigation did, and gets persisted instead of thrown away with the exception.
+    result_collector = FinalResultCollector()
+
     async def on_event(event: dict) -> None:
         await _append_event(db, investigation_id, event["type"], event["message"], event.get("data"))
 
@@ -575,7 +664,7 @@ async def run_investigation(
             if direct_route == "tabular":
                 result = await _run_tabular_direct(
                     catalog, storage, investigation_id, sandbox_manager, workspace_id, query,
-                    mentioned_file_ids, on_event,
+                    mentioned_file_ids, on_event, result_collector,
                 )
                 if result is None:
                     logger.info(
@@ -584,7 +673,7 @@ async def run_investigation(
                     )
             elif direct_route == "document":
                 result = await _run_document_direct(
-                    catalog, vector_store, query, mentioned_file_ids, on_event,
+                    catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
                 )
                 if result is None:
                     logger.info(
@@ -607,7 +696,7 @@ async def run_investigation(
                 orchestrator = OrchestratorAgent(
                     catalog, vector_store=vector_store, memory=memory, storage=storage,
                     reports_dir=engine_bootstrap.REPORTS_ROOT, investigation_id=investigation_id,
-                    sandbox_manager=sandbox_manager,
+                    sandbox_manager=sandbox_manager, result_collector=result_collector,
                 )
                 thread_context = await _thread_context(db, chat_id)
                 result = await orchestrator.run(
@@ -636,14 +725,41 @@ async def run_investigation(
                 if error_info.kind != "unknown"
                 else f"Something went wrong while investigating: {exc}"
             )
-            await _append_event(db, investigation_id, "error", user_facing)
-            await db[INVESTIGATIONS].update_one(
-                {"_id": investigation_id}, {"$set": {"status": "failed", "completed_at": _now()}},
-            )
+
             message = Message(
                 chat_id=chat_id, role="assistant",
                 content=user_facing,
                 investigation_id=investigation_id,
+            )
+            # A LATER tool call is what raised - result_collector may already hold real charts/
+            # reports/files_used from EARLIER, already-successful calls in this same run (e.g. a
+            # 1st invoke_tabular_agent that made a chart, then a 2nd call that crashed). Those
+            # are genuine completed work, not speculative - persist them instead of discarding
+            # them with the exception, same as the success path below does.
+            chart_ids: list = []
+            report_id = None
+            if result_collector.chart_paths or result_collector.artifacts:
+                try:
+                    chart_ids, report_id = await _persist_artifacts(
+                        db, workspace_id, investigation_id, message.id, user_id,
+                        result_collector.chart_paths, result_collector.artifacts,
+                    )
+                except Exception:
+                    logger.exception(
+                        "investigation %s: failed to persist partial results after error",
+                        investigation_id,
+                    )
+                if chart_ids or report_id:
+                    message.content += (
+                        "\n\n_Some results were produced before this error - see below._"
+                    )
+            message.chart_ids = chart_ids
+            message.report_id = report_id
+            message.files_used = result_collector.files_used
+
+            await _append_event(db, investigation_id, "error", user_facing)
+            await db[INVESTIGATIONS].update_one(
+                {"_id": investigation_id}, {"$set": {"status": "failed", "completed_at": _now()}},
             )
             await db[MESSAGES].insert_one(message.to_mongo())
             return
@@ -652,10 +768,12 @@ async def run_investigation(
             chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
         )
         chart_ids, report_id = await _persist_artifacts(
-            db, workspace_id, investigation_id, message.id, user_id, result.artifact_refs,
+            db, workspace_id, investigation_id, message.id, user_id,
+            result.chart_paths, result.artifacts,
         )
         message.chart_ids = chart_ids
         message.report_id = report_id
+        message.files_used = result.files_used
         await db[MESSAGES].insert_one(message.to_mongo())
 
         await db[INVESTIGATIONS].update_one(
@@ -669,10 +787,20 @@ async def run_investigation(
         )
         logger.info("investigation %s completed", investigation_id)
 
-        # Strictly after the above - the user already has their answer (SSE
-        # "completed" event just went out) before this starts, so the summary
-        # LLM call's latency is never on the user-facing critical path.
-        await _update_chat_continuity(db, chat_id, query, result)
+        # Strictly after the above - the user already has their answer (SSE "completed" event
+        # just went out) before this line runs. Enqueues a SEPARATE arq job (update_chat_memory)
+        # rather than awaiting the summary/preference-extraction work inline - this call itself
+        # just pushes to Redis and returns immediately, so THIS job (run_investigation) finishes
+        # right away instead of also paying for that LLM call's latency before it can pick up its
+        # next job. update_chat_memory retries itself on failure (see its own docstring) - this
+        # enqueue call is the only thing that needs to succeed here, and enqueueing is not
+        # expected to fail under normal operation.
+        await ctx["redis"].enqueue_job(
+            "update_chat_memory",
+            chat_id=chat_id, user_id=user_id, query=query, response=result.final_answer,
+            files_used=result.files_used, files_created=result.artifact_refs,
+            requested_at=now_iso(),
+        )
     finally:
         # Always wait for the pre-warm task kicked off at the top of this function to actually
         # finish - success or failure - before releasing anything below. Without this, a fast

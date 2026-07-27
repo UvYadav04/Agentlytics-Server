@@ -40,7 +40,14 @@ def get_db() -> AsyncIOMotorDatabase:
 
 async def ensure_indexes() -> None:
     db = get_db()
-    await db["users"].create_index("google_id", unique=True)
+    # Partial, not a plain unique index: google_id is None for every email/password-only
+    # account (see shared/models/user.py), and a plain unique index would treat every one of
+    # those null values as "the same" and reject the second such signup with a duplicate-key
+    # error. Restricting the uniqueness constraint to documents where google_id is actually a
+    # string sidesteps that while still preventing two Users from sharing one real Google id.
+    await db["users"].create_index(
+        "google_id", unique=True, partialFilterExpression={"google_id": {"$type": "string"}},
+    )
     await db["users"].create_index("email", unique=True)
     await db["workspaces"].create_index("user_id")
     await db["files"].create_index("workspace_id")

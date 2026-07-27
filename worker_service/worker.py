@@ -14,10 +14,12 @@ import asyncio
 import logging
 import os
 
+from arq.worker import func as arq_func
+
 from worker_service import engine_bootstrap  # noqa: F401  (sys.path setup, see module docstring)
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
 from worker_service.tasks.ingestion import run_ingestion
-from worker_service.tasks.investigation import run_investigation
+from worker_service.tasks.investigation import run_investigation, update_chat_memory
 
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
 from analyzerEngine.sandbox.sandbox_manager import get_manager as get_sandbox_manager
@@ -99,7 +101,17 @@ async def on_shutdown(ctx):
 
 
 class WorkerSettings:
-    functions = [run_ingestion, run_investigation, refresh_dashboard]
+    functions = [
+        run_ingestion,
+        run_investigation,
+        refresh_dashboard,
+        # max_tries spelled out explicitly (5 is arq's own default too) so the retry contract
+        # promised in update_chat_memory's docstring - "retries via arq's own Retry mechanism...
+        # if they fail retry them" - is visible right here at the registration site, not just
+        # implied. Backoff itself (job_try * 5 seconds) is set where the job raises Retry, in
+        # worker_service/tasks/investigation.py.
+        arq_func(update_chat_memory, max_tries=5),
+    ]
     redis_settings = get_arq_redis_settings()
     on_startup = on_startup
     on_shutdown = on_shutdown

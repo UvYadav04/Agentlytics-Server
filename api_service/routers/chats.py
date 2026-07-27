@@ -127,6 +127,7 @@ class MessageOut(BaseModel):
     investigation_id: str | None
     chart_ids: list[str]
     report_id: str | None
+    files_used: list[str]
     created_at: str
 
 
@@ -160,7 +161,7 @@ def _message_out(m: Message) -> MessageOut:
     return MessageOut(
         id=m.id, chat_id=m.chat_id, role=m.role, content=m.content,
         investigation_id=m.investigation_id, chart_ids=m.chart_ids, report_id=m.report_id,
-        created_at=m.created_at.isoformat(),
+        files_used=m.files_used, created_at=m.created_at.isoformat(),
     )
 
 
@@ -355,14 +356,6 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         "send_message: user message persisted at +%.1fms (chat_id=%s, message_id=%s)",
         (time.perf_counter() - t0) * 1000, chat_id, message.id,
     )
-    # Shadow test only - classifies the query and logs the decision, but
-    # never affects routing: the arq enqueue below always runs regardless.
-    # _schedule_shadow_classification(
-    #     chat_id=chat_id,
-    #     message_id=message.id,
-    #     user_id=user.id,
-    #     query=body.content,
-    # )
 
     investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
     await get_db()[INVESTIGATIONS].insert_one(investigation.to_mongo())
@@ -370,29 +363,10 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         "send_message: investigation %s created at +%.1fms (chat_id=%s)",
         investigation.id, (time.perf_counter() - t0) * 1000, chat_id,
     )
-
-    # Real routing decision now (was a foreground latency/accuracy test only - see
-    # shared/intent_classifier.py's module docstring). Called in the foreground, not
-    # fire-and-forget, because run_investigation needs the route BEFORE it's enqueued - there's
-    # no cheap way to decide this after the fact without adding a second job round trip.
-    #
-    # route_query_intent (shared/intent_router.py) is a hybrid classifier: embedding similarity
-    # first (near-instant, no LLM call), falling back to the LLM classifier only when the
-    # embedding result isn't confident - see that module's docstring. Only
-    # "tabular"/"document"/"orchestrator" are ever passed through as a real route; "greeting" and
-    # anything below confidence (including a classifier error, which reports top_score=0.0) fall
-    # back to route=None, which run_investigation treats as "run the full Orchestrator" - the
-    # always-safe default this feature must never regress on a low-confidence or failed
-    # classification.
     route_result = await asyncio.to_thread(route_query_intent, body.content)
     if route_result.method == "embedding":
-        # Already passed both the similarity AND margin confidence gates inside
-        # route_query_intent - trusted directly, no extra threshold needed here.
         route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
     else:
-        # method == "llm" (embedding wasn't confident) or "none" (no usable result at all) -
-        # same INTENT_ROUTE_CONFIDENCE_THRESHOLD gate the original LLM-only classifier always
-        # applied, kept here so a low-confidence LLM answer still falls back to the Orchestrator.
         llm = route_result.llm_result
         route = (
             llm.top_label
@@ -407,6 +381,10 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         route_result.margin, route, route_result.latency_ms,
         (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
     )
+
+    return SendMessageResponse(
+            message_id=message.id, investigation_id=None, limited=True, limit_message=LIMIT_MESSAGE,
+        )
 
     pool = await get_arq_pool()
     job = await pool.enqueue_job(

@@ -1,10 +1,12 @@
-"""JWT issuing/verification + Google ID token verification, shared so both
-api_service (issues/verifies) and any future service can decode the same
-token without duplicating the secret-handling logic.
+"""JWT issuing/verification + Google ID token verification + email/password credential
+handling, shared so both api_service (issues/verifies) and any future service can decode the
+same token / hash passwords the same way without duplicating the secret-handling logic.
 """
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import bcrypt
 import jwt
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
@@ -13,6 +15,11 @@ from pydantic import BaseModel
 from shared.config import get_settings
 
 ACCESS_TOKEN_COOKIE_NAME = "access_token"
+
+# bcrypt truncates silently past 72 bytes - reject anything longer up front (in
+# MIN/MAX_PASSWORD_LENGTH-consuming call sites, see api_service/routers/auth.py) rather than let
+# two different long passwords that share the same first 72 bytes hash identically.
+MAX_PASSWORD_BYTES = 72
 
 
 class TokenPayload(BaseModel):
@@ -79,3 +86,34 @@ def verify_google_id_token(token: str) -> GoogleProfile:
         name=idinfo.get("name", idinfo["email"]),
         picture=idinfo.get("picture"),
     )
+
+
+# ---------------------------------------------------------------- email/password credentials
+
+def hash_password(password: str) -> str:
+    """bcrypt with a fresh random salt per call (gensalt()'s default cost factor, 12) - the
+    resulting hash string carries its own salt/cost, so verify_password below needs nothing
+    else to check against it later."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """False (never raises) for a malformed/foreign hash - a User whose password_hash somehow
+    isn't a valid bcrypt hash should fail a login attempt, not 500 the request."""
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
+
+
+def generate_email_token() -> str:
+    """URL-safe, unguessable token for the email-verification link - see
+    User.email_verification_token."""
+    return secrets.token_urlsafe(32)
+
+
+def generate_temporary_password() -> str:
+    """Random password emailed by POST /auth/forgot-password - long/random enough to be safe to
+    send in plaintext over email for the short time until the user changes it, comfortably over
+    the signup form's own minimum length."""
+    return secrets.token_urlsafe(12)

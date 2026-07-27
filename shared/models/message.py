@@ -15,4 +15,9 @@ class Message(MongoModel):
     investigation_id: Optional[str] = None
     chart_ids: list[str] = Field(default_factory=list)
     report_id: Optional[str] = None
+    # file_ids this specific message's investigation actually read from - straight off
+    # OrchestratorResult.files_used (see analyzerEngine/tools/orchestrator/models.py's
+    # FinalResultCollector) - shown client-side as "files used" chips so the user can see what
+    # this answer was actually based on.
+    files_used: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)

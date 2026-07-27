@@ -75,7 +75,7 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
             # worker's health checks.
             result = await asyncio.to_thread(manager.ingest_file, local_path, file.workspace_id, file.id)
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(tmp_dir, ignore_errors=True   )
 
         if result.status == "failed":
             await _mark_failed(db, file, "; ".join(result.errors) if result.errors else "Ingestion failed")

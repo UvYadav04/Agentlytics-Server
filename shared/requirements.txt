@@ -8,6 +8,10 @@ pyjwt
 google-auth
 requests
 openai
+# Password hashing for email/password auth (shared/auth.py's hash_password/verify_password) -
+# used directly rather than through passlib, which has had bcrypt-backend version-detection
+# issues with recent bcrypt releases.
+bcrypt
 # Vectorized cosine similarity for shared/intent_router.py's embedding classification tier -
 # a hard dependency (not optional like sentence-transformers below), since the hybrid router is
 # the default routing path, not an opt-in shadow test.
