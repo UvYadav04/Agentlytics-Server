@@ -6,8 +6,14 @@ provider, retry policy) never has to be made in more than one file.
 Deliberately plain smtplib over STARTTLS rather than a provider-specific SDK (SendGrid, SES,
 Resend, ...) - any provider that exposes SMTP credentials works here unchanged (Gmail/Workspace,
 SES SMTP, SendGrid SMTP relay, Mailgun, Resend, Postmark, ...), so switching providers later is
-just new env values, not a new integration. Every setting comes from
-shared/config.get_settings() (SMTP_* below) - see shared/.env.example for the full list.
+just new env values, not a new integration.
+
+Configured for Brevo (formerly Sendinblue) by default - SMTP_SERVER/SMTP_PORT/SMTP_LOGIN/SMTP_KEY
+are Brevo's own naming for its SMTP relay (smtp-relay.brevo.com, port 587, the "SMTP login"
+address Brevo generates like xxxxx@smtp-brevo.com, and the SMTP key/password from the Brevo
+dashboard's SMTP & API settings). The older SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD names are still
+read as a fallback so any other provider's env vars keep working unchanged. Every setting comes
+from shared/config.get_settings() - see shared/.env.example for the full list.
 
 Sending is entirely best-effort: a failure here is logged and swallowed, never raised back into
 the caller's request - a verification email that fails to send shouldn't turn a successful
@@ -30,16 +36,25 @@ MUTED = "#83807A"
 BORDER = "#E8E4D9"
 BG = "#F5F4EE"
 
+# Brevo's SMTP login (e.g. "xxxxx@smtp-brevo.com") only authenticates the connection - it is NOT
+# a valid "From" address. The "From" header has to be a sender verified in the Brevo dashboard,
+# so this falls back to the account owner's real address rather than SMTP_LOGIN when
+# SMTP_FROM_EMAIL is left unset.
+_DEFAULT_FROM_EMAIL = "dineshnirban01@gmail.com"
+
 
 def _smtp_settings() -> dict:
     settings = get_settings()
+    host = settings.get("SMTP_SERVER") or settings.get("SMTP_HOST")
+    username = settings.get("SMTP_LOGIN") or settings.get("SMTP_USERNAME")
+    password = settings.get("SMTP_KEY") or settings.get("SMTP_PASSWORD")
     return {
-        "host": settings.get("SMTP_HOST"),
+        "host": host,
         "port": int(settings.get("SMTP_PORT", "587") or "587"),
-        "username": settings.get("SMTP_USERNAME"),
-        "password": settings.get("SMTP_PASSWORD"),
+        "username": username,
+        "password": password,
         "use_tls": (settings.get("SMTP_USE_TLS", "true") or "true").lower() != "false",
-        "from_email": settings.get("SMTP_FROM_EMAIL") or settings.get("SMTP_USERNAME"),
+        "from_email": settings.get("SMTP_FROM_EMAIL") or _DEFAULT_FROM_EMAIL,
         "from_name": settings.get("SMTP_FROM_NAME") or "Agentlytics",
     }
 

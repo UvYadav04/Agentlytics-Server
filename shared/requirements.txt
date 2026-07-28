@@ -17,6 +17,11 @@ bcrypt
 # the default routing path, not an opt-in shadow test.
 numpy
 
+# Semantic response cache (shared/semantic_cache.py) - RedisVL owns the embedding index, KNN
+# lookup, TTL, and distance-threshold logic against the same Redis instance `redis` above already
+# connects to, rather than a hand-rolled cache. See that module's docstring for the full design.
+redisvl
+
 # --- Observability (shared by api_service + worker_service) ---
 # Pushes logging.info/error records straight to Loki over HTTP - see
 # shared/logging_config.py. Console output is unaffected either way.

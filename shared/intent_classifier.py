@@ -35,11 +35,21 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 from shared.config import get_settings
+from shared.semantic_cache import cached_check, cached_store
 
 logger = logging.getLogger("intent_classifier")
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+
+# shared/semantic_cache.py index name for this module's LLM fallback tier. A tight threshold on
+# purpose - a false-positive cache hit here means misrouting a query to the wrong
+# tabular/document/orchestrator handler, so it's worth erring towards more cache misses (i.e.
+# more LLM calls) in exchange for fewer wrong ones. 1 day TTL: routing preferences don't need to
+# be cached forever, and this keeps the index from growing unbounded across many distinct queries.
+_CACHE_NAME = "intent_classifier"
+_CACHE_DISTANCE_THRESHOLD = 0.05
+_CACHE_TTL_SECONDS = 86400
 
 # Qwen3-family models are hybrid reasoning models - disable the <think> block so the
 # response is just the JSON we asked for (see module docstring).
@@ -102,6 +112,9 @@ class IntentResult:
     scores: list[float]
     latency_ms: float
     error: str | None = None
+    cached: bool = False  # True when top_label/top_score came from shared/semantic_cache.py
+    # instead of an actual DeepInfra call this time - purely informational (logging/debugging),
+    # every other field means the same thing either way.
 
 
 def _parse_reply(raw_text: str) -> tuple[str | None, float, str | None]:
@@ -144,6 +157,25 @@ def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
             latency_ms=latency_ms, error="DEEPINFRA_API_KEY not configured",
         )
 
+    cache_enabled = (settings.get("INTENT_CACHE_ENABLED", "true") or "true").lower() != "false"
+    if cache_enabled:
+        cached_value = cached_check(_CACHE_NAME, query, distance_threshold=_CACHE_DISTANCE_THRESHOLD, ttl=_CACHE_TTL_SECONDS)
+        if cached_value is not None:
+            intent, _, confidence_str = cached_value.partition("|")
+            try:
+                confidence = float(confidence_str)
+            except ValueError:
+                confidence = 0.0
+            latency_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "intent_classifier: query=%r top_label=%s top_score=%.3f latency_ms=%.1f model=%s cache=hit",
+                query, intent, confidence, latency_ms, model,
+            )
+            return IntentResult(
+                query=query, top_label=intent, top_score=confidence,
+                labels=[intent], scores=[confidence], latency_ms=latency_ms, error=None, cached=True,
+            )
+
     labels, scores, top_label, top_score, error = [], [], None, 0.0, None
     try:
         client = OpenAI(api_key=api_key, base_url=DEEPINFRA_BASE_URL, timeout=timeout)
@@ -163,6 +195,11 @@ def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
         if intent is not None:
             labels, scores = [intent], [confidence]
             top_label, top_score = intent, confidence
+            if cache_enabled:
+                cached_store(
+                    _CACHE_NAME, query, f"{intent}|{confidence}",
+                    distance_threshold=_CACHE_DISTANCE_THRESHOLD, ttl=_CACHE_TTL_SECONDS,
+                )
         error = parse_error
     except Exception as exc:  # noqa: BLE001 - test harness must never crash the request
         error = str(exc)
@@ -174,5 +211,5 @@ def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
     )
     return IntentResult(
         query=query, top_label=top_label, top_score=top_score,
-        labels=labels, scores=scores, latency_ms=latency_ms, error=error,
+        labels=labels, scores=scores, latency_ms=latency_ms, error=error, cached=False,
     )
