@@ -382,9 +382,6 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
     )
 
-    # return SendMessageResponse(
-    #         message_id=message.id, investigation_id=None, limited=True, limit_message=LIMIT_MESSAGE,
-    #     )
 
     pool = await get_arq_pool()
     job = await pool.enqueue_job(
