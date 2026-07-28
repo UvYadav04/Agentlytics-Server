@@ -73,7 +73,7 @@ services:
     build:
       context: .
       dockerfile: api_service/Dockerfile
-    image: data-analyzer-api
+    image: itzdineshyadav/data-analyzer:api
     container_name: data-analyzer-api
     env_file:
       - ./shared/.env
@@ -88,7 +88,7 @@ services:
     build:
       context: .
       dockerfile: worker_service/Dockerfile
-    image: data-analyzer-worker
+    image: itzdineshyadav/data-analyzer:worker
     container_name: data-analyzer-worker
     env_file:
       - ./shared/.env
