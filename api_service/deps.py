@@ -1,4 +1,4 @@
-"""FastAPI dependencies shared across routers."""
+
 import jwt
 from fastapi import Cookie, HTTPException, status
 

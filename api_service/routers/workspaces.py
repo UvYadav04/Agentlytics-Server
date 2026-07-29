@@ -76,7 +76,7 @@ async def rename_workspace(
 
 @router.get("/{workspace_id}/charts", response_model=list[ChartSummaryOut])
 async def list_charts(workspace_id: str, user: User = Depends(get_current_user)):
-    """Right-panel chart/dashboard gallery (build plan Phase 9)."""
+    
     await get_owned_workspace(workspace_id, user)
     cursor = get_db()[CHARTS].find({"workspace_id": workspace_id}).sort("created_at", -1)
     docs = await cursor.to_list(length=200)
