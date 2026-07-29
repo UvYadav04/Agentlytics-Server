@@ -153,7 +153,7 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         value=token,
         httponly=True,
         secure=True,
-        samesite="lax",
+        samesite="none",
         max_age=_cookie_max_age(),
         path="/",
     )
