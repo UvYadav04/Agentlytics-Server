@@ -61,13 +61,17 @@
 
 services:
   redis:
-    image: redis:7-alpine
+    # redis-stack-server (not plain redis:7-alpine) - shared/semantic_cache.py's RedisVL
+    # SemanticCache needs the RediSearch module (FT.CREATE/FT._LIST/FT.SEARCH) for its vector
+    # index; plain Redis doesn't ship it and semantic caching silently disables itself with
+    # "unknown command 'FT._LIST'". Verify with `docker exec data-analyzer-redis redis-cli MODULE LIST`.
+    image: redis/redis-stack-server:latest
     container_name: data-analyzer-redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --save 60 1 --loglevel warning
+    command: redis-stack-server --save 60 1 --loglevel warning
 
   api_service:
     build:
