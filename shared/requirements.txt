@@ -17,6 +17,13 @@ bcrypt
 # the default routing path, not an opt-in shadow test.
 numpy
 
+# shared/onnx_intent - local CPU inference for the intent embedding tier (replaces the DeepInfra
+# embeddings call). tokenizers loads the exported tokenizer.json; onnxruntime runs model.onnx.
+# Run shared/onnx_intent/download_model.py once (needs optimum[onnxruntime] + transformers +
+# torch, not listed here - those are build-time only) to populate shared/onnx_intent/weights/.
+onnxruntime
+tokenizers
+
 # Semantic response cache (shared/semantic_cache.py) - RedisVL owns the embedding index, KNN
 # lookup, TTL, and distance-threshold logic against the same Redis instance `redis` above already
 # connects to, rather than a hand-rolled cache. See that module's docstring for the full design.

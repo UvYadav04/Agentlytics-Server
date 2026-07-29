@@ -20,10 +20,11 @@ async def lifespan(app: FastAPI):
     await ensure_indexes()
     # Embeds every intent_examples.json phrase once, up front, so the hybrid router's embedding
     # tier never regenerates them per request (see shared/intent_router.py's module docstring).
-    # Run off the event loop - it makes blocking network/HTTP calls (DeepInfra embeddings API).
-    # A False return (e.g. DEEPINFRA_API_KEY not set yet) is intentionally non-fatal: routing
-    # just falls back to the LLM classifier for every request until it's configured - never a
-    # reason to fail startup.
+    # Run off the event loop - it loads the local ONNX model (shared/onnx_intent) and runs a
+    # CPU inference pass. A False return (e.g. model files not downloaded yet - see
+    # shared/onnx_intent/download_model.py) is intentionally non-fatal: route_query_intent_fast
+    # just returns method="none" (full Orchestrator) for every request until it's configured -
+    # never a reason to fail startup.
     await asyncio.to_thread(intent_router.init)
     yield
     await close_redis()

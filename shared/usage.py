@@ -20,6 +20,7 @@ it finds in the orchestrator's artifact_refs, and simply skips persisting
 (doesn't create the Mongo doc / doesn't count it) if the user is already at
 the cap - see worker_service/tasks/investigation.py.
 """
+from shared.admin import is_admin_email
 from shared.config import get_settings
 from shared.db import get_db
 from shared.models.message import COLLECTION as MESSAGES
@@ -65,16 +66,20 @@ async def get_or_create_usage(user_id: str) -> Usage:
     return usage
 
 
-async def has_message_capacity(user_id: str) -> bool:
+async def has_message_capacity(user_id: str, email: str | None = None) -> bool:
+    if is_admin_email(email):
+        return True
     usage = await get_or_create_usage(user_id)
     return usage.messages_sent < messages_limit()
 
 
-async def has_chat_message_capacity(chat_id: str) -> bool:
+async def has_chat_message_capacity(chat_id: str, email: str | None = None) -> bool:
     """Per-chat cap (default 8), independent of the per-user lifetime caps
     above - counted directly off the `messages` collection (both roles)
     rather than a Usage counter, since it naturally resets to 0 for every
     new chat and needs no increment step of its own."""
+    if is_admin_email(email):
+        return True
     count = await get_db()[MESSAGES].count_documents({"chat_id": chat_id})
     return count < messages_per_chat_limit()
 
@@ -89,12 +94,16 @@ async def has_report_capacity(user_id: str) -> bool:
     return usage.reports_created < reports_limit()
 
 
-async def has_chat_creation_capacity(user_id: str) -> bool:
+async def has_chat_creation_capacity(user_id: str, email: str | None = None) -> bool:
+    if is_admin_email(email):
+        return True
     usage = await get_or_create_usage(user_id)
     return usage.chats_created < chats_limit()
 
 
-async def has_workspace_creation_capacity(user_id: str) -> bool:
+async def has_workspace_creation_capacity(user_id: str, email: str | None = None) -> bool:
+    if is_admin_email(email):
+        return True
     usage = await get_or_create_usage(user_id)
     return usage.workspaces_created < workspaces_limit()
 

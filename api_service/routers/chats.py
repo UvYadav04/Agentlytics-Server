@@ -26,7 +26,8 @@ from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
-from shared.intent_router import route_query_intent
+from shared.intent_router import route_query_intent_fast
+from shared.admin import is_admin_email
 from shared.job_timing import now_iso
 from shared.redis_client import get_arq_pool, get_redis, investigation_channel
 from shared.storage import delete_object
@@ -91,13 +92,11 @@ async def _shadow_classify_and_log(
 
 router = APIRouter(tags=["chats"])
 
-# Below this confidence, treat the classification as "unknown" and fall back to the full
-# Orchestrator (route=None) rather than trust a low-confidence direct route - a misroute here
-# means a wrong/incomplete answer, not just a slower one. run_investigation applies a second,
-# independent safety check on top of this (whether the file selection is actually unambiguous
-# for tabular/document routes - see its _select_direct_route_files), so this threshold only
-# needs to guard against the classifier itself being unsure.
-INTENT_ROUTE_CONFIDENCE_THRESHOLD = 0.7
+# route_query_intent_fast's own confidence gate (shared/intent_router.py's similarity_threshold/
+# margin_threshold) already decides embedding vs. none - nothing left to threshold here.
+# run_investigation applies a second, independent safety check on top of that (whether the file
+# selection is actually unambiguous for tabular/document routes - see its
+# _select_direct_route_files) before a route is actually allowed to skip the Orchestrator.
 
 LIMIT_MESSAGE = (
     "You've used all 20 free messages. Upgrade for more, or check back once your plan resets."
@@ -171,13 +170,15 @@ async def create_chat(workspace_id: str, body: CreateChatRequest, user: User = D
 
     # Free-tier checkpoint: at most 2 chats per user (lifetime, tracked on Usage.chats_created -
     # see shared/usage.py). Checked before insert, same "check before the gated action starts"
-    # pattern as send_message's message-capacity check below.
-    if not await usage.has_chat_creation_capacity(user.id):
+    # pattern as send_message's message-capacity check below. Bypassed entirely for admin emails
+    # (see shared/admin.py).
+    if not await usage.has_chat_creation_capacity(user.id, email=user.email):
         raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, CHAT_LIMIT_MESSAGE)
 
     chat = Chat(workspace_id=workspace_id, title=body.title)
     await get_db()[CHATS].insert_one(chat.to_mongo())
-    await usage.increment_chats(user.id)
+    if not is_admin_email(user.email):
+        await usage.increment_chats(user.id)
     return _chat_out(chat)
 
 
@@ -326,8 +327,14 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     # anything is enqueued: (1) this specific chat's own 8-message cap, then (2) the
     # user's lifetime 20-message cap across every chat (shared/usage.py). Either one
     # being hit still persists the user's message (so it's visible in the transcript)
-    # but never enqueues an investigation for it.
-    if not await usage.has_chat_message_capacity(chat_id):
+    # but never enqueues an investigation for it. Run concurrently - independent reads.
+    # Both bypassed entirely for admin emails (see shared/admin.py).
+    chat_has_capacity, user_has_capacity = await asyncio.gather(
+        usage.has_chat_message_capacity(chat_id, email=user.email),
+        usage.has_message_capacity(user.id, email=user.email),
+    )
+
+    if not chat_has_capacity:
         message = Message(chat_id=chat_id, role="user", content=body.content)
         await get_db()[MESSAGES].insert_one(message.to_mongo())
         logger.info(
@@ -339,7 +346,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
             limit_message=CHAT_MESSAGE_LIMIT_MESSAGE,
         )
 
-    if not await usage.has_message_capacity(user.id):
+    if not user_has_capacity:
         message = Message(chat_id=chat_id, role="user", content=body.content)
         await get_db()[MESSAGES].insert_one(message.to_mongo())
         logger.info(
@@ -350,30 +357,30 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
             message_id=message.id, investigation_id=None, limited=True, limit_message=LIMIT_MESSAGE,
         )
 
+    # message.id/investigation.id are generated locally (uuid4 hex - see shared/models/base.py),
+    # not by Mongo, so both are already known here - the inserts below don't need to complete
+    # before the intent classification runs. persist_task kicks off both writes concurrently
+    # with each other AND with the classification call right below, instead of the previous
+    # fully-sequential "insert message, insert investigation, then classify" chain. It's still
+    # awaited before enqueueing (the worker's SSE/ownership checks need the Investigation doc to
+    # already exist), so this isn't a full fire-and-forget queue handoff like update_chat_memory's
+    # - just every independent piece of this request running in parallel instead of one at a time.
     message = Message(chat_id=chat_id, role="user", content=body.content)
-    await get_db()[MESSAGES].insert_one(message.to_mongo())
-    logger.info(
-        "send_message: user message persisted at +%.1fms (chat_id=%s, message_id=%s)",
-        (time.perf_counter() - t0) * 1000, chat_id, message.id,
+    investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
+    db = get_db()
+    persist_task = asyncio.create_task(
+        asyncio.gather(
+            db[MESSAGES].insert_one(message.to_mongo()),
+            db[INVESTIGATIONS].insert_one(investigation.to_mongo()),
+        )
     )
 
-    investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
-    await get_db()[INVESTIGATIONS].insert_one(investigation.to_mongo())
-    logger.info(
-        "send_message: investigation %s created at +%.1fms (chat_id=%s)",
-        investigation.id, (time.perf_counter() - t0) * 1000, chat_id,
-    )
-    route_result = await asyncio.to_thread(route_query_intent, body.content)
-    if route_result.method == "embedding":
-        route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
-    else:
-        llm = route_result.llm_result
-        route = (
-            llm.top_label
-            if llm is not None and llm.top_label in ("tabular", "document", "orchestrator")
-            and llm.top_score >= INTENT_ROUTE_CONFIDENCE_THRESHOLD
-            else None
-        )
+    # Local ONNX embedding tier only - a few ms, no network call, no LLM fallback (see
+    # shared/intent_router.py). Ambiguous queries just route to the full Orchestrator (route=None)
+    # instead of waiting on a slower, more accurate classification - matches the "if unsure,
+    # choose orchestrator" rule the LLM fallback itself would have applied anyway.
+    route_result = await asyncio.to_thread(route_query_intent_fast, body.content)
+    route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
     logger.info(
         "send_message: intent_router method=%s top_intent=%s top_similarity=%.3f margin=%.3f "
         "route=%s router_latency_ms=%.1f at +%.1fms total (chat_id=%s, error=%s)",
@@ -382,6 +389,11 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
     )
 
+    await persist_task
+    logger.info(
+        "send_message: user message + investigation %s persisted at +%.1fms (chat_id=%s, message_id=%s)",
+        investigation.id, (time.perf_counter() - t0) * 1000, chat_id, message.id,
+    )
 
     pool = await get_arq_pool()
     job = await pool.enqueue_job(

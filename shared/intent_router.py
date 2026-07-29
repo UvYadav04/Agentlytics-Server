@@ -1,10 +1,11 @@
 """Hybrid intent router: embedding-similarity first, LLM fallback only when unsure.
 
 Replaces shared/intent_classifier.py's classify_intent as api_service/routers/chats.py's real
-routing decision (see that module's docstring - still called synchronously, in the foreground,
-before the arq job is enqueued, so the route is known before worker_service ever picks the job
-up). The old "always call the LLM" classifier took ~5s on every single message, even for
-"hi" or "show my sales" - obviously not ambiguous. This module fixes that:
+routing decision (see that module's docstring). api_service/routers/chats.py calls
+route_query_intent_fast() below - embedding tier only, never the LLM fallback - so the route is
+resolved in a few ms and the arq job can be enqueued immediately. route_query_intent() (LLM
+fallback included) is kept for any other caller that wants the slower, more accurate hybrid
+behavior.
 
     query -> embed -> cosine similarity against every example embedding -> confident? -> route
                                                                         -> not confident? -> LLM
@@ -16,13 +17,11 @@ Example phrases per label live in a JSON config file (shared/intent_examples.jso
 see INTENT_EXAMPLES_PATH below), not in this module - routing can be improved just by adding more
 representative phrases there, no code change and no retraining required.
 
-Embeddings come from DeepInfra's OpenAI-compatible /embeddings endpoint - same provider/client
-pattern shared/intent_classifier.py's LLM call already uses (the `openai` SDK pointed at
-DEEPINFRA_BASE_URL), so this adds no new provider dependency. Every example embedding is
-generated ONCE, at application startup (see init(), called from api_service/main.py's lifespan)
-and L2-normalized up front; at runtime only the query itself gets embedded (one call), so cosine
-similarity against every example collapses into a single normalized dot product
-(_index.matrix @ query_vector) - vectorized, no per-example Python loop.
+Embeddings come from shared/onnx_intent (a local ONNX model, see that module) instead of a
+network call - every example embedding is generated ONCE, at application startup (see init(),
+called from api_service/main.py's lifespan) and L2-normalized up front; at runtime only the query
+itself gets embedded, so cosine similarity against every example collapses into a single
+normalized dot product (_index.matrix @ query_vector) - vectorized, no per-example Python loop.
 
 Confidence is judged per INTENT, not per individual example: several examples for the SAME
 (correct) intent scoring similarly high is a sign of MORE confidence, not less, so similarities
@@ -39,20 +38,12 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-from openai import OpenAI
 
 from shared.config import get_settings
 from shared.intent_classifier import CANDIDATE_LABELS, IntentResult, classify_intent
+from shared.onnx_intent import embed as _onnx_embed
 
 logger = logging.getLogger("intent_router")
-
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
-DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
-
-# Sub-1s budget end to end - much tighter than the LLM fallback's own 30s default, since the
-# entire point of this tier is to be fast; a slow/stuck embeddings call should fail fast and let
-# the caller fall back to the LLM rather than eat the latency budget this module exists to save.
-DEFAULT_EMBEDDING_TIMEOUT = 5.0
 
 _EXAMPLES_PATH_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intent_examples.json")
 
@@ -96,19 +87,10 @@ class _ExampleIndex:
 
 
 _index: _ExampleIndex | None = None
-_client: OpenAI | None = None
 
 
 def _settings():
     return get_settings()
-
-
-def _embedding_model() -> str:
-    return _settings().get("INTENT_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL) or DEFAULT_EMBEDDING_MODEL
-
-
-def _embedding_timeout() -> float:
-    return float(_settings().get("INTENT_EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT) or DEFAULT_EMBEDDING_TIMEOUT)
 
 
 def _examples_path() -> str:
@@ -133,20 +115,6 @@ def margin_threshold() -> float:
     return float(_settings().get("INTENT_MARGIN_THRESHOLD", DEFAULT_MARGIN_THRESHOLD) or DEFAULT_MARGIN_THRESHOLD)
 
 
-def _get_client() -> OpenAI | None:
-    """Shared across every call this process makes (not rebuilt per request) - None (not raised)
-    when DEEPINFRA_API_KEY isn't configured, so callers can degrade to "embedding tier
-    unavailable" the same never-crash way shared/intent_classifier.py already does."""
-    global _client
-    if _client is not None:
-        return _client
-    api_key = _settings().get("DEEPINFRA_API_KEY")
-    if not api_key:
-        return None
-    _client = OpenAI(api_key=api_key, base_url=DEEPINFRA_BASE_URL, timeout=_embedding_timeout())
-    return _client
-
-
 def _load_examples() -> dict[str, list[str]]:
     path = _examples_path()
     with open(path, encoding="utf-8") as f:
@@ -168,34 +136,21 @@ def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def _embed(client: OpenAI, model: str, texts: list[str]) -> np.ndarray:
-    response = client.embeddings.create(model=model, input=texts)
-    # DeepInfra (like OpenAI) returns `data` in the same order as `input` and includes an
-    # `index` field per item - sort by it explicitly rather than trusting list order, in case
-    # that guarantee ever changes upstream.
-    ordered = sorted(response.data, key=lambda item: item.index)
-    return np.array([item.embedding for item in ordered], dtype=np.float32)
+def _embed(texts: list[str]) -> np.ndarray:
+    return _onnx_embed(texts)
 
 
 def init(force: bool = False) -> bool:
     """Build the in-memory example index once, at application startup (see api_service/main.py's
     lifespan). Safe to call more than once - a no-op unless force=True or nothing has been built
-    yet. Returns True once the index is ready, False if it couldn't be built (no
-    DEEPINFRA_API_KEY yet, a bad/missing examples config, or the embeddings call itself failing)
-    - callers should treat False as "embedding tier unavailable this run", never as a reason to
-    fail startup: classify() below falls straight through to the LLM classifier whenever
-    `_index is None`, exactly like this feature never existed."""
+    yet. Returns True once the index is ready, False if it couldn't be built (missing ONNX model
+    files, a bad/missing examples config, or the embedding call itself failing) - callers should
+    treat False as "embedding tier unavailable this run", never as a reason to fail startup:
+    route_query_intent_fast returns method="none" whenever `_index is None`, and
+    route_query_intent falls through to the LLM classifier instead."""
     global _index
     if _index is not None and not force:
         return True
-
-    client = _get_client()
-    if client is None:
-        logger.warning(
-            "intent_router: DEEPINFRA_API_KEY not configured - embedding tier disabled, "
-            "every query will use the LLM classifier"
-        )
-        return False
 
     try:
         examples = _load_examples()
@@ -206,15 +161,14 @@ def init(force: bool = False) -> bool:
                 labels.append(label)
                 texts.append(phrase)
 
-        model = _embedding_model()
         start = time.perf_counter()
-        matrix = _normalize_rows(_embed(client, model, texts))
+        matrix = _normalize_rows(_embed(texts))
         labels_arr = np.array(labels)
         label_masks = {label: (labels_arr == label) for label in examples}
         _index = _ExampleIndex(texts=texts, matrix=matrix, label_masks=label_masks)
         logger.info(
-            "intent_router: embedded %d example phrase(s) across %d intent(s) in %.1fms (model=%s, path=%s)",
-            len(texts), len(examples), (time.perf_counter() - start) * 1000, model, _examples_path(),
+            "intent_router: embedded %d example phrase(s) across %d intent(s) in %.1fms (path=%s)",
+            len(texts), len(examples), (time.perf_counter() - start) * 1000, _examples_path(),
         )
         return True
     except Exception:
@@ -253,36 +207,43 @@ def _llm_fallback(query: str, timeout: float, embedding_fields: dict) -> RouteRe
     )
 
 
-def route_query_intent(query: str, timeout: float = 30.0) -> RouteResult:
-    """Hybrid routing decision for ONE query - embedding similarity first, LLM fallback only when
-    the embedding result isn't confident (see _is_confident). Never raises: any internal failure
-    (missing API key, a bad config file, a network error) degrades straight to the LLM
-    classifier, same always-safe contract shared/intent_classifier.classify_intent already has.
+def route_query_intent(query: str, timeout: float = 30.0, llm_fallback: bool = True) -> RouteResult:
+    """Routing decision for ONE query - embedding similarity first, LLM fallback only when the
+    embedding result isn't confident (see _is_confident) AND llm_fallback=True. Never raises: any
+    internal failure (missing model files, a bad config file, an inference error) degrades to
+    either the LLM classifier (llm_fallback=True) or method="none" (llm_fallback=False), same
+    always-safe contract shared/intent_classifier.classify_intent already has.
 
-    `timeout` is forwarded to the LLM fallback call only - the embedding call itself uses its own
-    much shorter INTENT_EMBEDDING_TIMEOUT (see module docstring)."""
+    `timeout` is forwarded to the LLM fallback call only."""
     start = time.perf_counter()
     no_embedding_fields = {
         "top_intent": None, "top_similarity": 0.0,
         "second_intent": None, "second_similarity": 0.0, "margin": 0.0,
     }
 
-    if _index is None and not init():
-        result = _llm_fallback(query, timeout, no_embedding_fields)
-        return _finish(result, start)
+    def _unresolved(error: str | None) -> RouteResult:
+        if llm_fallback:
+            result = _llm_fallback(query, timeout, no_embedding_fields)
+            if error:
+                result.error = error
+            return result
+        return RouteResult(
+            query=query, intent=None, method="none", llm_result=None, error=error,
+            **no_embedding_fields,
+        )
 
-    client = _get_client()
+    if _index is None and not init():
+        return _finish(_unresolved(None), start)
+
     try:
-        query_vec = _normalize_rows(_embed(client, _embedding_model(), [query]))[0]
+        query_vec = _normalize_rows(_embed([query]))[0]
         similarities = _index.matrix @ query_vec  # vectorized cosine similarity, both sides pre-normalized
         intent_scores = _per_intent_scores(similarities)
         top_intent, top_similarity, second_intent, second_similarity = _top_two(intent_scores)
         margin = top_similarity - second_similarity
     except Exception as exc:
-        logger.warning("intent_router: embedding call failed (%s) - falling back to the LLM classifier", exc)
-        result = _llm_fallback(query, timeout, no_embedding_fields)
-        result.error = str(exc)
-        return _finish(result, start)
+        logger.warning("intent_router: embedding call failed (%s)", exc)
+        return _finish(_unresolved(str(exc)), start)
 
     embedding_fields = {
         "top_intent": top_intent, "top_similarity": top_similarity,
@@ -296,8 +257,18 @@ def route_query_intent(query: str, timeout: float = 30.0) -> RouteResult:
         )
         return _finish(result, start)
 
-    result = _llm_fallback(query, timeout, embedding_fields)
+    if llm_fallback:
+        result = _llm_fallback(query, timeout, embedding_fields)
+    else:
+        result = RouteResult(
+            query=query, intent=None, method="none", llm_result=None, error=None,
+            **embedding_fields,
+        )
     return _finish(result, start)
+
+
+def route_query_intent_fast(query: str) -> RouteResult:
+    return route_query_intent(query, llm_fallback=False)
 
 
 def _finish(result: RouteResult, start: float) -> RouteResult:

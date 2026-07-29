@@ -13,16 +13,11 @@ block unless told otherwise (see deepinfra_client.py's DISABLE_THINKING comment)
 reasoning text would blow past max_tokens before the model ever emits the JSON we actually want,
 or leak into the JSON block itself. extra_body below turns it off the same way.
 
-Called synchronously, in the foreground, from api_service/routers/chats.py's send_message -
-deliberately, so the route is known BEFORE the arq job is enqueued (there's no cheap way to
-decide the route after the fact without a second job round trip), and so its latency shows up
-in that route's own timing logs instead of being hidden in a background task. send_message only
-trusts "tabular"/"document"/"orchestrator" above INTENT_ROUTE_CONFIDENCE_THRESHOLD as a real
-route - "greeting", low confidence, and any classifier error all fall back to route=None, which
-worker_service/tasks/investigation.py treats as "run the full Orchestrator" (today's original,
-always-safe behavior). Even a trusted "tabular"/"document" route gets a second, independent
-safety check in investigation.py's _select_direct_route_files (file selection must be
-unambiguous) before it's actually allowed to skip the Orchestrator.
+api_service/routers/chats.py's send_message no longer calls this module directly - it calls
+shared/intent_router.py's route_query_intent_fast (a local ONNX embedding-only tier, no network
+call, no LLM). This classifier is still what route_query_intent's (non-"fast") LLM fallback tier
+uses when a caller explicitly wants it, and is still exercised by shared/query_router.py's
+shadow-test path.
 """
 from __future__ import annotations
 
