@@ -1,24 +1,3 @@
-"""DeepInfra-based intent classifier - now a REAL routing decision, not just a shadow test.
-
-Classifies a query into one of four categories: "greeting", "tabular", "document",
-"orchestrator" (see _SYSTEM_PROMPT below for the full category definitions given to the model).
-Calls DeepInfra's OpenAI-compatible chat completion API directly via the `openai` SDK pointed at
-DeepInfra's base_url - same provider this codebase already uses elsewhere (see
-analyzerEngine/llm_provider/providers/deepinfra_client.py), just called directly here instead of
-through autogen's wrapper, since this module lives in shared/ (used by both api_service and
-worker_service) and has no autogen dependency.
-
-Qwen3-family models are hybrid reasoning models that wrap every response in a <think>...</think>
-block unless told otherwise (see deepinfra_client.py's DISABLE_THINKING comment) - left on, that
-reasoning text would blow past max_tokens before the model ever emits the JSON we actually want,
-or leak into the JSON block itself. extra_body below turns it off the same way.
-
-api_service/routers/chats.py's send_message no longer calls this module directly - it calls
-shared/intent_router.py's route_query_intent_fast (a local ONNX embedding-only tier, no network
-call, no LLM). This classifier is still what route_query_intent's (non-"fast") LLM fallback tier
-uses when a caller explicitly wants it, and is still exercised by shared/query_router.py's
-shadow-test path.
-"""
 from __future__ import annotations
 
 import json
@@ -37,17 +16,10 @@ logger = logging.getLogger("intent_classifier")
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
 
-# shared/semantic_cache.py index name for this module's LLM fallback tier. A tight threshold on
-# purpose - a false-positive cache hit here means misrouting a query to the wrong
-# tabular/document/orchestrator handler, so it's worth erring towards more cache misses (i.e.
-# more LLM calls) in exchange for fewer wrong ones. 1 day TTL: routing preferences don't need to
-# be cached forever, and this keeps the index from growing unbounded across many distinct queries.
 _CACHE_NAME = "intent_classifier"
 _CACHE_DISTANCE_THRESHOLD = 0.05
 _CACHE_TTL_SECONDS = 86400
 
-# Qwen3-family models are hybrid reasoning models - disable the <think> block so the
-# response is just the JSON we asked for (see module docstring).
 _DISABLE_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
 
 CANDIDATE_LABELS = ["greeting", "tabular", "document", "orchestrator"]
@@ -136,9 +108,6 @@ def _parse_reply(raw_text: str) -> tuple[str | None, float, str | None]:
 
 
 def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
-    """Never raises - any failure (missing key, network, bad/unparseable response) is
-    captured on `.error` with top_label=None, same "never take down the caller" contract
-    as shared/query_router.py's classify()."""
     settings = get_settings()
     model = settings.get("INTENT_CLASSIFIER_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
     api_key = settings.get("DEEPINFRA_API_KEY")

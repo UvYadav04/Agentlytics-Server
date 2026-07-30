@@ -1,7 +1,3 @@
-# Auto-discovers every container on this Docker host via the socket mount
-# and tails its stdout/stderr log file straight to Loki - covers redis,
-# postgres, clickhouse, minio, prometheus, grafana, etc. (anything that
-# doesn't push its own structured logs the way api_service/worker_service do).
 server:
   http_listen_port: 9080
   grpc_listen_port: 0

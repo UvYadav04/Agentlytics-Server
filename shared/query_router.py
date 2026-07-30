@@ -1,30 +1,3 @@
-"""Shadow query router.
-
-Classifies short/simple queries ("hi", "hello", "thanks"...) against a
-canned intent list so we can evaluate whether a fast-path (bypassing the
-arq queue entirely) would be safe to turn on - *before* actually wiring it
-up. Nothing in this module changes request handling: it only produces a
-`ClassificationResult` for the caller to log.
-
-Tiers, cheapest first:
-  1. exact  - normalized text is byte-for-byte a canned phrase
-  2. fuzzy  - difflib similarity ratio against every canned phrase
-              (stdlib only, no new dependency)
-  3. hf     - optional sentence-embedding cosine similarity, only runs if
-              `sentence-transformers` is installed *and*
-              QUERY_ROUTER_HF_ENABLED=true. Lazily loaded on first use so
-              importing this module never requires the dependency.
-
-Context gating: a short message that follows a prior turn in the same
-chat ("no", "make it red instead") can score high against a canned
-phrase purely by being short - but it is very likely a reply/correction,
-not small talk. So any match is marked `context_gated` (and
-`would_shortcircuit=False`) whenever the chat already has prior
-messages. The classification itself still runs and gets logged, so we
-can measure how often this would matter.
-
-See api_service/routers/chats.py for the (shadow-only) call site.
-"""
 from __future__ import annotations
 
 import difflib
@@ -37,15 +10,6 @@ from shared.config import get_settings
 
 logger = logging.getLogger("query_router")
 
-# Short/ambiguous items ("ok", "yes", "no") are deliberately included here
-# even though they're common follow-up replies too ("ok" after a
-# clarifying question, "yes"/"no" answering one) - that's exactly what
-# context-gating (above) exists for. A bare "yes"/"no"/"ok" only ever gets
-# `would_shortcircuit=True` when it's the *first* message in the chat
-# (nothing to be a follow-up to); with prior context it still classifies
-# for logging, but `context_gated=True` blocks the shortcircuit. So the
-# list can be broad - the gating check is what keeps it safe, not the
-# list being narrow.
 CANNED_INTENTS: dict[str, list[str]] = {
     "greeting": [
         "hi", "hello", "hey", "yo", "hiya", "sup", "howdy",
@@ -117,12 +81,6 @@ def _fuzzy_match(normalized: str, threshold: float) -> tuple[str, float] | None:
         return (best_intent, best_score)
     return None
 
-
-# --- Optional HF tier ---------------------------------------------------
-# Lazily loaded: importing this module never requires sentence-transformers.
-# Flip on with QUERY_ROUTER_HF_ENABLED=true once the dependency is installed
-# (see shared/requirements.txt for the optional install note).
-
 _hf_model = None
 _hf_ready = False
 _hf_load_failed = False
@@ -160,12 +118,6 @@ def _hf_match(text: str, threshold: float) -> tuple[str, float] | None:
 
 
 def classify(query: str, has_prior_context: bool) -> ClassificationResult:
-    """Classify a query for shadow evaluation.
-
-    Never raises: any internal failure is captured on `.error` and reported
-    as `tier="none"`, so a bug here can never take down the caller (which
-    today just logs the result - see chats.py).
-    """
     start = time.perf_counter()
     settings = get_settings()
     fuzzy_threshold = float(settings.get("QUERY_ROUTER_FUZZY_THRESHOLD", 0.84) or 0.84)
@@ -177,8 +129,6 @@ def classify(query: str, has_prior_context: bool) -> ClassificationResult:
     try:
         normalized = normalize(query)
 
-        # Long messages are obviously not small talk - skip the tiers
-        # entirely rather than wasting fuzzy/HF compute on them.
         if normalized and len(normalized.split()) <= max_words:
             match = _exact_match(normalized)
             if match:

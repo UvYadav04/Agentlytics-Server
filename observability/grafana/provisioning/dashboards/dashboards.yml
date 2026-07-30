@@ -1,5 +1,3 @@
-# Tells Grafana to auto-load any dashboard JSON dropped in ./json alongside
-# this file - no manual "Import dashboard" click-through needed.
 apiVersion: 1
 
 providers:

@@ -1,38 +1,3 @@
-"""Semantic response cache for repeated / near-duplicate LLM calls, built on RedisVL's
-`SemanticCache` (https://docs.redisvl.com/en/latest/user_guide/03_llmcache.html) rather than a
-hand-rolled embedding-similarity index - RedisVL already owns the embedding storage, the KNN
-lookup, TTL handling, and the distance-threshold math; this module's only job is to wire that up
-to infrastructure this codebase already has:
-
-  - the same Redis instance shared/redis_client.py uses (REDIS_URL) - one more search index in
-    the same Redis, no new service to run or pay for.
-  - the same DeepInfra embeddings endpoint shared/intent_router.py already calls
-    (DEEPINFRA_API_KEY + INTENT_EMBEDDING_MODEL / BAAI/bge-base-en-v1.5 by default) - no new
-    embedding model, provider, or API key to manage.
-
-RedisVL's `SemanticCache` takes a `vectorizer` object; rather than depend on one of RedisVL's
-built-in provider vectorizers (which don't support DeepInfra's OpenAI-compatible endpoint out of
-the box), this uses `redisvl.utils.vectorize.CustomVectorizer` - a thin adapter RedisVL ships
-specifically for "bring your own embed function" - wrapping the same `openai` SDK / DeepInfra
-base_url pattern already used elsewhere in this codebase.
-
-Usage (see shared/intent_classifier.py for the first real call site):
-
-    from shared.semantic_cache import cached_check, cached_store
-
-    hit = cached_check("my_cache_name", prompt)
-    if hit is not None:
-        return hit
-    response = call_the_llm(prompt)
-    cached_store("my_cache_name", prompt, response)
-    return response
-
-Every entry point here is best-effort and never raises: no DEEPINFRA_API_KEY yet, redisvl not
-installed, or Redis itself unreachable all just disable caching for that process (cached_check
-returns None, cached_store becomes a no-op) - callers already have to handle "cache miss" the
-same way, so a disabled cache is indistinguishable from an always-empty one and never turns into
-a request failure.
-"""
 from __future__ import annotations
 
 import logging

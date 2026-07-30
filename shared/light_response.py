@@ -1,26 +1,3 @@
-"""Lightweight, single-call chat completion for messages that don't need the full
-Orchestrator: pure greetings/small talk, and any query in a workspace with no uploaded files
-(nothing for the Tabular/Document tools to act on anyway).
-
-api_service/light_investigation.py is the caller that decides which of the two applies (via
-shared/intent_router.py's "greeting" classification vs. a plain "does this workspace have any
-ready files" check) and drives retry/fallback around this module.
-
-Deliberately mirrors shared/intent_classifier.py's shape - same DeepInfra-via-openai-SDK call,
-same "never raises, report on .error" contract - rather than routing through
-analyzerEngine/llm_provider: this module lives in shared/ (importable from api_service, which
-has no analyzerEngine dependency - see intent_classifier.py's own docstring for why that split
-exists).
-
-Two prompts, chosen by `route`:
-  - "greeting": the query is small talk (hi/thanks/bye/...) - keep the reply short and warm,
-    don't answer a data question that was never asked.
-  - "no_files": the workspace has zero uploaded files - answer general-knowledge questions
-    directly, but nudge the user to upload a file if the question clearly needs their data.
-
-Callers own retries and fallback (see api_service/light_investigation.py) - this module makes
-exactly ONE attempt per call and never raises.
-"""
 from __future__ import annotations
 
 import logging
@@ -36,8 +13,6 @@ logger = logging.getLogger("light_response")
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
 
-# Qwen3-family models are hybrid reasoning models - disable the <think> block so the response is
-# just the reply text, same reasoning as shared/intent_classifier.py's own _DISABLE_THINKING.
 _DISABLE_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
 
 _GREETING_PROMPT = """You are the assistant for a data analysis platform. The user just sent a
@@ -69,12 +44,6 @@ class LightReplyResult:
 
 
 def generate_light_reply(query: str, route: str, timeout: float = 20.0) -> LightReplyResult:
-    """One attempt, never raises (any failure - missing key, network, empty reply - is captured
-    on `.error` with content=None, same "never take down the caller" contract as
-    shared/intent_classifier.classify_intent).
-
-    `route` must be "greeting" or "no_files" - anything else is a caller bug, not something to
-    guess at, so it's asserted rather than silently defaulted to one or the other."""
     if route not in _PROMPTS:
         raise ValueError(f"generate_light_reply: unknown route {route!r} (expected 'greeting' or 'no_files')")
 

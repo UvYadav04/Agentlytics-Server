@@ -1,11 +1,3 @@
-"""Shadow log of query_router classification decisions.
-
-Written once per incoming chat message (fire-and-forget, see
-api_service/routers/chats.py::_schedule_shadow_classification). Nothing
-reads this at request time - it exists purely so we can later compute
-precision/recall on the fast-path classifier against real traffic before
-ever turning short-circuiting on.
-"""
 from datetime import datetime
 from typing import Optional
 

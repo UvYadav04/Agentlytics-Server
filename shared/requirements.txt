@@ -8,42 +8,15 @@ pyjwt
 google-auth
 requests
 openai
-# Password hashing for email/password auth (shared/auth.py's hash_password/verify_password) -
-# used directly rather than through passlib, which has had bcrypt-backend version-detection
-# issues with recent bcrypt releases.
 bcrypt
-# Vectorized cosine similarity for shared/intent_router.py's embedding classification tier -
-# a hard dependency (not optional like sentence-transformers below), since the hybrid router is
-# the default routing path, not an opt-in shadow test.
 numpy
 
-# shared/onnx_intent - local CPU inference for the intent embedding tier (replaces the DeepInfra
-# embeddings call). tokenizers loads the exported tokenizer.json; onnxruntime runs model.onnx.
-# model.onnx itself is gitignored (too large to commit) - shared/onnx_intent/ensure_weights.py
-# downloads it automatically on first use if it's missing (e.g. right after a fresh deploy),
-# using huggingface_hub below, so no manual step is required on a new box. (Alternatively, run
-# shared/onnx_intent/download_model.py by hand once - needs optimum[onnxruntime] + transformers +
-# torch, not listed here since those are build-time only, to regenerate the whole weights/ dir
-# from BAAI/bge-small-en-v1.5 directly instead of fetching the pre-converted copy.)
 onnxruntime
 tokenizers
 huggingface_hub
 
-# Semantic response cache (shared/semantic_cache.py) - RedisVL owns the embedding index, KNN
-# lookup, TTL, and distance-threshold logic against the same Redis instance `redis` above already
-# connects to, rather than a hand-rolled cache. See that module's docstring for the full design.
 redisvl
 
-# --- Observability (shared by api_service + worker_service) ---
-# Pushes logging.info/error records straight to Loki over HTTP - see
-# shared/logging_config.py. Console output is unaffected either way.
 python-logging-loki
-# Metrics registry/exposition used by both services: api_service exposes it
-# via prometheus-fastapi-instrumentator (its own requirements.txt), worker_service
-# opens its own metrics-only HTTP server with this directly (see worker.py).
 prometheus-client
 
-# Optional - only needed if QUERY_ROUTER_HF_ENABLED=true (see
-# shared/query_router.py). Left commented out so the HF tier stays fully
-# optional/lazy; uncomment once you're ready to enable it.
-# sentence-transformers

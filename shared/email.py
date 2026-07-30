@@ -1,25 +1,3 @@
-"""Generic SMTP email sender + the specific transactional emails email/password auth needs
-(verification link, temporary password, password-changed notice). One place, shared by
-api_service and any future service, so a change to how mail actually gets sent (SMTP host,
-provider, retry policy) never has to be made in more than one file.
-
-Deliberately plain smtplib over STARTTLS rather than a provider-specific SDK (SendGrid, SES,
-Resend, ...) - any provider that exposes SMTP credentials works here unchanged (Gmail/Workspace,
-SES SMTP, SendGrid SMTP relay, Mailgun, Resend, Postmark, ...), so switching providers later is
-just new env values, not a new integration.
-
-Configured for Brevo (formerly Sendinblue) by default - SMTP_SERVER/SMTP_PORT/SMTP_LOGIN/SMTP_KEY
-are Brevo's own naming for its SMTP relay (smtp-relay.brevo.com, port 587, the "SMTP login"
-address Brevo generates like xxxxx@smtp-brevo.com, and the SMTP key/password from the Brevo
-dashboard's SMTP & API settings). The older SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD names are still
-read as a fallback so any other provider's env vars keep working unchanged. Every setting comes
-from shared/config.get_settings() - see shared/.env.example for the full list.
-
-Sending is entirely best-effort: a failure here is logged and swallowed, never raised back into
-the caller's request - a verification email that fails to send shouldn't turn a successful
-signup into a 500, and the affected flows (resend-verification, forgot-password) are all safe
-for the user to retry from the UI.
-"""
 import asyncio
 import logging
 import smtplib
@@ -35,11 +13,6 @@ TEXT = "#262624"
 MUTED = "#83807A"
 BORDER = "#E8E4D9"
 BG = "#F5F4EE"
-
-# Brevo's SMTP login (e.g. "xxxxx@smtp-brevo.com") only authenticates the connection - it is NOT
-# a valid "From" address. The "From" header has to be a sender verified in the Brevo dashboard,
-# so this falls back to the account owner's real address rather than SMTP_LOGIN when
-# SMTP_FROM_EMAIL is left unset.
 _DEFAULT_FROM_EMAIL = "dineshnirban01@gmail.com"
 
 
@@ -67,10 +40,6 @@ def _frontend_url(path: str) -> str:
 def _send_sync(to_email: str, subject: str, html_body: str, text_body: str) -> None:
     cfg = _smtp_settings()
     if not cfg["host"] or not cfg["from_email"]:
-        # Not a hard failure - lets the rest of the app (and local dev without SMTP configured)
-        # keep working; the caller's flow (signup, forgot-password, ...) already succeeded by
-        # the time this runs. The token/temporary password is still in Mongo either way, so
-        # nothing is unrecoverable - it just can't be delivered until SMTP_* is set.
         logger.warning(
             "SMTP not configured (SMTP_HOST/SMTP_FROM_EMAIL missing) - skipping email to %s: %r",
             to_email, subject,
@@ -104,9 +73,6 @@ async def send_email(to_email: str, subject: str, html_body: str, text_body: str
 
 
 def _wrap_html(preheader: str, heading: str, body_html: str, cta_label: str = None, cta_url: str = None) -> str:
-    """Shared card/button chrome for every templated email below, matching the app's own
-    palette (tailwind.config.ts) so a verification/reset email looks like it came from the same
-    product as the app itself."""
     cta_html = ""
     if cta_label and cta_url:
         cta_html = f"""
