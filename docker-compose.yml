@@ -1,70 +1,5 @@
-# Server-only stack - Client lives in its own separate repo and is deployed
-# independently (not part of this compose file). `docker compose up -d
-# --build` gets you Redis, api_service, and worker_service. MongoDB is NOT
-# included here - both services point at MongoDB Atlas (or whatever
-# MONGO_URI you set) via shared/.env, loaded through `env_file:` below with
-# no override, so whatever's in that file is what's actually used.
-#
-# worker_service's Tabular Agent sandbox needs the HOST's Docker daemon
-# (docker-outside-of-docker) to spin up sibling containers - see the
-# PARQUET_ROOT comment in worker_service/engine_bootstrap.py before relying
-# on this in production. docker.sock is bind-mounted below so the Docker SDK
-# inside worker_service actually talks to the host daemon.
-#
-# `parquet_data`/`memory_data` below are plain named Docker volumes (see the
-# `volumes:` block at the bottom - no `driver_opts`/host bind path is set),
-# NOT bind mounts. That's deliberate, and it's what makes the sandbox
-# boundary work: the host daemon resolves a *volume name* the same way
-# regardless of which container asks for it, so worker_service (mounting
-# `parquet_data:/data/parquet` below) and every sandbox sibling container it
-# spins up (sandbox_executor.py, mounting the same volume by its runtime name
-# - see PARQUET_VOLUME_NAME there) end up looking at the exact same data at
-# the exact same container path, without either side needing to know or
-# agree on any HOST filesystem path.
-#
-# One thing to keep in sync: Compose auto-derives each named volume's
-# *runtime* name as "{project_name}_{volume_name}" (e.g. `parquet_data` here
-# becomes `server_parquet_data`, since this directory is named "Server") -
-# unless COMPOSE_PROJECT_NAME is set explicitly. sandbox_executor.py needs
-# that exact runtime name to mount it into sibling containers - set
-# PARQUET_VOLUME_NAME below (or export COMPOSE_PROJECT_NAME) if that default
-# doesn't match. `docker volume ls` shows the real name if you're unsure.
-#
-# --- Image tagging (Docker Hub) ---
-# Every buildable service below carries BOTH `build:` and `image:`. That
-# dual declaration is what lets one file serve three different workflows
-# without drifting apart:
-#   - Local dev:        docker compose up -d --build   (builds, tags, and
-#                        runs the image named below, straight from source)
-#   - CI (GitHub Actions): docker compose build && docker compose push
-#                        (builds the same image, pushes it to Docker Hub)
-#   - EC2 (production): docker compose pull && docker compose up -d
-#                        (never touches `build:` - just pulls the tag CI
-#                        pushed and runs it; the EC2 box needs THIS file and
-#                        the env files below, not the app source at all)
-# DOCKERHUB_USERNAME / IMAGE_TAG come from a .env file next to this compose
-# file (see .env.example) locally, or from the workflow environment in CI.
-#
-# Observability (Langfuse/Prometheus/Loki/Grafana) is deliberately NOT in
-# this file - it lives in docker-compose.observability.yml as a separate
-# overlay, ready to bolt on:
-#
-#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
-#
-# api_service/worker_service's code already handles that overlay being
-# absent (shared/logging_config.py's Loki handler and
-# llm_provider/langfuse_wrapper.py's tracing both no-op cleanly if
-# LOKI_URL / LANGFUSE_* aren't set), so there's nothing to change here when
-# you're ready to turn it on - just add the second -f flag.
-#
-# Usage: docker compose up -d --build
-
 services:
   redis:
-    # redis-stack-server (not plain redis:7-alpine) - shared/semantic_cache.py's RedisVL
-    # SemanticCache needs the RediSearch module (FT.CREATE/FT._LIST/FT.SEARCH) for its vector
-    # index; plain Redis doesn't ship it and semantic caching silently disables itself with
-    # "unknown command 'FT._LIST'". Verify with `docker exec data-analyzer-redis redis-cli MODULE LIST`.
     image: redis/redis-stack-server:latest
     container_name: data-analyzer-redis
     ports:
@@ -99,58 +34,15 @@ services:
       - ./analyzerEngine/.env
     environment:
       REDIS_URL: redis://redis:6379/0
-      # This container's OWN mount point for the `parquet_data` named volume below - used for
-      # this process's own reads/writes and the sandbox job-scratch directory. Does NOT need to
-      # match any host path (there isn't one - see top note); it only needs to match the
-      # `:/data/parquet` target in the volume mount two lines down.
       PARQUET_ROOT: /data/parquet
-      # Runtime name of the named volume sandbox_executor.py mounts into every sibling sandbox
-      # container it spins up (docker-outside-of-docker) - must match the `parquet_data` volume
-      # declared at the bottom of this file as Compose actually names it at runtime
-      # ("{project_name}_parquet_data" by default - see top note). Override this if your
-      # COMPOSE_PROJECT_NAME/directory name isn't "server", rather than letting the two
-      # drift out of sync silently.
       PARQUET_VOLUME_NAME: server_parquet_data
-      # This container's OWN mount point for the `sandbox_sockets` named volume below - the
-      # persistent Tabular Agent sandbox (sandbox/sandbox_manager.py, sandbox/sandbox_server.py)
-      # uses this so worker_service can dial each investigation's sandbox container over its
-      # Unix Domain Socket, the same named-volume trick PARQUET_ROOT/PARQUET_VOLUME_NAME use for
-      # parquet data - see sandbox_manager.py's own top-of-file note.
       SANDBOX_SOCKET_ROOT: /data/sandbox_sockets
-      # Runtime name of the named volume sandbox_manager.py mounts into every sandbox container
-      # it creates - must match the `sandbox_sockets` volume declared at the bottom of this file
-      # as Compose actually names it at runtime ("{project_name}_sandbox_sockets" by default,
-      # same caveat as PARQUET_VOLUME_NAME above).
       SANDBOX_SOCKET_VOLUME_NAME: server_sandbox_sockets
-      # Persistent per-user long-term memory (LongTermMemory, see
-      # engine_bootstrap.py's MEMORY_ROOT comment) - its own named volume below, deliberately
-      # NOT nested under /data/parquet: PythonSandbox bind-mounts the whole `parquet_data`
-      # volume read-write into every sandboxed code execution, so anything living under it is
-      # exposed to model-generated code.
       MEMORY_ROOT: /data/memory
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Named Docker volumes (no host path) - see the top-of-file note on why this is a named
-      # volume rather than a bind mount, and PARQUET_VOLUME_NAME above for how
-      # sandbox_executor.py mounts this exact same volume into sibling sandbox containers.
-      # This is the ONLY persistent local storage this stack has - it survives container
-      # rebuilds/redeploys/recreation because Docker manages the volume's storage independently
-      # of any one container's writable layer, which gets discarded every time. Anything
-      # worker_service needs to survive a redeploy (parquet data, and per-user long-term memory
-      # below) must live under a named volume like this one. Anything that doesn't need to
-      # survive a redeploy (e.g. REPORTS_ROOT's scratch files, uploaded to R2 then deleted) is
-      # fine left off, on the container's own ephemeral filesystem.
       - parquet_data:/data/parquet
-      # Backs MEMORY_ROOT above - another named volume, no host setup/mkdir needed (Docker
-      # creates it automatically on first `up`). Never mounted into a sandbox container, unlike
-      # parquet_data, so it has no PARQUET_VOLUME_NAME-style env var counterpart.
       - memory_data:/data/memory
-      # Backs SANDBOX_SOCKET_ROOT above - shared with every persistent sandbox container
-      # (sandbox_manager.py mounts this same named volume at /shared inside each one) so both
-      # sides can see the same .sock file. Unlike parquet_data, nothing here needs to survive a
-      # redeploy - it only ever holds transient .sock files for currently-running
-      # investigations - but it's still a named volume (not a bind mount), for the identical
-      # docker-outside-of-docker reason parquet_data is.
       - sandbox_sockets:/data/sandbox_sockets
     depends_on:
       - redis

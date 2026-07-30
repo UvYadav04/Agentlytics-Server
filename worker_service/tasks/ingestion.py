@@ -1,25 +1,11 @@
-"""arq job: run_ingestion(ctx, file_id).
-
-Pulls the raw uploaded file from R2, hands it to the engine's
-IngestionManager (Parquet output written to the worker's local disk via
-LocalParquetStore - see engine_bootstrap.PARQUET_ROOT for why this isn't
-R2 - PDF chunks written to the Chroma vector store), and updates the File
-document's status/catalog fields in Mongo.
-
-No Redis pub/sub event streaming here - that's the Investigation flow
-(tasks/investigation.py). File status is polled/refetched by the frontend
-via GET /workspaces/{id}/files.
-"""
 import asyncio
 import logging
 import os
 import shutil
 import tempfile
 
-# Must run before any `from ingestion...` / `from vectordb...` import below -
-# this is what makes analyzerEngine's top-level-style imports resolve.
-from worker_service import engine_bootstrap  # noqa: F401
 
+from worker_service import engine_bootstrap  
 from analyzerEngine.ingestion.manager import IngestionManager
 
 from shared.db import get_db
@@ -66,13 +52,8 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
                 status_for_log = "failed_download"
                 return
 
-            # Built once at worker startup (see worker.py's on_startup), not per-job - see the
-            # comment there for why (ChromaVectorStore() opens a real network connection).
             manager = IngestionManager(storage=ctx["storage"], vector_store=ctx["vector_store"])
 
-            # ingest_file() is fully synchronous (pandas/docling/chromadb calls) -
-            # run it off the event loop so it doesn't block other jobs or the
-            # worker's health checks.
             result = await asyncio.to_thread(manager.ingest_file, local_path, file.workspace_id, file.id)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True   )
@@ -91,20 +72,11 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
             "page_count": schema_summary.get("page_count"),
             "columns": schema_summary.get("columns"),
             "extracted_tables": result.extracted_tables or [],
-            # status == "partial" (e.g. scanned PDF) still counts as ready, but
-            # keep the warning visible rather than silently dropping it.
             "error": "; ".join(result.errors) if result.errors else None,
         }
         await db[FILES].update_one({"_id": file.id}, {"$set": update})
         logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
         status_for_log = result.status
-
-        # Nothing reads the raw uploaded file back from S3 after this point - tabular files
-        # are queried through their parquet output_ref (LocalParquetStore) and PDFs are queried
-        # through their extracted chunks in the vector store, never through storage_key again.
-        # So the raw copy is dead weight in S3 the moment ingestion succeeds, regardless of file
-        # type. Best-effort: a delete failure here shouldn't turn a successful ingestion into a
-        # failed job - it just means one orphaned object to clean up later.
         try:
             await asyncio.to_thread(delete_object, file.storage_key)
             logger.info("run_ingestion: deleted raw upload from S3 for file %s (key=%s)",

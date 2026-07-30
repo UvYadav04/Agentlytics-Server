@@ -1,19 +1,3 @@
-"""arq job: refresh_dashboard(ctx, dashboard_id).
-
-Re-runs a real-time dashboard's stored transform_script against its dependencies' CURRENT
-data (this is what makes a file swap via the relink endpoint take effect - the File lookup
-below happens fresh on every refresh, keyed only by file_id - Mongo's own doc _id - never
-against a remembered path), matches the sandbox's fresh save() outputs back to each chart by
-name, re-renders each matched chart, and overwrites its EXISTING Chart doc's storage_key
-content in R2 - same chart_id/URL throughout, so nothing that already links to it breaks and
-no new Chart docs (or usage-cap charges) get created on refresh.
-
-Entirely independent of any Investigation - this isn't a chat turn, so there's no SSE event
-stream to publish progress to. A chart the script didn't produce a save() for this run (e.g.
-because the script raised before reaching it - see sandbox/runner.py's note on why earlier
-save() calls still survive a later exception) is left with its last-good content rather than
-being blanked out.
-"""
 import asyncio
 import logging
 import re
@@ -40,9 +24,6 @@ logger = logging.getLogger("worker.dashboard_refresh")
 
 
 def _safe_name(name: str) -> str:
-    """Mirror sandbox/path_resolver.py's new_artifact_id sanitization, so a chart's stored
-    `name` matches the prefix of whatever file_id save() actually wrote its fresh output
-    under."""
     return re.sub(r"[^0-9a-zA-Z_]", "_", str(name))[:40].strip("_") or "result"
 
 
@@ -67,9 +48,6 @@ async def refresh_dashboard(ctx, dashboard_id: str, requested_at: str | None = N
             return
 
         file_docs = await db[FILES].find({"_id": {"$in": dashboard.file_ids}}).to_list(length=len(dashboard.file_ids))
-        # Dashboard.file_ids ARE file_ids (Mongo doc _id, == the artifact's file_id per
-        # sandbox/path_resolver.py's convention) - no output_ref/path lookup needed at all, just a
-        # "ready" filter. sandbox.run() takes {table_name: file_id} directly.
         ready_ids = {f["_id"] for f in file_docs if f.get("status") == "ready"}
         tables = {fid: fid for fid in dashboard.file_ids if fid in ready_ids}
         missing = [fid for fid in dashboard.file_ids if fid not in ready_ids]
@@ -83,24 +61,13 @@ async def refresh_dashboard(ctx, dashboard_id: str, requested_at: str | None = N
             status_for_log = "skipped_no_ready_files"
             return
 
-        # Not part of any chat (see module docstring), so there's no chat_id to persist a sandbox
-        # by - each refresh gets its own synthetic session id and its container is released
-        # immediately after, same one-shot-per-call behavior this had before sandboxes started
-        # persisting per chat (see sandbox/sandbox_manager.py). Prefixed so it can never collide
-        # with a real chat's own sandbox cache entry.
         sandbox_session_id = f"dashboard-refresh-{dashboard_id}"
-        # ctx["sandbox_manager"] (built once in worker.py's on_startup), passed explicitly - see
-        # investigation.py's matching note on why this must be the exact same instance the rest
-        # of the process uses, not a fresh get_manager() lookup that could resolve to a
-        # different singleton depending on which import path reached it.
         sandbox_manager = ctx["sandbox_manager"]
         sandbox = PythonSandbox(
             root_dir=engine_bootstrap.PARQUET_ROOT, session_id=sandbox_session_id,
             manager=sandbox_manager,
         )
         try:
-            # PythonSandbox.run() blocks on Docker/UDS calls - keep it off the event loop the
-            # same way worker_service/tasks/ingestion.py does for IngestionManager.ingest_file.
             result = await asyncio.to_thread(sandbox.run, dashboard.transform_script, tables, dashboard.workspace_id)
         except SandboxExecutionError as exc:
             logger.error("refresh_dashboard: sandbox failed for dashboard %s: %s", dashboard_id, exc)
@@ -132,9 +99,6 @@ async def refresh_dashboard(ctx, dashboard_id: str, requested_at: str | None = N
 
         for chart in dashboard.charts:
             prefix = f"{_safe_name(chart.name)}_"
-            # save()'s file_id is already "{safe_name}_{hex8}" with no path/extension attached
-            # (see sandbox/path_resolver.py's new_artifact_id) - a direct prefix match, no more
-            # splitting a path apart to get at the basename first.
             match = next((s for s in saved if s["file_id"].startswith(prefix)), None)
             if match is None:
                 logger.warning(

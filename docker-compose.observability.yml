@@ -1,37 +1,9 @@
-# Observability overlay - Langfuse (LLM tracing), Prometheus/node-exporter/
-# cAdvisor (server/system metrics), Loki/Promtail (logs), Grafana
-# (dashboards over both). Deferred for now; bring it up alongside the base
-# stack with:
-#
-#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
-#
-# Nothing in api_service/worker_service needs to change to use this later -
-# shared/logging_config.py's Loki handler and
-# analyzerEngine/llm_provider/langfuse_wrapper.py's tracing both already
-# check for LOKI_URL / LANGFUSE_HOST /  LANGFUSE_PUBLIC_KEY+SECRET_KEY at
-# runtime and no-op if unset, which is the state today with this file left
-# out. The `environment:` overrides below are the only thing that actually
-# turns them on.
-#
-# Secrets (Postgres/ClickHouse/MinIO/Redis passwords, Langfuse's
-# NEXTAUTH_SECRET/SALT/ENCRYPTION_KEY, Grafana admin password, and
-# optionally the LANGFUSE_INIT_* auto-provisioning values) come from a
-# root-level .env file (this directory, next to docker-compose.yml) - copy
-# .env.example to .env and fill in real values before bringing this overlay
-# up.
 
 services:
-  # --- Wire the base services into the observability stack ---
   api_service:
     environment:
-      # Loki push endpoint - shared/logging_config.py adds a LokiHandler
-      # pointed here (in addition to the console handler) when this is set.
       LOKI_URL: http://loki:3100/loki/api/v1/push
       SERVICE_NAME: api_service
-      # Self-hosted Langfuse instance - internal compose network address,
-      # not the host-published one. Public/secret keys still come from
-      # shared/.env (see .env.example) - per-project credentials,
-      # not something a compose file can know in advance.
       LANGFUSE_HOST: http://langfuse-web:3000
     depends_on:
       - loki
@@ -41,21 +13,10 @@ services:
       LOKI_URL: http://loki:3100/loki/api/v1/push
       SERVICE_NAME: worker_service
       LANGFUSE_HOST: http://langfuse-web:3000
-      # prometheus_client.start_http_server() port opened in worker.py's
-      # on_startup - arq has no HTTP server of its own, so this is the only
-      # way Prometheus has anything to scrape here. Container-internal only;
-      # Prometheus reaches it at worker_service:9100 over the compose network.
       PROMETHEUS_METRICS_PORT: "9100"
     depends_on:
       - loki
 
-  # ---------------------------------------------------------------------
-  # Langfuse (self-hosted v3) - LLM call tracing/cost/token monitoring.
-  # Own Postgres/ClickHouse/Redis/MinIO below, all name-prefixed langfuse-*
-  # so nothing collides with the app's own `redis` service in
-  # docker-compose.yml. Adapted from the official reference at
-  # https://github.com/langfuse/langfuse/blob/main/docker-compose.yml.
-  # ---------------------------------------------------------------------
   langfuse-web:
     image: docker.io/langfuse/langfuse:3
     container_name: langfuse-web
@@ -70,7 +31,6 @@ services:
       langfuse-clickhouse:
         condition: service_healthy
     ports:
-      # Published to the host so you can open the Langfuse UI at
       - "3001:3000"
     environment: &langfuse-env
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3001}
@@ -104,10 +64,6 @@ services:
       REDIS_PORT: "6379"
       REDIS_AUTH: ${REDIS_AUTH:?set REDIS_AUTH in .env}
       REDIS_TLS_ENABLED: "false"
-      # Auto-create your first org/project/user on first boot so you don't
-      # have to click through Langfuse's signup flow - all optional, leave
-      # blank in .env to skip and sign up manually instead. See
-      # https://langfuse.com/self-hosting/administration/headless-initialization
       LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
       LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
       LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
@@ -173,7 +129,6 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
     ports:
-      # MinIO console, for poking at stored trace media/exports directly.
       - "127.0.0.1:9091:9001"
     volumes:
       - langfuse_minio_data:/data
@@ -199,9 +154,6 @@ services:
       timeout: 10s
       retries: 10
 
-  # ---------------------------------------------------------------------
-  # Prometheus + node-exporter + cAdvisor - server/system metrics.
-  # ---------------------------------------------------------------------
   prometheus:
     image: prom/prometheus:latest
     container_name: data-analyzer-prometheus
@@ -238,12 +190,6 @@ services:
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
 
-  # ---------------------------------------------------------------------
-  # Loki + Promtail - log aggregation. Promtail tails every container's
-  # Docker logs (zero per-service config needed); api_service/worker_service
-  # additionally push their own structured logs straight to Loki's HTTP
-  # push API via shared/logging_config.py for proper service/level labels.
-  # ---------------------------------------------------------------------
   loki:
     image: grafana/loki:latest
     container_name: data-analyzer-loki
@@ -265,10 +211,6 @@ services:
     depends_on:
       - loki
 
-  # ---------------------------------------------------------------------
-  # Grafana - dashboards over Prometheus (metrics) + Loki (logs). Both
-  # datasources are auto-provisioned from ./observability/grafana on boot.
-  # ---------------------------------------------------------------------
   grafana:
     image: grafana/grafana:latest
     container_name: data-analyzer-grafana

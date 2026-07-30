@@ -11,12 +11,7 @@ InvestigationStatus = Literal["running", "completed", "failed", "cancelled"]
 
 
 class InvestigationEvent(BaseModel):
-    """One entry in Investigation.events[] - also the shape published to the
-    Redis pub/sub channel `investigation:{id}` as each event happens. Mongo's
-    events[] is the source of truth (SSE replays from here on reconnect);
-    Redis pub/sub is just the live tail (see Phase 5 of the build plan)."""
-
-    type: str  # e.g. "status", "tool_call", "delegation", "answer", "cancelled", "error"
+    type: str
     message: str
     data: dict = Field(default_factory=dict)
     at: datetime = Field(default_factory=utcnow)

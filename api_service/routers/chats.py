@@ -305,9 +305,7 @@ async def list_messages(chat_id: str, user: User = Depends(get_current_user)):
 
 @router.get("/chats/{chat_id}/active-investigation")
 async def active_investigation(chat_id: str, user: User = Depends(get_current_user)):
-    """So the frontend can, on chat load, auto-reconnect to a still-running
-    investigation instead of showing an idle input (see build plan Phase 5,
-    'On chat load')."""
+
     await get_owned_chat(chat_id, user)
     doc = await get_db()[INVESTIGATIONS].find_one({"chat_id": chat_id, "status": "running"})
     if doc is None:
@@ -318,11 +316,7 @@ async def active_investigation(chat_id: str, user: User = Depends(get_current_us
 
 @router.post("/chats/{chat_id}/messages", response_model=SendMessageResponse)
 async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depends(get_current_user)):
-    # Captured before anything else in this handler runs - this is "when the request arrived"
-    # for timing purposes. request_received_at (ISO, ms precision) rides along as the
-    # `requested_at` job kwarg so run_investigation can log the full request -> worker pickup
-    # latency later (see shared/job_timing.py); t0 is just this process's own perf_counter for
-    # the elapsed-ms logging below.
+   
     request_received_at = now_iso()
     t0 = time.perf_counter()
     logger.info(
@@ -368,12 +362,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     db[INVESTIGATIONS].insert_one(investigation.to_mongo()),
 )
 
-    # Local ONNX embedding tier (no network call) plus a cheap "does this workspace have any
-    # ready files" existence check, run concurrently - both are needed to decide light_route
-    # below and neither depends on the other. Ambiguous intent-tier queries just route to the
-    # full Orchestrator (route=None) instead of waiting on a slower, more accurate
-    # classification - matches the "if unsure, choose orchestrator" rule the LLM fallback itself
-    # would have applied anyway.
+    
     route_result, files_doc = await asyncio.gather(
         asyncio.to_thread(route_query_intent_fast, body.content),
         db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
@@ -381,9 +370,6 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     has_files = files_doc is not None
     route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
 
-    # "greeting" wins even if files exist (a "hi" shouldn't trigger analysis); "no_files" applies
-    # regardless of what the intent tier guessed, since there's nothing for Tabular/Document to
-    # act on either way. Both bypass the arq queue - see api_service/light_investigation.py.
     if route_result.intent == "greeting":
         light_route = "greeting"
     elif not has_files:
@@ -407,9 +393,6 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     )
 
     if light_route is not None:
-        # Fire-and-forget: HTTP response returns immediately, the light-model call + retry/
-        # fallback logic runs in its own background task (see that module's docstring for why
-        # this needs no special-casing on the SSE side).
         schedule_light_response(
             investigation_id=investigation.id, chat_id=chat_id, workspace_id=chat.workspace_id,
             user_id=user.id, query=body.content, route=light_route,

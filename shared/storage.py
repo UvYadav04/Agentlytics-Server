@@ -1,15 +1,3 @@
-"""AWS S3 access for api_service (raw file uploads, chart/report
-downloads). Thin boto3 wrapper.
-
-This is separate from Server/analyzerEngine/ingestion/storage/r2_store.py,
-which implements the engine's BaseObjectStore interface (write/read a
-pandas DataFrame as Parquet) and is only used inside worker_service when
-constructing the IngestionManager. That module is currently unused
-(worker_service uses LocalParquetStore instead) - if you want the engine's
-Parquet storage on S3 too, wire up an S3ParquetStore there separately. This
-module deals in raw bytes/URLs and is used for the upload/download flow in
-Phase 3, plus chart/report file storage in Phase 7.
-"""
 import uuid
 
 import boto3

@@ -1,14 +1,3 @@
-"""Redis access shared by api_service and worker_service.
-
-Two distinct uses of the same Redis instance (see full_application_build_plan.md):
-  - durable job queue, via arq (api_service enqueues, worker_service consumes)
-  - ephemeral pub/sub, the live event relay for SSE streaming
-
-`get_redis()` is a plain redis.asyncio client for pub/sub (publish from the
-worker, subscribe from api_service's SSE endpoint). `get_arq_redis_settings()`
-gives arq's own connection settings, used both to create the enqueueing pool
-in api_service and as `WorkerSettings.redis_settings` in worker_service.
-"""
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from redis.asyncio import Redis
 
@@ -45,8 +34,6 @@ def investigation_channel(investigation_id: str) -> str:
 
 
 async def _close(conn) -> None:
-    # redis-py renamed close() -> aclose() around v5; support either so this
-    # doesn't break depending on exactly what got pip-installed.
     closer = getattr(conn, "aclose", None) or getattr(conn, "close", None)
     if closer is not None:
         await closer()

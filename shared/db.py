@@ -1,17 +1,3 @@
-"""Mongo access shared by api_service and worker_service.
-
-Deliberately thin: `get_db()` returns a motor AsyncIOMotorDatabase and
-callers do explicit collection operations (`get_db()["files"].find_one(...)`)
-or use the `COLLECTION` constant exported by each model module, e.g.:
-
-    from shared.db import get_db
-    from shared.models.file import File, COLLECTION as FILES
-
-    doc = await get_db()[FILES].find_one({"_id": file_id})
-    file = File.from_mongo(doc)
-
-`ensure_indexes()` is called once on api_service/worker_service startup.
-"""
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 from shared.config import get_settings
@@ -40,11 +26,6 @@ def get_db() -> AsyncIOMotorDatabase:
 
 async def ensure_indexes() -> None:
     db = get_db()
-    # Partial, not a plain unique index: google_id is None for every email/password-only
-    # account (see shared/models/user.py), and a plain unique index would treat every one of
-    # those null values as "the same" and reject the second such signup with a duplicate-key
-    # error. Restricting the uniqueness constraint to documents where google_id is actually a
-    # string sidesteps that while still preventing two Users from sharing one real Google id.
     await db["users"].create_index(
         "google_id", unique=True, partialFilterExpression={"google_id": {"$type": "string"}},
     )
@@ -58,8 +39,6 @@ async def ensure_indexes() -> None:
     await db["dashboards"].create_index("workspace_id")
     await db["reports"].create_index("workspace_id")
     await db["usage"].create_index("user_id", unique=True)
-    await db["query_shadow_logs"].create_index("chat_id")
-    await db["query_shadow_logs"].create_index([("tier", 1), ("created_at", -1)])
 
 
 async def close_client() -> None:
