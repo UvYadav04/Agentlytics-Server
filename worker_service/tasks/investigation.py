@@ -508,7 +508,7 @@ def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, k
 
 
 async def _run_tabular_direct(
-    catalog: FileCatalog, storage: LocalParquetStore, investigation_id: str, sandbox_manager,
+    catalog: FileCatalog, storage: LocalParquetStore, chat_id: str, sandbox_manager,
     workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
 ) -> OrchestratorResult | None:
     """Skips the Orchestrator entirely - builds a TabularAgent straight from the catalog and
@@ -521,7 +521,7 @@ async def _run_tabular_direct(
     assigned_files = [TabularFileRef(file_id=e.file_id, filename=e.filename) for e in entries]
     agent = TabularAgent(
         assigned_files, storage=storage, workspace_id=workspace_id,
-        investigation_id=investigation_id, sandbox_manager=sandbox_manager, direct_route=True,
+        chat_id=chat_id, sandbox_manager=sandbox_manager, direct_route=True,
         reports_dir=engine_bootstrap.REPORTS_ROOT,
     )
     findings = await agent.run(query, constraints={}, on_event=on_event)
@@ -576,10 +576,17 @@ async def run_investigation(
         investigation_id=investigation_id, chat_id=chat_id,
     )
 
+    # Sandbox is keyed by chat_id (not investigation_id) and now persists warm across the WHOLE
+    # chat - every message in this chat reuses the same container until either this user starts
+    # a DIFFERENT chat (the sandbox eviction in get_or_create below) or the chat sits idle past
+    # SandboxManager's idle_timeout_seconds (5 min default - see sandbox/sandbox_manager.py).
+    # There is deliberately no matching release() at the end of this function anymore (see the
+    # `finally` block below) - that used to tear the sandbox down after every single turn, which
+    # is exactly the per-message cold-start cost this change removes.
     sandbox_manager = ctx["sandbox_manager"]
     prewarm_start = time.perf_counter()
     sandbox_prewarm_task = asyncio.create_task(
-        asyncio.to_thread(sandbox_manager.get_or_create, investigation_id)
+        asyncio.to_thread(sandbox_manager.get_or_create, chat_id, user_id)
     )
 
     def _log_prewarm_result(task: asyncio.Task, _start=prewarm_start) -> None:
@@ -588,15 +595,17 @@ async def run_investigation(
         exc = task.exception()  # also marks the exception as "retrieved" - no asyncio warning
         if exc is not None:
             logger.warning(
-                "investigation %s: sandbox pre-warm failed after %.1fms (the first run_python "
-                "call will just create it synchronously instead, same as before this change): %s",
-                investigation_id, (time.perf_counter() - _start) * 1000, exc,
+                "investigation %s: sandbox pre-warm failed after %.1fms for chat=%s (the first "
+                "run_python call will just create it synchronously instead, same as before this "
+                "change): %s",
+                investigation_id, (time.perf_counter() - _start) * 1000, chat_id, exc,
             )
         else:
             logger.info(
-                "investigation %s: sandbox pre-warmed in %.1fms (overlapped with catalog build "
-                "and the orchestrator's own LLM calls, not added on top of them)",
-                investigation_id, (time.perf_counter() - _start) * 1000,
+                "investigation %s: sandbox pre-warmed/reused in %.1fms for chat=%s (overlapped "
+                "with catalog build and the orchestrator's own LLM calls, not added on top of "
+                "them)",
+                investigation_id, (time.perf_counter() - _start) * 1000, chat_id,
             )
 
     sandbox_prewarm_task.add_done_callback(_log_prewarm_result)
@@ -663,7 +672,7 @@ async def run_investigation(
 
             if direct_route == "tabular":
                 result = await _run_tabular_direct(
-                    catalog, storage, investigation_id, sandbox_manager, workspace_id, query,
+                    catalog, storage, chat_id, sandbox_manager, workspace_id, query,
                     mentioned_file_ids, on_event, result_collector,
                 )
                 if result is None:
@@ -695,7 +704,7 @@ async def run_investigation(
                 # Orchestrator path below can be cancelled once it has started.
                 orchestrator = OrchestratorAgent(
                     catalog, vector_store=vector_store, memory=memory, storage=storage,
-                    reports_dir=engine_bootstrap.REPORTS_ROOT, investigation_id=investigation_id,
+                    reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
                     sandbox_manager=sandbox_manager, result_collector=result_collector,
                 )
                 thread_context = await _thread_context(db, chat_id)
@@ -803,29 +812,24 @@ async def run_investigation(
         )
     finally:
         # Always wait for the pre-warm task kicked off at the top of this function to actually
-        # finish - success or failure - before releasing anything below. Without this, a fast
+        # finish - success or failure - before this function returns. Without this, a fast
         # investigation that never touched the Tabular Agent (so nothing else ever awaited this
-        # task) could reach release() while the background thread is still mid-`docker run`,
-        # racing container creation against its own teardown. The exception (if any) was already
-        # logged by _log_prewarm_result's done-callback, so this is just a rendezvous, not a
-        # second place that needs to report it.
+        # task) could return while the background thread is still mid-`docker run`, leaking an
+        # un-awaited task. The exception (if any) was already logged by _log_prewarm_result's
+        # done-callback, so this is just a rendezvous, not a second place that needs to report it.
         try:
             await sandbox_prewarm_task
         except Exception:
             pass
 
-        # Runs on every exit path (completed/failed/cancelled/an exception this function itself
-        # doesn't catch) - this investigation is over either way, so its persistent sandbox
-        # container (see sandbox/sandbox_manager.py - one container per investigation_id, warm
-        # across every invoke_tabular_agent call this run made) is released now rather than left
-        # for the idle-timeout reaper to eventually notice. release() itself makes blocking
-        # Docker SDK calls (container stop/remove), so it's pushed off the event loop the same
-        # way PythonSandbox.run's own Docker calls already are elsewhere (see
-        # dashboard_refresh.py's asyncio.to_thread note).
-        try:
-            await asyncio.to_thread(sandbox_manager.release, investigation_id)
-        except Exception:
-            logger.exception("failed to release sandbox for investigation %s", investigation_id)
+        # Deliberately NOT releasing the sandbox here anymore. It used to be torn down at the end
+        # of every single investigation (one container per investigation_id); now it's kept warm
+        # per CHAT across every message in that chat, and only goes away when SandboxManager
+        # itself decides to let it go - this user starting a DIFFERENT chat (evicted in
+        # get_or_create, triggered by the next message's pre-warm call above) or the chat sitting
+        # idle past idle_timeout_seconds (5 min default - the background reaper thread, not
+        # anything in this function). See sandbox/sandbox_manager.py.
+
         # Paired with log_job_picked_up above - total in-worker duration (excludes queue wait,
         # which was already logged separately). The specific outcome (completed/failed/
         # cancelled) is already logged with its own status a few lines up in each branch; this

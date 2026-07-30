@@ -34,3 +34,5 @@ Thumbs.db
 *.log
 logs/
 **/logs/
+
+shared/onnx_intent/weights

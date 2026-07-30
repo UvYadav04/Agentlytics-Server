@@ -83,19 +83,19 @@ async def refresh_dashboard(ctx, dashboard_id: str, requested_at: str | None = N
             status_for_log = "skipped_no_ready_files"
             return
 
-        # Not part of any Investigation (see module docstring), so there's no investigation_id to
-        # reuse a sandbox by - each refresh gets its own synthetic id and its container is released
-        # immediately after, same one-shot-per-call behavior this had before the persistent-sandbox
-        # architecture (see sandbox/sandbox_manager.py). Prefixed so it can never collide with a real
-        # investigation_id's own sandbox cache entry.
-        sandbox_investigation_id = f"dashboard-refresh-{dashboard_id}"
+        # Not part of any chat (see module docstring), so there's no chat_id to persist a sandbox
+        # by - each refresh gets its own synthetic session id and its container is released
+        # immediately after, same one-shot-per-call behavior this had before sandboxes started
+        # persisting per chat (see sandbox/sandbox_manager.py). Prefixed so it can never collide
+        # with a real chat's own sandbox cache entry.
+        sandbox_session_id = f"dashboard-refresh-{dashboard_id}"
         # ctx["sandbox_manager"] (built once in worker.py's on_startup), passed explicitly - see
         # investigation.py's matching note on why this must be the exact same instance the rest
         # of the process uses, not a fresh get_manager() lookup that could resolve to a
         # different singleton depending on which import path reached it.
         sandbox_manager = ctx["sandbox_manager"]
         sandbox = PythonSandbox(
-            root_dir=engine_bootstrap.PARQUET_ROOT, investigation_id=sandbox_investigation_id,
+            root_dir=engine_bootstrap.PARQUET_ROOT, session_id=sandbox_session_id,
             manager=sandbox_manager,
         )
         try:
@@ -108,7 +108,7 @@ async def refresh_dashboard(ctx, dashboard_id: str, requested_at: str | None = N
             return
         finally:
             try:
-                await asyncio.to_thread(sandbox_manager.release, sandbox_investigation_id)
+                await asyncio.to_thread(sandbox_manager.release, sandbox_session_id)
             except Exception:
                 logger.exception("refresh_dashboard: failed to release sandbox for dashboard %s", dashboard_id)
 

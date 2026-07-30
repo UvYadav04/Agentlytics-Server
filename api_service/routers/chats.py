@@ -27,6 +27,7 @@ from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
 from shared.intent_router import route_query_intent_fast
+from api_service.light_investigation import schedule_light_response
 from shared.admin import is_admin_email
 from shared.job_timing import now_iso
 from shared.redis_client import get_arq_pool, get_redis, investigation_channel
@@ -97,6 +98,12 @@ router = APIRouter(tags=["chats"])
 # run_investigation applies a second, independent safety check on top of that (whether the file
 # selection is actually unambiguous for tabular/document routes - see its
 # _select_direct_route_files) before a route is actually allowed to skip the Orchestrator.
+#
+# Two cases skip the arq queue (and the Orchestrator) entirely, straight to
+# api_service/light_investigation.py's light-model path: the query classifies as "greeting", or
+# the workspace has zero ready files (nothing for Tabular/Document tools to act on regardless of
+# what the intent tier thinks the query is about - see send_message below for exactly how these
+# two are decided, and why "no files" is its own reason rather than being folded into "greeting").
 
 LIMIT_MESSAGE = (
     "You've used all 20 free messages. Upgrade for more, or check back once your plan resets."
@@ -323,12 +330,6 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
 
     chat = await get_owned_chat(chat_id, user)
 
-    # Free-tier checkpoints, both checked before the user's message is persisted /
-    # anything is enqueued: (1) this specific chat's own 8-message cap, then (2) the
-    # user's lifetime 20-message cap across every chat (shared/usage.py). Either one
-    # being hit still persists the user's message (so it's visible in the transcript)
-    # but never enqueues an investigation for it. Run concurrently - independent reads.
-    # Both bypassed entirely for admin emails (see shared/admin.py).
     chat_has_capacity, user_has_capacity = await asyncio.gather(
         usage.has_chat_message_capacity(chat_id, email=user.email),
         usage.has_message_capacity(user.id, email=user.email),
@@ -357,35 +358,43 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
             message_id=message.id, investigation_id=None, limited=True, limit_message=LIMIT_MESSAGE,
         )
 
-    # message.id/investigation.id are generated locally (uuid4 hex - see shared/models/base.py),
-    # not by Mongo, so both are already known here - the inserts below don't need to complete
-    # before the intent classification runs. persist_task kicks off both writes concurrently
-    # with each other AND with the classification call right below, instead of the previous
-    # fully-sequential "insert message, insert investigation, then classify" chain. It's still
-    # awaited before enqueueing (the worker's SSE/ownership checks need the Investigation doc to
-    # already exist), so this isn't a full fire-and-forget queue handoff like update_chat_memory's
-    # - just every independent piece of this request running in parallel instead of one at a time.
     message = Message(chat_id=chat_id, role="user", content=body.content)
     investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
     db = get_db()
-    persist_task = asyncio.create_task(
-        asyncio.gather(
-            db[MESSAGES].insert_one(message.to_mongo()),
-            db[INVESTIGATIONS].insert_one(investigation.to_mongo()),
-        )
-    )
+    persist_task = asyncio.gather(
+    db[MESSAGES].insert_one(message.to_mongo()),
+    db[INVESTIGATIONS].insert_one(investigation.to_mongo()),
+)
 
-    # Local ONNX embedding tier only - a few ms, no network call, no LLM fallback (see
-    # shared/intent_router.py). Ambiguous queries just route to the full Orchestrator (route=None)
-    # instead of waiting on a slower, more accurate classification - matches the "if unsure,
-    # choose orchestrator" rule the LLM fallback itself would have applied anyway.
-    route_result = await asyncio.to_thread(route_query_intent_fast, body.content)
+    # Local ONNX embedding tier (no network call) plus a cheap "does this workspace have any
+    # ready files" existence check, run concurrently - both are needed to decide light_route
+    # below and neither depends on the other. Ambiguous intent-tier queries just route to the
+    # full Orchestrator (route=None) instead of waiting on a slower, more accurate
+    # classification - matches the "if unsure, choose orchestrator" rule the LLM fallback itself
+    # would have applied anyway.
+    route_result, files_doc = await asyncio.gather(
+        asyncio.to_thread(route_query_intent_fast, body.content),
+        db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
+    )
+    has_files = files_doc is not None
     route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
+
+    # "greeting" wins even if files exist (a "hi" shouldn't trigger analysis); "no_files" applies
+    # regardless of what the intent tier guessed, since there's nothing for Tabular/Document to
+    # act on either way. Both bypass the arq queue - see api_service/light_investigation.py.
+    if route_result.intent == "greeting":
+        light_route = "greeting"
+    elif not has_files:
+        light_route = "no_files"
+    else:
+        light_route = None
+
     logger.info(
         "send_message: intent_router method=%s top_intent=%s top_similarity=%.3f margin=%.3f "
-        "route=%s router_latency_ms=%.1f at +%.1fms total (chat_id=%s, error=%s)",
+        "route=%s light_route=%s has_files=%s router_latency_ms=%.1f at +%.1fms total "
+        "(chat_id=%s, error=%s)",
         route_result.method, route_result.top_intent, route_result.top_similarity,
-        route_result.margin, route, route_result.latency_ms,
+        route_result.margin, route, light_route, has_files, route_result.latency_ms,
         (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
     )
 
@@ -395,22 +404,37 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         investigation.id, (time.perf_counter() - t0) * 1000, chat_id, message.id,
     )
 
-    pool = await get_arq_pool()
-    job = await pool.enqueue_job(
-        "run_investigation",
-        investigation_id=investigation.id,
-        chat_id=chat_id,
-        workspace_id=chat.workspace_id,
-        user_id=user.id,
-        query=body.content,
-        file_ids=body.file_ids,
-        requested_at=request_received_at,
-        route=route,
-    )
-    logger.info(
-        "send_message: investigation %s enqueued as arq job %s at +%.1fms total (chat_id=%s)",
-        investigation.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000, chat_id,
-    )
+    if light_route is not None:
+        # Fire-and-forget: HTTP response returns immediately, the light-model call + retry/
+        # fallback logic runs in its own background task (see that module's docstring for why
+        # this needs no special-casing on the SSE side).
+        schedule_light_response(
+            investigation_id=investigation.id, chat_id=chat_id, workspace_id=chat.workspace_id,
+            user_id=user.id, query=body.content, route=light_route,
+            requested_at=request_received_at, file_ids=body.file_ids,
+        )
+        logger.info(
+            "send_message: investigation %s dispatched to light-response path (%s) at +%.1fms "
+            "total (chat_id=%s)",
+            investigation.id, light_route, (time.perf_counter() - t0) * 1000, chat_id,
+        )
+    else:
+        pool = await get_arq_pool()
+        job = await pool.enqueue_job(
+            "run_investigation",
+            investigation_id=investigation.id,
+            chat_id=chat_id,
+            workspace_id=chat.workspace_id,
+            user_id=user.id,
+            query=body.content,
+            file_ids=body.file_ids,
+            requested_at=request_received_at,
+            route=route,
+        )
+        logger.info(
+            "send_message: investigation %s enqueued as arq job %s at +%.1fms total (chat_id=%s)",
+            investigation.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000, chat_id,
+        )
 
     return SendMessageResponse(message_id=message.id, investigation_id=investigation.id)
 
