@@ -305,6 +305,7 @@ def _artifact_title(path: str) -> str:
 
 async def _persist_dashboard_bundle(
     db, s3, bucket: str, workspace_id: str, investigation_id: str, message_id: str, user_id: str, manifest_path: str,
+    email: str | None = None,
 ) -> list:
     """Handles the "dashboard_bundle" artifact kind - see ReportingTools.
     generate_realtime_dashboard_bundle() and FinalResultCollector's kind tagging. Uploads one HTML file
@@ -322,7 +323,7 @@ async def _persist_dashboard_bundle(
     chart_configs: list[ChartConfig] = []
 
     for chart_meta in manifest.get("charts", []):
-        if not await usage.has_chart_capacity(user_id):
+        if not await usage.has_chart_capacity(user_id, email):
             await _append_event(
                 db, investigation_id, "status",
                 "Chart limit reached - some dashboard charts generated but not saved.",
@@ -356,6 +357,7 @@ async def _persist_dashboard_bundle(
             x_column=chart_meta.get("x_column"),
             y_column=chart_meta.get("y_column"),
             z_column=chart_meta.get("z_column"),
+            bins=chart_meta.get("bins"),
         ))
 
     if not chart_configs:
@@ -379,7 +381,7 @@ async def _persist_dashboard_bundle(
 
 async def _persist_artifacts(
     db, workspace_id: str, investigation_id: str, message_id: str, user_id: str,
-    chart_paths: list, artifacts: list,
+    chart_paths: list, artifacts: list, email: str | None = None,
 ) -> tuple[list, str | None]:
     """Uploads local files the orchestrator produced (charts/dashboards/reports/csv exports -
     see tools/reporting/reporting_tools.py, tools/tabular/tabular_tools.py's
@@ -404,7 +406,7 @@ async def _persist_artifacts(
         if not isinstance(ref, str) or not os.path.isfile(ref):
             continue
         try:
-            if not await usage.has_chart_capacity(user_id):
+            if not await usage.has_chart_capacity(user_id, email):
                 await _append_event(
                     db, investigation_id, "status",
                     "Chart limit reached - a chart was generated but not saved.",
@@ -446,9 +448,10 @@ async def _persist_artifacts(
             if kind == "dashboard_bundle":
                 chart_ids.extend(await _persist_dashboard_bundle(
                     db, s3, bucket, workspace_id, investigation_id, message_id, user_id, ref,
+                    email,
                 ))
             else:
-                if not await usage.has_report_capacity(user_id):
+                if not await usage.has_report_capacity(user_id, email):
                     await _append_event(
                         db, investigation_id, "status",
                         "Report limit reached - file generated but not saved.",
@@ -510,6 +513,7 @@ def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, k
 async def _run_tabular_direct(
     catalog: FileCatalog, storage: LocalParquetStore, chat_id: str, sandbox_manager,
     workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
+    thread_context: dict | None = None, chart_capacity_checker=None,
 ) -> OrchestratorResult | None:
     """Skips the Orchestrator entirely - builds a TabularAgent straight from the catalog and
     runs it. Returns None (never raises for this reason) when file selection isn't unambiguous,
@@ -522,9 +526,12 @@ async def _run_tabular_direct(
     agent = TabularAgent(
         assigned_files, storage=storage, workspace_id=workspace_id,
         chat_id=chat_id, sandbox_manager=sandbox_manager, direct_route=True,
-        reports_dir=engine_bootstrap.REPORTS_ROOT,
+        reports_dir=engine_bootstrap.REPORTS_ROOT, chart_capacity_checker=chart_capacity_checker,
     )
-    findings = await agent.run(query, constraints={}, on_event=on_event)
+    # thread_context (recent turns/summary) matters MORE here than on the Orchestrator path -
+    # this agent never talks to the Orchestrator at all, so this is its only source of "what did
+    # we just talk about" (see agents/thread_context.py).
+    findings = await agent.run(query, constraints={}, on_event=on_event, thread_context=thread_context)
     # Same registration OrchestratorTools.invoke_tabular_agent uses for the full-Orchestrator
     # path - splits findings.charts/artifact_refs into the collector's typed chart_paths/
     # artifacts instead of the old flat list _persist_artifacts used to re-guess kinds from.
@@ -534,13 +541,13 @@ async def _run_tabular_direct(
     return OrchestratorResult(
         final_answer=findings.summary, chart_paths=result_collector.chart_paths,
         artifacts=result_collector.artifacts, files_used=result_collector.files_used,
-        open_questions=[],
+        open_questions=[], follow_up_questions=findings.follow_up_questions,
     )
 
 
 async def _run_document_direct(
     catalog: FileCatalog, vector_store, query: str, mentioned_file_ids: list, on_event,
-    result_collector: FinalResultCollector,
+    result_collector: FinalResultCollector, thread_context: dict | None = None,
 ) -> OrchestratorResult | None:
     """Same shape as _run_tabular_direct above, for the Document Agent - targeted document
     reasoning only (see agents/document/config.py's own scoping note), not whole-document
@@ -553,20 +560,24 @@ async def _run_document_direct(
     # Deterministic backend lookup, never an LLM tool call - see tools/document/metadata.py.
     metadata_brief = build_document_metadata_brief(catalog, vector_store, [e.file_id for e in entries])
     agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True)
-    findings = await agent.run(query, constraints={}, on_event=on_event, metadata_brief=metadata_brief)
+    findings = await agent.run(
+        query, constraints={}, on_event=on_event, metadata_brief=metadata_brief,
+        thread_context=thread_context,
+    )
     result_collector.add_document_findings(
         findings, "invoke_document_agent", [e.file_id for e in entries],
     )
     return OrchestratorResult(
         final_answer=findings.summary, chart_paths=result_collector.chart_paths,
         artifacts=result_collector.artifacts, files_used=result_collector.files_used,
-        open_questions=[],
+        open_questions=[], follow_up_questions=findings.follow_up_questions,
     )
 
 
 async def run_investigation(
     ctx, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str,
     file_ids: list[str] | None = None, requested_at: str | None = None, route: str | None = None,
+    email: str | None = None,
 ) -> None:
     # First line, always - logs when this worker actually started running the job, plus
     # queue_wait/request_to_worker latency (requested_at comes from chats.py's send_message,
@@ -627,6 +638,14 @@ async def run_investigation(
     # work this investigation did, and gets persisted instead of thrown away with the exception.
     result_collector = FinalResultCollector()
 
+    # Bound to this investigation's user/email once, then handed down to whichever Tabular Agent
+    # ends up running (direct-routed or via the Orchestrator) - see TabularTools.
+    # create_visualizations, which calls this BEFORE generating a chart so the limit (and the
+    # admin bypass - shared/usage.py's has_chart_capacity(email=...)) is enforced up front
+    # instead of only at persist time below, after the work was already done.
+    async def chart_capacity_checker() -> bool:
+        return await usage.has_chart_capacity(user_id, email)
+
     async def on_event(event: dict) -> None:
         await _append_event(db, investigation_id, event["type"], event["message"], event.get("data"))
 
@@ -666,6 +685,14 @@ async def run_investigation(
             "data": {"skipped_files": skipped_files},
         })
 
+    # Fetched once, up front, and threaded into EVERY path below (both direct-route helpers and
+    # the Orchestrator) - not just the Orchestrator's, like before. A direct-routed Tabular/
+    # Document agent never talks to the Orchestrator at all, so without this it would have zero
+    # memory of earlier turns in this chat: "show me a chart of THIS data" only resolves if
+    # whichever agent actually handles the turn can see what "this data" referred to a message or
+    # two ago (see agents/thread_context.py).
+    thread_context = await _thread_context(db, chat_id)
+
     try:
         try:
             result = None
@@ -673,7 +700,8 @@ async def run_investigation(
             if direct_route == "tabular":
                 result = await _run_tabular_direct(
                     catalog, storage, chat_id, sandbox_manager, workspace_id, query,
-                    mentioned_file_ids, on_event, result_collector,
+                    mentioned_file_ids, on_event, result_collector, thread_context,
+                    chart_capacity_checker,
                 )
                 if result is None:
                     logger.info(
@@ -683,6 +711,7 @@ async def run_investigation(
             elif direct_route == "document":
                 result = await _run_document_direct(
                     catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
+                    thread_context,
                 )
                 if result is None:
                     logger.info(
@@ -706,8 +735,8 @@ async def run_investigation(
                     catalog, vector_store=vector_store, memory=memory, storage=storage,
                     reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
                     sandbox_manager=sandbox_manager, result_collector=result_collector,
+                    chart_capacity_checker=chart_capacity_checker,
                 )
-                thread_context = await _thread_context(db, chat_id)
                 result = await orchestrator.run(
                     query, workspace_id=workspace_id, thread_context=thread_context,
                     on_event=on_event, cancel_check=cancel_check,
@@ -751,7 +780,7 @@ async def run_investigation(
                 try:
                     chart_ids, report_id = await _persist_artifacts(
                         db, workspace_id, investigation_id, message.id, user_id,
-                        result_collector.chart_paths, result_collector.artifacts,
+                        result_collector.chart_paths, result_collector.artifacts, email,
                     )
                 except Exception:
                     logger.exception(
@@ -773,12 +802,17 @@ async def run_investigation(
             await db[MESSAGES].insert_one(message.to_mongo())
             return
 
+        # result.follow_up_questions came from the SAME model call that produced final_answer -
+        # see agents/final_answer.py (the responding agent's system prompt asks it to end its
+        # final reply with a small marked section, split back out before final_answer/
+        # follow_up_questions were ever set on `result`). No extra LLM round trip needed.
         message = Message(
             chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
+            follow_up_questions=result.follow_up_questions,
         )
         chart_ids, report_id = await _persist_artifacts(
             db, workspace_id, investigation_id, message.id, user_id,
-            result.chart_paths, result.artifacts,
+            result.chart_paths, result.artifacts, email,
         )
         message.chart_ids = chart_ids
         message.report_id = report_id

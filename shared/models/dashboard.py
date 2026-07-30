@@ -34,6 +34,7 @@ class ChartConfig(BaseModel):
     x_column: Optional[str] = None
     y_column: Optional[str] = None
     z_column: Optional[str] = None
+    bins: Optional[int] = None
 
 
 class Dashboard(MongoModel):

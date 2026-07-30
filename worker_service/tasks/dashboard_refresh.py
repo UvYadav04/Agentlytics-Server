@@ -159,7 +159,7 @@ async def refresh_dashboard(ctx, dashboard_id: str, requested_at: str | None = N
                     name=chart.name, label_column=chart.label_column, value_columns=chart.value_columns,
                     time_column=chart.time_column, series_column=chart.series_column,
                     value_column=chart.value_column, x_column=chart.x_column, y_column=chart.y_column,
-                    z_column=chart.z_column,
+                    z_column=chart.z_column, bins=chart.bins,
                 )
                 section = ReportingTools._render_section(dataframe, spec)
                 html = ReportingTools._render_html(section["title"], [section], source_count=1)

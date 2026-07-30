@@ -5,6 +5,7 @@ import onnxruntime as ort
 from tokenizers import Tokenizer
 
 from shared.config import get_settings
+from shared.onnx_intent.ensure_weights import ensure_model_downloaded
 
 _DEFAULT_WEIGHTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
 _MAX_LENGTH = 64
@@ -37,7 +38,14 @@ def _load() -> None:
     tokenizer.enable_padding(pad_id=pad_id if pad_id is not None else 0, pad_token="[PAD]")
     tokenizer.enable_truncation(max_length=_MAX_LENGTH)
 
-    session = ort.InferenceSession(_model_path(), providers=["CPUExecutionProvider"])
+    model_path = _model_path()
+    # model.onnx is gitignored (see shared/onnx_intent/ensure_weights.py's docstring) - on a
+    # fresh deploy (e.g. EC2 right after git pull) it won't exist yet. This downloads it once,
+    # in place, before the very first InferenceSession is ever created; every call after that
+    # (this process or a later restart) finds the file already there and returns immediately.
+    ensure_model_downloaded(model_path)
+
+    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
 
     _tokenizer = tokenizer
     _session = session

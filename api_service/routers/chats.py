@@ -134,6 +134,7 @@ class MessageOut(BaseModel):
     chart_ids: list[str]
     report_id: str | None
     files_used: list[str]
+    follow_up_questions: list[str]
     created_at: str
 
 
@@ -167,7 +168,8 @@ def _message_out(m: Message) -> MessageOut:
     return MessageOut(
         id=m.id, chat_id=m.chat_id, role=m.role, content=m.content,
         investigation_id=m.investigation_id, chart_ids=m.chart_ids, report_id=m.report_id,
-        files_used=m.files_used, created_at=m.created_at.isoformat(),
+        files_used=m.files_used, follow_up_questions=m.follow_up_questions,
+        created_at=m.created_at.isoformat(),
     )
 
 
@@ -411,7 +413,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         schedule_light_response(
             investigation_id=investigation.id, chat_id=chat_id, workspace_id=chat.workspace_id,
             user_id=user.id, query=body.content, route=light_route,
-            requested_at=request_received_at, file_ids=body.file_ids,
+            requested_at=request_received_at, file_ids=body.file_ids, email=user.email,
         )
         logger.info(
             "send_message: investigation %s dispatched to light-response path (%s) at +%.1fms "
@@ -426,6 +428,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
             chat_id=chat_id,
             workspace_id=chat.workspace_id,
             user_id=user.id,
+            email=user.email,
             query=body.content,
             file_ids=body.file_ids,
             requested_at=request_received_at,

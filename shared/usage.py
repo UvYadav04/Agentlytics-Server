@@ -84,12 +84,16 @@ async def has_chat_message_capacity(chat_id: str, email: str | None = None) -> b
     return count < messages_per_chat_limit()
 
 
-async def has_chart_capacity(user_id: str) -> bool:
+async def has_chart_capacity(user_id: str, email: str | None = None) -> bool:
+    if is_admin_email(email):
+        return True
     usage = await get_or_create_usage(user_id)
     return usage.charts_created < charts_limit()
 
 
-async def has_report_capacity(user_id: str) -> bool:
+async def has_report_capacity(user_id: str, email: str | None = None) -> bool:
+    if is_admin_email(email):
+        return True
     usage = await get_or_create_usage(user_id)
     return usage.reports_created < reports_limit()
 

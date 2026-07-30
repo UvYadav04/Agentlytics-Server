@@ -19,10 +19,15 @@ numpy
 
 # shared/onnx_intent - local CPU inference for the intent embedding tier (replaces the DeepInfra
 # embeddings call). tokenizers loads the exported tokenizer.json; onnxruntime runs model.onnx.
-# Run shared/onnx_intent/download_model.py once (needs optimum[onnxruntime] + transformers +
-# torch, not listed here - those are build-time only) to populate shared/onnx_intent/weights/.
+# model.onnx itself is gitignored (too large to commit) - shared/onnx_intent/ensure_weights.py
+# downloads it automatically on first use if it's missing (e.g. right after a fresh deploy),
+# using huggingface_hub below, so no manual step is required on a new box. (Alternatively, run
+# shared/onnx_intent/download_model.py by hand once - needs optimum[onnxruntime] + transformers +
+# torch, not listed here since those are build-time only, to regenerate the whole weights/ dir
+# from BAAI/bge-small-en-v1.5 directly instead of fetching the pre-converted copy.)
 onnxruntime
 tokenizers
+huggingface_hub
 
 # Semantic response cache (shared/semantic_cache.py) - RedisVL owns the embedding index, KNN
 # lookup, TTL, and distance-threshold logic against the same Redis instance `redis` above already

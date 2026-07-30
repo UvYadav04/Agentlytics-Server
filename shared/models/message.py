@@ -20,4 +20,9 @@ class Message(MongoModel):
     # FinalResultCollector) - shown client-side as "files used" chips so the user can see what
     # this answer was actually based on.
     files_used: list[str] = Field(default_factory=list)
+    # 2-3 suggested next questions (see analyzerEngine/tools/orchestrator/follow_up.py) - only
+    # populated for assistant messages that went through a real investigation (Orchestrator or a
+    # direct-routed Tabular/Document agent), empty for user messages and for the light-response
+    # greeting/no-files path (see api_service/light_investigation.py, which never sets this).
+    follow_up_questions: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)

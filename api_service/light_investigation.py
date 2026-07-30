@@ -53,11 +53,11 @@ _tasks: set[asyncio.Task] = set()
 
 def schedule_light_response(
     *, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str, route: str,
-    requested_at: str | None = None, file_ids: list[str] | None = None,
+    requested_at: str | None = None, file_ids: list[str] | None = None, email: str | None = None,
 ) -> None:
     """Fire-and-forget - see module docstring. `route` must be "greeting" or "no_files"."""
     task = asyncio.create_task(
-        _run(investigation_id, chat_id, workspace_id, user_id, query, route, requested_at, file_ids or [])
+        _run(investigation_id, chat_id, workspace_id, user_id, query, route, requested_at, file_ids or [], email)
     )
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
@@ -78,7 +78,7 @@ async def _append_event(db, investigation_id: str, event_type: str, message: str
 
 async def _fallback_to_orchestrator(
     db, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str,
-    requested_at: str | None, file_ids: list[str],
+    requested_at: str | None, file_ids: list[str], email: str | None = None,
 ) -> None:
     logger.warning(
         "light_investigation: all %d attempt(s) failed for investigation %s - falling back to the full Orchestrator",
@@ -90,12 +90,13 @@ async def _fallback_to_orchestrator(
         "run_investigation",
         investigation_id=investigation_id, chat_id=chat_id, workspace_id=workspace_id,
         user_id=user_id, query=query, file_ids=file_ids, requested_at=requested_at, route=None,
+        email=email,
     )
 
 
 async def _run(
     investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str, route: str,
-    requested_at: str | None, file_ids: list[str],
+    requested_at: str | None, file_ids: list[str], email: str | None = None,
 ) -> None:
     db = get_db()
     result = None
@@ -117,7 +118,7 @@ async def _run(
 
         if result is None or not result.content:
             await _fallback_to_orchestrator(
-                db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids,
+                db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids, email,
             )
             return
 
@@ -158,7 +159,7 @@ async def _run(
         )
         try:
             await _fallback_to_orchestrator(
-                db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids,
+                db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids, email,
             )
         except Exception:
             # Fallback enqueue itself failed (e.g. Redis is down) - nothing left to hand this off
