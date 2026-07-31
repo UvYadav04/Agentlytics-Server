@@ -144,7 +144,7 @@ def _llm_fallback(query: str, timeout: float, embedding_fields: dict) -> RouteRe
     llm_result = classify_intent(query, timeout=timeout)
     return RouteResult(
         query=query,
-        intent=llm_result.top_label,
+        intent=llm_result.top_label,    
         method="llm" if llm_result.top_label else "none",
         llm_result=llm_result,
         error=llm_result.error,
@@ -199,7 +199,7 @@ def route_query_intent(query: str, timeout: float = 30.0, llm_fallback: bool = T
         result = _llm_fallback(query, timeout, embedding_fields)
     else:
         result = RouteResult(
-            query=query, intent=None, method="none", llm_result=None, error=None,
+            query=query, intent=top_intent, method="none", llm_result=None, error=None,
             **embedding_fields,
         )
     return _finish(result, start)
