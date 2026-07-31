@@ -1,4 +1,4 @@
-#
+
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,7 +12,7 @@ COPY shared/requirements.txt shared/requirements.txt
 COPY analyzerEngine/requirements.txt analyzerEngine/requirements.txt
 COPY worker_service/requirements.txt worker_service/requirements.txt
 
-#
+
 ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r worker_service/requirements.txt
 

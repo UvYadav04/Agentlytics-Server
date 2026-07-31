@@ -3,8 +3,7 @@ import os
 import sys
 from pathlib import Path
 
-_ENGINE_DIR = ("D:/Web-development/DataAnalyzer/Server/analyzerEngine").resolve()
-
+_ENGINE_DIR = (Path(__file__).resolve().parent.parent / "analyzerEngine").resolve()
 
 def _env_or_default(env_var: str, default: Path) -> str:
     return os.environ.get(env_var) or str(default.resolve())
