@@ -536,7 +536,7 @@ async def run_investigation(
             if direct_route == "tabular":
                 await on_event({
                     "type": "status",
-                    "message": "Picked up your request - working with the Tabular Agent...",
+                    "message": "Picked up your request",
                 })
                 result = await _run_tabular_direct(
                     catalog, storage, chat_id, sandbox_manager, workspace_id, query,
@@ -551,7 +551,7 @@ async def run_investigation(
             elif direct_route == "document":
                 await on_event({
                     "type": "status",
-                    "message": "Picked up your request - working with the Document Agent...",
+                    "message": "Picked up your request",
                 })
                 result = await _run_document_direct(
                     catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
@@ -571,7 +571,7 @@ async def run_investigation(
             else:
                 await on_event({
                     "type": "status",
-                    "message": "Picked up your request - the Orchestrator is investigating...",
+                    "message": "Picked up your request",
                 })
                 orchestrator = OrchestratorAgent(
                     catalog, vector_store=vector_store, memory=memory, storage=storage,
