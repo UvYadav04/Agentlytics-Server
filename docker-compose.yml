@@ -35,10 +35,12 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       PARQUET_ROOT: /data/parquet
-      PARQUET_VOLUME_NAME: server_parquet_data
       SANDBOX_SOCKET_ROOT: /data/sandbox_sockets
-      SANDBOX_SOCKET_VOLUME_NAME: server_sandbox_sockets
       MEMORY_ROOT: /data/memory
+      # No PARQUET_VOLUME_NAME/SANDBOX_SOCKET_VOLUME_NAME override here on purpose - leave
+      # sandbox_manager.py's own defaults (dataanalyzer_parquet_data/dataanalyzer_sandbox_sockets)
+      # in effect, which now match the pinned `name:` values below exactly. One source of truth
+      # instead of two strings that have to be kept in sync by hand (see the volumes: block).
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - parquet_data:/data/parquet
@@ -46,9 +48,12 @@ services:
       - sandbox_sockets:/data/sandbox_sockets
     depends_on:
       - redis
-
 volumes:
   redis_data:
+    name: dataanalyzer_redis_data
   parquet_data:
+    name: dataanalyzer_parquet_data
   memory_data:
+    name: dataanalyzer_memory_data
   sandbox_sockets:
+    name: dataanalyzer_sandbox_sockets
