@@ -79,8 +79,6 @@ class WorkerSettings:
         run_investigation,
         refresh_dashboard,
         arq_func(update_chat_memory, max_tries=5),
-        # Lower stakes than update_chat_memory (worst case a chat just keeps "New chat" a
-        # little longer) so fewer retries - 3 is plenty to ride out a transient DeepInfra hiccup.
         arq_func(generate_chat_title, max_tries=3),
     ]
     redis_settings = get_arq_redis_settings()

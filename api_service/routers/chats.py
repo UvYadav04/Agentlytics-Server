@@ -401,15 +401,12 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         investigation.id, (time.perf_counter() - t0) * 1000, chat_id, message.id,
     )
 
-    if is_first_message:
-        # Fire-and-forget, same as the update_chat_memory enqueue further down - titling the
-        # chat is never on the hook for this response's latency, and runs regardless of which
-        # route below ends up handling the message (light-response or the full Orchestrator).
-        title_pool = await get_arq_pool()
-        await title_pool.enqueue_job(
-            "generate_chat_title", chat_id=chat_id, query=body.content, requested_at=request_received_at,
-        )
-        logger.info("send_message: enqueued chat title generation for chat_id=%s (first message)", chat_id)
+    # if is_first_message:
+    #     title_pool = await get_arq_pool()
+    #     await title_pool.enqueue_job(
+    #         "generate_chat_title", chat_id=chat_id, query=body.content, requested_at=request_received_at,
+    #     )
+    #     logger.info("send_message: enqueued chat title generation for chat_id=%s (first message)", chat_id)
 
     if light_route is not None:
         schedule_light_response(
