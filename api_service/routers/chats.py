@@ -13,6 +13,7 @@ from shared.db import get_db
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
 from shared.models.chat import COLLECTION as CHATS
+from shared.models.chat import DEFAULT_TITLE as DEFAULT_CHAT_TITLE
 from shared.models.chat import Chat
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
@@ -139,7 +140,7 @@ class MessageOut(BaseModel):
 
 
 class CreateChatRequest(BaseModel):
-    title: str = "New chat"
+    title: str = DEFAULT_CHAT_TITLE
 
 
 class UpdateChatRequest(BaseModel):
@@ -202,7 +203,7 @@ async def list_chats(workspace_id: str, user: User = Depends(get_current_user)):
 @router.patch("/chats/{chat_id}", response_model=ChatOut)
 async def rename_chat(chat_id: str, body: UpdateChatRequest, user: User = Depends(get_current_user)):
     chat = await get_owned_chat(chat_id, user)
-    title = body.title.strip() or "New chat"
+    title = body.title.strip() or DEFAULT_CHAT_TITLE
     await get_db()[CHATS].update_one({"_id": chat.id}, {"$set": {"title": title}})
     chat.title = title
     return _chat_out(chat)
@@ -363,11 +364,19 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
 )
 
     
-    route_result, files_doc = await asyncio.gather(
+    # "Is this the chat's first message" is decided the same way _shadow_classify_and_log
+    # decides "does this chat have prior context": count everything under chat_id EXCLUDING the
+    # message we're inserting right now, by its own already-known id. Excluding by id (rather
+    # than counting before the insert) is what lets this run inside the same gather as
+    # persist_task's insert below without a race - the count is correct regardless of whether
+    # that insert has landed yet by the time this query runs.
+    route_result, files_doc, prior_message_count = await asyncio.gather(
         asyncio.to_thread(route_query_intent_fast, body.content),
         db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
+        db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
     )
     has_files = files_doc is not None
+    is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
     route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
 
     if route_result.intent == "greeting":
@@ -391,6 +400,16 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         "send_message: user message + investigation %s persisted at +%.1fms (chat_id=%s, message_id=%s)",
         investigation.id, (time.perf_counter() - t0) * 1000, chat_id, message.id,
     )
+
+    if is_first_message:
+        # Fire-and-forget, same as the update_chat_memory enqueue further down - titling the
+        # chat is never on the hook for this response's latency, and runs regardless of which
+        # route below ends up handling the message (light-response or the full Orchestrator).
+        title_pool = await get_arq_pool()
+        await title_pool.enqueue_job(
+            "generate_chat_title", chat_id=chat_id, query=body.content, requested_at=request_received_at,
+        )
+        logger.info("send_message: enqueued chat title generation for chat_id=%s (first message)", chat_id)
 
     if light_route is not None:
         schedule_light_response(

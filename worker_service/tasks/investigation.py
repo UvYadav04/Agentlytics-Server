@@ -459,32 +459,10 @@ async def run_investigation(
         investigation_id=investigation_id, chat_id=chat_id,
     )
 
+    # No per-investigation sandbox pre-warm needed anymore: the shared sandbox pool is warmed
+    # to min_size once at worker startup (see worker.py on_startup), and run_python calls just
+    # acquire whatever's idle in the pool - there's no per-chat container to create here.
     sandbox_manager = ctx["sandbox_manager"]
-    prewarm_start = time.perf_counter()
-    sandbox_prewarm_task = asyncio.create_task(
-        asyncio.to_thread(sandbox_manager.get_or_create, chat_id, user_id)
-    )
-
-    def _log_prewarm_result(task: asyncio.Task, _start=prewarm_start) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.warning(
-                "investigation %s: sandbox pre-warm failed after %.1fms for chat=%s (the first "
-                "run_python call will just create it synchronously instead, same as before this "
-                "change): %s",
-                investigation_id, (time.perf_counter() - _start) * 1000, chat_id, exc,
-            )
-        else:
-            logger.info(
-                "investigation %s: sandbox pre-warmed/reused in %.1fms for chat=%s (overlapped "
-                "with catalog build and the orchestrator's own LLM calls, not added on top of "
-                "them)",
-                investigation_id, (time.perf_counter() - _start) * 1000, chat_id,
-            )
-
-    sandbox_prewarm_task.add_done_callback(_log_prewarm_result)
 
     mentioned_file_ids = file_ids or []
     if mentioned_file_ids:
@@ -662,10 +640,4 @@ async def run_investigation(
             requested_at=now_iso(),
         )
     finally:
-        
-        try:
-            await sandbox_prewarm_task
-        except Exception:
-            pass
-
         log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)

@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
+import time
 
 from arq.worker import func as arq_func
 
-from worker_service import engine_bootstrap 
+from worker_service import engine_bootstrap
+from worker_service.tasks.chat_title import generate_chat_title
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
 from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation, update_chat_memory
@@ -39,7 +41,26 @@ async def on_startup(ctx):
     ctx["storage"] = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
     ctx["vector_store"] = ChromaVectorStore()
 
-    ctx["sandbox_manager"] = get_sandbox_manager(socket_root=engine_bootstrap.SANDBOX_SOCKET_ROOT)
+    sandbox_manager = get_sandbox_manager(socket_root=engine_bootstrap.SANDBOX_SOCKET_ROOT)
+    ctx["sandbox_manager"] = sandbox_manager
+
+    # Bring the pool up to min_size *now*, before this worker starts pulling jobs off the
+    # queue - this is what actually eliminates first-request latency: previously each new
+    # chat paid full container-create/start on its first run_python call (fire-and-forget
+    # pre-warmed, but still awaited before the investigation could finish). With a shared
+    # warm pool there's no per-chat sandbox to create - jobs just acquire whatever's idle.
+    warm_start = time.perf_counter()
+    try:
+        await asyncio.to_thread(sandbox_manager.warm_pool)
+        logging.getLogger("worker").info(
+            "sandbox pool warmed to min_size=%d in %.1fms",
+            sandbox_manager.min_size, (time.perf_counter() - warm_start) * 1000,
+        )
+    except Exception:
+        logging.getLogger("worker").exception(
+            "failed to warm the sandbox pool at startup - continuing without it; the pool "
+            "will grow on-demand as executions come in"
+        )
 
     logging.getLogger("worker").info("worker started, engine loaded from %s", engine_bootstrap.ENGINE_DIR)
 
@@ -58,6 +79,9 @@ class WorkerSettings:
         run_investigation,
         refresh_dashboard,
         arq_func(update_chat_memory, max_tries=5),
+        # Lower stakes than update_chat_memory (worst case a chat just keeps "New chat" a
+        # little longer) so fewer retries - 3 is plenty to ride out a transient DeepInfra hiccup.
+        arq_func(generate_chat_title, max_tries=3),
     ]
     redis_settings = get_arq_redis_settings()
     on_startup = on_startup
