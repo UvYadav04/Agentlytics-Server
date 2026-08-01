@@ -28,6 +28,7 @@ from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
 from shared.intent_router import route_query_intent_fast
+from shared.chat_title import generate_title
 from api_service.light_investigation import schedule_light_response
 from shared.admin import is_admin_email
 from shared.job_timing import now_iso
@@ -92,6 +93,45 @@ async def _shadow_classify_and_log(
         # Shadow logging must never affect the real request path.
         shadow_logger.exception("shadow classification failed for message %s", message_id)
 
+
+# Same "hold a reference so it isn't GC'd mid-flight" pattern as _shadow_tasks above and
+# light_investigation.py's _tasks - titling runs entirely in this process now (no arq round
+# trip), fired once per chat right after its first message lands.
+_title_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_chat_title(*, chat_id: str, query: str) -> None:
+    """Fire-and-forget - titles a brand-new chat off the request's critical path. Calls the same
+    kind of small, latency-sensitive DeepInfra call as api_service/light_investigation.py's light
+    path (shared/chat_title.generate_title is deliberately shaped the same way - see its
+    docstring), run in-process via asyncio.to_thread instead of round-tripping through arq: this
+    only ever needs to happen once, right after the first message, with no queue/retry semantics
+    worth the extra hop - generate_title() itself never raises and always returns a usable title
+    (falling back to a deterministic heuristic), so there's nothing here to retry."""
+    task = asyncio.create_task(_generate_and_set_chat_title(chat_id, query))
+    _title_tasks.add(task)
+    task.add_done_callback(_title_tasks.discard)
+
+
+async def _generate_and_set_chat_title(chat_id: str, query: str) -> None:
+    try:
+        # generate_title() wraps a blocking `openai` SDK call - offloaded to a thread so it
+        # never stalls this process's event loop (same pattern as route_query_intent_fast below).
+        result = await asyncio.to_thread(generate_title, query)
+        update = await get_db()[CHATS].update_one(
+            {"_id": chat_id, "title": DEFAULT_CHAT_TITLE},
+            {"$set": {"title": result.title}},
+        )
+        logger.info(
+            "chat title: chat=%s title=%r matched=%s model=%s fallback=%s latency_ms=%.1f error=%s",
+            chat_id, result.title, update.matched_count, result.model, result.fallback,
+            result.latency_ms, result.error,
+        )
+    except Exception:
+        # Worst case the chat just keeps its default title - never worth surfacing to the user.
+        logger.exception("chat title generation/update failed for chat_id=%s", chat_id)
+
+
 router = APIRouter(tags=["chats"])
 
 # route_query_intent_fast's own confidence gate (shared/intent_router.py's similarity_threshold/
@@ -134,6 +174,7 @@ class MessageOut(BaseModel):
     investigation_id: str | None
     chart_ids: list[str]
     report_id: str | None
+    csv_file_ids: list[str]
     files_used: list[str]
     follow_up_questions: list[str]
     created_at: str
@@ -169,6 +210,7 @@ def _message_out(m: Message) -> MessageOut:
     return MessageOut(
         id=m.id, chat_id=m.chat_id, role=m.role, content=m.content,
         investigation_id=m.investigation_id, chart_ids=m.chart_ids, report_id=m.report_id,
+        csv_file_ids=m.csv_file_ids,
         files_used=m.files_used, follow_up_questions=m.follow_up_questions,
         created_at=m.created_at.isoformat(),
     )
@@ -401,12 +443,9 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         investigation.id, (time.perf_counter() - t0) * 1000, chat_id, message.id,
     )
 
-    # if is_first_message:
-    #     title_pool = await get_arq_pool()
-    #     await title_pool.enqueue_job(
-    #         "generate_chat_title", chat_id=chat_id, query=body.content, requested_at=request_received_at,
-    #     )
-    #     logger.info("send_message: enqueued chat title generation for chat_id=%s (first message)", chat_id)
+    if is_first_message:
+        _schedule_chat_title(chat_id=chat_id, query=body.content)
+        logger.info("send_message: scheduled chat title generation for chat_id=%s (first message)", chat_id)
 
     if light_route is not None:
         schedule_light_response(

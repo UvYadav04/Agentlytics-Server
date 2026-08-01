@@ -15,6 +15,11 @@ class Message(MongoModel):
     investigation_id: Optional[str] = None
     chart_ids: list[str] = Field(default_factory=list)
     report_id: Optional[str] = None
+    # CSV-format Report docs (generate_csv, or generate_report if it ever produces one) - kept
+    # separate from report_id (markdown reports only) so multiple CSV exports in one investigation
+    # don't clobber each other or the markdown report - see worker_service/tasks/investigation.py's
+    # _persist_artifacts.
+    csv_file_ids: list[str] = Field(default_factory=list)
     files_used: list[str] = Field(default_factory=list)
     follow_up_questions: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)

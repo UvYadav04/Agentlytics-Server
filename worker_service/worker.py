@@ -6,7 +6,6 @@ import time
 from arq.worker import func as arq_func
 
 from worker_service import engine_bootstrap
-from worker_service.tasks.chat_title import generate_chat_title
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
 from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation, update_chat_memory
@@ -79,7 +78,6 @@ class WorkerSettings:
         run_investigation,
         refresh_dashboard,
         arq_func(update_chat_memory, max_tries=5),
-        arq_func(generate_chat_title, max_tries=3),
     ]
     redis_settings = get_arq_redis_settings()
     on_startup = on_startup

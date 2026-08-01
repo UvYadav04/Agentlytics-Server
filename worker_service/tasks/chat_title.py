@@ -1,3 +1,8 @@
+# NOTE: no longer registered as an arq job (see worker_service/worker.py) - chat titling now runs
+# in-process, fire-and-forget, from api_service/routers/chats.py's send_message
+# (_schedule_chat_title/_generate_and_set_chat_title) right when the chat's first message lands,
+# instead of round-tripping through arq. Left here unregistered rather than deleted; nothing
+# imports this module anymore.
 import asyncio
 import logging
 

@@ -288,11 +288,17 @@ async def _persist_dashboard_bundle(
 async def _persist_artifacts(
     db, workspace_id: str, investigation_id: str, message_id: str, user_id: str,
     chart_paths: list, artifacts: list, email: str | None = None,
-) -> tuple[list, str | None]:
+) -> tuple[list, str | None, list]:
     s3 = get_s3_client()
     bucket = get_bucket_name()
     chart_ids: list = []
     report_id = None
+    # Separate from report_id: generate_csv/generate_report can both produce a "report" kind
+    # artifact in the same investigation (e.g. a markdown report AND a CSV export), and a single
+    # report_id used to just get silently clobbered by whichever one persisted last - the other
+    # would still upload fine but nothing on the Message would ever point back to it. CSVs get
+    # their own list so every one of them stays reachable (see MessageList.tsx's CSV Files row).
+    csv_file_ids: list = []
 
     for chart in chart_paths:
         ref = chart.get("location")
@@ -355,13 +361,92 @@ async def _persist_artifacts(
                 )
                 await db[REPORTS].insert_one(report.to_mongo())
                 await usage.increment_reports(user_id)
-                report_id = report.id
+                if fmt == "csv":
+                    csv_file_ids.append(report.id)
+                else:
+                    report_id = report.id
         except Exception:
             logger.exception("failed to persist artifact %s", ref)
         finally:
             shutil.rmtree(os.path.dirname(ref), ignore_errors=True)
 
-    return chart_ids, report_id
+    return chart_ids, report_id, csv_file_ids
+
+
+# Same "hold a reference so it isn't GC'd mid-flight" pattern used by api_service/
+# light_investigation.py and chats.py's shadow-classification tasks. arq's worker runs one
+# persistent event loop across jobs (not one loop per job), so a task scheduled here keeps
+# running after run_investigation itself returns and the job is marked done - see
+# _schedule_finalize below.
+_background_tasks: set[asyncio.Task] = set()
+
+
+async def _with_retries(coro_fn, *, attempts: int = 3, base_delay: float = 1.0, description: str = "operation"):
+    """Small retry helper for best-effort background persistence: by the time anything calls
+    this, the user has already been sent their result (see _finalize_investigation_bookkeeping),
+    so nothing is awaiting this call - it just needs to keep trying instead of silently dropping a
+    write on a transient Mongo/S3/Redis hiccup, and log clearly if it never recovers."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_fn()
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("%s failed (attempt %d/%d): %s", description, attempt, attempts, exc)
+            if attempt < attempts:
+                await asyncio.sleep(base_delay * attempt)
+    logger.error("%s failed after %d attempt(s), giving up: %s", description, attempts, last_exc)
+    return None
+
+
+async def _finalize_investigation_bookkeeping(
+    ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
+    files_used: list, artifact_refs: list,
+) -> None:
+    """Bookkeeping that has NO effect on what the user sees, so it's the only part of finishing
+    an investigation that's safe to push to the background - run_investigation already persisted
+    chart/report/CSV artifacts and inserted the Message with its chart_ids/report_id/csv_file_ids
+    before sending the "completed" event, since those chips are part of the result itself and
+    can't be deferred. This just marks the Investigation completed, bumps the usage counter, and
+    queues the chat-memory update - each through _with_retries so a transient Mongo/Redis failure
+    doesn't get silently dropped now that nothing is awaiting this."""
+    await _with_retries(
+        lambda: db[INVESTIGATIONS].update_one(
+            {"_id": investigation_id},
+            {"$set": {"status": "completed", "final_answer": final_answer, "completed_at": _now()}},
+        ),
+        description=f"investigation status update (investigation {investigation_id})",
+    )
+
+    await _with_retries(
+        lambda: usage.increment_messages(user_id),
+        description=f"usage increment (investigation {investigation_id})",
+    )
+
+    await _with_retries(
+        lambda: ctx["redis"].enqueue_job(
+            "update_chat_memory",
+            chat_id=chat_id, user_id=user_id, query=query, response=final_answer,
+            files_used=files_used, files_created=artifact_refs, requested_at=now_iso(),
+        ),
+        description=f"chat memory enqueue (investigation {investigation_id})",
+    )
+
+    logger.info("investigation %s: background bookkeeping complete", investigation_id)
+
+
+def _schedule_finalize(
+    ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
+    files_used: list, artifact_refs: list,
+) -> None:
+    """Fire-and-forget - see _background_tasks/_finalize_investigation_bookkeeping above."""
+    task = asyncio.create_task(
+        _finalize_investigation_bookkeeping(
+            ctx, db, investigation_id, chat_id, user_id, query, final_answer, files_used, artifact_refs,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, kind: str) -> list | None:
@@ -456,9 +541,6 @@ async def run_investigation(
         investigation_id=investigation_id, chat_id=chat_id,
     )
 
-    # No per-investigation sandbox pre-warm needed anymore: the shared sandbox pool is warmed
-    # to min_size once at worker startup (see worker.py on_startup), and run_python calls just
-    # acquire whatever's idle in the pool - there's no per-chat container to create here.
     sandbox_manager = ctx["sandbox_manager"]
 
     mentioned_file_ids = file_ids or []
@@ -580,9 +662,10 @@ async def run_investigation(
             )
             chart_ids: list = []
             report_id = None
+            csv_file_ids: list = []
             if result_collector.chart_paths or result_collector.artifacts:
                 try:
-                    chart_ids, report_id = await _persist_artifacts(
+                    chart_ids, report_id, csv_file_ids = await _persist_artifacts(
                         db, workspace_id, investigation_id, message.id, user_id,
                         result_collector.chart_paths, result_collector.artifacts, email,
                     )
@@ -591,12 +674,13 @@ async def run_investigation(
                         "investigation %s: failed to persist partial results after error",
                         investigation_id,
                     )
-                if chart_ids or report_id:
+                if chart_ids or report_id or csv_file_ids:
                     message.content += (
                         "\n\n_Some results were produced before this error - see below._"
                     )
             message.chart_ids = chart_ids
             message.report_id = report_id
+            message.csv_file_ids = csv_file_ids
             message.files_used = result_collector.files_used
 
             await _append_event(db, investigation_id, "error", user_facing)
@@ -606,35 +690,36 @@ async def run_investigation(
             await db[MESSAGES].insert_one(message.to_mongo())
             return
 
+        # Chart/report/CSV chips are part of the result the user sees on this message, so they
+        # can't be deferred to the background - persist them and build the real message first.
+        # Everything past that point is pure bookkeeping with no effect on what's rendered
+        # (Investigation status, usage counters, the chat-memory update), so THAT'S what moves to
+        # the background via _schedule_finalize - the user isn't waiting on any of it.
         message = Message(
             chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
-            follow_up_questions=result.follow_up_questions,
+            follow_up_questions=result.follow_up_questions, files_used=result.files_used,
         )
-        chart_ids, report_id = await _persist_artifacts(
+        chart_ids, report_id, csv_file_ids = await _persist_artifacts(
             db, workspace_id, investigation_id, message.id, user_id,
             result.chart_paths, result.artifacts, email,
         )
         message.chart_ids = chart_ids
         message.report_id = report_id
-        message.files_used = result.files_used
+        message.csv_file_ids = csv_file_ids
         await db[MESSAGES].insert_one(message.to_mongo())
-
-        await db[INVESTIGATIONS].update_one(
-            {"_id": investigation_id},
-            {"$set": {"status": "completed", "final_answer": result.final_answer, "completed_at": _now()}},
-        )
-        await usage.increment_messages(user_id)
         await _append_event(
             db, investigation_id, "completed", "Investigation complete.",
             {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id},
         )
-        logger.info("investigation %s completed", investigation_id)
+        logger.info(
+            "investigation %s: result sent (message %s, %d chart(s), report=%s, %d csv(s)); "
+            "finalizing bookkeeping in background",
+            investigation_id, message.id, len(chart_ids), report_id, len(csv_file_ids),
+        )
 
-        await ctx["redis"].enqueue_job(
-            "update_chat_memory",
-            chat_id=chat_id, user_id=user_id, query=query, response=result.final_answer,
-            files_used=result.files_used, files_created=result.artifact_refs,
-            requested_at=now_iso(),
+        _schedule_finalize(
+            ctx, db, investigation_id, chat_id, user_id, query, result.final_answer,
+            result.files_used, result.artifact_refs,
         )
     finally:
         log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)
