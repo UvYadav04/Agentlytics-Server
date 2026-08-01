@@ -102,10 +102,6 @@ async def _run(
     result = None
     try:
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            # The DeepInfra call is a blocking `openai` SDK call under the hood - offloaded to a
-            # thread so it never stalls this process's event loop for every OTHER concurrent
-            # request, not just this one (same pattern chats.py already uses for
-            # route_query_intent_fast).
             result = await asyncio.to_thread(generate_light_reply, query, route)
             if result.content:
                 break
@@ -143,10 +139,7 @@ async def _run(
             investigation_id, route, result.model, result.latency_ms,
         )
 
-        # Same decoupled write-side-of-thread-continuity job the full Orchestrator path enqueues
-        # after a successful run - keeps Chat.recent_turns/summary consistent regardless of which
-        # path handled a given turn (see worker_service/tasks/investigation.py's update_chat_memory
-        # docstring for why this is a separate job rather than inline work here).
+       
         pool = await get_arq_pool()
         await pool.enqueue_job(
             "update_chat_memory",

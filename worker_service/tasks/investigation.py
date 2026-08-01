@@ -171,9 +171,6 @@ async def update_chat_memory(
     ctx, chat_id: str, user_id: str, query: str, response: str,
     files_used: list, files_created: list, requested_at: str | None = None,
 ) -> None:
-    picked_up_at = log_job_picked_up(
-        logger, ctx, "update_chat_memory", requested_at=requested_at, chat_id=chat_id,
-    )
     db = get_db()
 
     try:
