@@ -171,6 +171,9 @@ async def update_chat_memory(
     ctx, chat_id: str, user_id: str, query: str, response: str,
     files_used: list, files_created: list, requested_at: str | None = None,
 ) -> None:
+    picked_up_at = log_job_picked_up(
+        logger, ctx, "update_chat_memory", requested_at=requested_at, chat_id=chat_id,
+    )
     db = get_db()
 
     try:
@@ -590,11 +593,16 @@ async def run_investigation(
         try:
             result = None
 
+            # Emitted exactly once here, regardless of which path ends up handling the request -
+            # previously this fired again before the Orchestrator fallback below, so any query
+            # that attempted a direct route (tabular/document) and then bailed out (ambiguous
+            # file selection) showed "Picked up your request" twice in the trail.
+            await on_event({
+                "type": "status",
+                "message": "Picked up your request",
+            })
+
             if direct_route == "tabular":
-                await on_event({
-                    "type": "status",
-                    "message": "Picked up your request",
-                })
                 result = await _run_tabular_direct(
                     catalog, storage, chat_id, sandbox_manager, workspace_id, query,
                     mentioned_file_ids, on_event, result_collector, thread_context,
@@ -606,10 +614,6 @@ async def run_investigation(
                         "selection) - falling back to the Orchestrator", investigation_id,
                     )
             elif direct_route == "document":
-                await on_event({
-                    "type": "status",
-                    "message": "Picked up your request",
-                })
                 result = await _run_document_direct(
                     catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
                     thread_context,
@@ -626,10 +630,6 @@ async def run_investigation(
                     investigation_id, direct_route,
                 )
             else:
-                await on_event({
-                    "type": "status",
-                    "message": "Picked up your request",
-                })
                 orchestrator = OrchestratorAgent(
                     catalog, vector_store=vector_store, memory=memory, storage=storage,
                     reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
