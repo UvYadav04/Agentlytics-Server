@@ -155,7 +155,8 @@ CHAT_MESSAGE_LIMIT_MESSAGE = (
 )
 
 CHAT_LIMIT_MESSAGE = (
-    "You've reached the free-tier limit of 2 chats. Upgrade to create more."
+    "You've reached the free-tier limit of 2 chats. Continue in one of your existing chats, "
+    "or upgrade to start new ones."
 )
 
 

@@ -615,29 +615,10 @@ async def run_investigation(
 
     thread_context = await _thread_context(db, chat_id)
 
-    # Top-level span + Langfuse trace for the whole investigation - every LLM generation created
-    # underneath (agents/*/agent.py -> llm_provider -> langfuse_wrapper.py) nests under this via
-    # ambient OTel context/Langfuse's propagate_attributes, giving the documented hierarchy:
-    # User Request -> Orchestrator -> Planner -> Tool Selection -> Agent -> LLM -> Tool Calls ->
-    # Final Response. Entered/exited manually (not via `with`) so the large existing try/except
-    # structure below doesn't need reindenting; safe here because every branch below either
-    # `return`s or falls through to the end without re-raising past this point.
-    #
-    # langfuse_cm is built and defaulted to nullcontext() *before* span_cm is entered, so nothing
-    # between "span entered" and the outer try/finally (which is what exits it) can raise - a
-    # version-mismatched Langfuse SDK failing here previously leaked the span's context token
-    # (it was entered but its finally-block exit was never reached), which then surfaced as an
-    # unrelated-looking "Failed to detach context: ... created in a different Context" error the
-    # next time anything tried to close a span in that task.
     langfuse = get_langfuse_client()
     langfuse_cm = nullcontext()
     if langfuse is not None:
         try:
-            # v4: a standalone context-manager function imported from the package, NOT a method
-            # on the Langfuse client instance (that was the bug - langfuse.propagate_attributes(...)
-            # doesn't exist, langfuse-python only ever exposed this as `from langfuse import
-            # propagate_attributes`). See llm_provider/langfuse_wrapper.py's docstring for the
-            # v3->v4 API history this project has already hit once before.
             from langfuse import propagate_attributes
             langfuse_cm = propagate_attributes(
                 user_id=user_id,
@@ -677,11 +658,6 @@ async def run_investigation(
     try:
         try:
             result = None
-
-            # Emitted exactly once here, regardless of which path ends up handling the request -
-            # previously this fired again before the Orchestrator fallback below, so any query
-            # that attempted a direct route (tabular/document) and then bailed out (ambiguous
-            # file selection) showed "Picked up your request" twice in the trail.
             await on_event({
                 "type": "status",
                 "message": "Picked up your request",
