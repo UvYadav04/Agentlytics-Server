@@ -28,3 +28,14 @@ opentelemetry-instrumentation-requests
 opentelemetry-instrumentation-botocore
 opentelemetry-instrumentation-logging
 
+# shared/observability.py imports this directly (LangfuseSpanProcessor, get_client()) and is used
+# by BOTH api_service and worker_service - it used to live only in analyzerEngine/requirements.txt,
+# which worker_service pulls in transitively but api_service does NOT, so api_service silently
+# never had the package installed (caught gracefully - "langfuse is not installed" log + no-op -
+# but still a gap). Pinned to v4 - llm_provider/langfuse_wrapper.py and shared/observability.py
+# use v4-only APIs (start_observation(as_type="generation"), propagate_attributes, get_client()).
+# langfuse v3's start_generation() was removed in v4; an unpinned install would silently pull
+# whatever is newest and either break (pre-v4, missing these) or drift across a future major bump.
+# Bump this deliberately, together with langfuse_wrapper.py/observability.py, if upgrading again.
+langfuse>=4.14.1,<5
+
