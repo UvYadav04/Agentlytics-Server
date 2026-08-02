@@ -7,6 +7,8 @@ from shared.admin import is_admin_email
 from shared.db import get_db
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
+from shared.models.report import COLLECTION as REPORTS
+from shared.models.report import Report
 from shared.models.user import User
 from shared.models.workspace import COLLECTION as WORKSPACES
 from shared.models.workspace import Workspace
@@ -24,6 +26,15 @@ class ChartSummaryOut(BaseModel):
     message_id: str
     title: str
     url: str
+    created_at: str
+
+
+class ReportSummaryOut(BaseModel):
+    id: str
+    message_id: str
+    title: str
+    format: str
+    url: str | None
     created_at: str
 
 
@@ -79,7 +90,7 @@ async def rename_workspace(
 
 @router.get("/{workspace_id}/charts", response_model=list[ChartSummaryOut])
 async def list_charts(workspace_id: str, user: User = Depends(get_current_user)):
-    
+
     await get_owned_workspace(workspace_id, user)
     cursor = get_db()[CHARTS].find({"workspace_id": workspace_id}).sort("created_at", -1)
     docs = await cursor.to_list(length=200)
@@ -90,4 +101,26 @@ async def list_charts(workspace_id: str, user: User = Depends(get_current_user))
             url=presign_get(c.storage_key), created_at=c.created_at.isoformat(),
         )
         for c in charts
+    ]
+
+
+@router.get("/{workspace_id}/reports", response_model=list[ReportSummaryOut])
+async def list_reports(workspace_id: str, user: User = Depends(get_current_user)):
+    await get_owned_workspace(workspace_id, user)
+    # Only "ready" reports have a storage_key to presign - a still-generating or failed one has
+    # nothing to link to yet, and would just be a dead entry in the sidebar list.
+    cursor = (
+        get_db()[REPORTS]
+        .find({"workspace_id": workspace_id, "status": "ready"})
+        .sort("created_at", -1)
+    )
+    docs = await cursor.to_list(length=200)
+    reports = [Report.from_mongo(d) for d in docs]
+    return [
+        ReportSummaryOut(
+            id=r.id, message_id=r.message_id, title=r.title, format=r.format,
+            url=presign_get(r.storage_key) if r.storage_key else None,
+            created_at=r.created_at.isoformat(),
+        )
+        for r in reports
     ]
