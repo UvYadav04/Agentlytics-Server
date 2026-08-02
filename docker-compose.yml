@@ -1,32 +1,30 @@
 services:
   redis:
-    image: redis/redis-stack-server:latest
+    image: redis:7-alpine
     container_name: data-analyzer-redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-stack-server --save 60 1 --loglevel warning
+    command: redis-server --save 60 1 --loglevel warning
 
   api_service:
-    build:
-      context: .
-      dockerfile: api_service/Dockerfile
     image: itzdineshyadav/data-analyzer:api
     container_name: data-analyzer-api
     env_file:
       - ./shared/.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      OTEL_SERVICE_NAME: api_service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4317
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     depends_on:
       - redis
 
   worker_service:
-    build:
-      context: .
-      dockerfile: worker_service/Dockerfile
     image: itzdineshyadav/data-analyzer:worker
     container_name: data-analyzer-worker
     env_file:
@@ -34,13 +32,13 @@ services:
       - ./analyzerEngine/.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      OTEL_SERVICE_NAME: worker_service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4317
       PARQUET_ROOT: /data/parquet
       SANDBOX_SOCKET_ROOT: /data/sandbox_sockets
       MEMORY_ROOT: /data/memory
-      # No PARQUET_VOLUME_NAME/SANDBOX_SOCKET_VOLUME_NAME override here on purpose - leave
-      # sandbox_manager.py's own defaults (dataanalyzer_parquet_data/dataanalyzer_sandbox_sockets)
-      # in effect, which now match the pinned `name:` values below exactly. One source of truth
-      # instead of two strings that have to be kept in sync by hand (see the volumes: block).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - parquet_data:/data/parquet
@@ -48,6 +46,7 @@ services:
       - sandbox_sockets:/data/sandbox_sockets
     depends_on:
       - redis
+
 volumes:
   redis_data:
     name: dataanalyzer_redis_data

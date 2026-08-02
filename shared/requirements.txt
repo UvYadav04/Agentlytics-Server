@@ -17,6 +17,14 @@ huggingface_hub
 
 redisvl
 
-python-logging-loki
 prometheus-client
+
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-pymongo
+opentelemetry-instrumentation-redis
+opentelemetry-instrumentation-httpx
+opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-botocore
+opentelemetry-instrumentation-logging
 

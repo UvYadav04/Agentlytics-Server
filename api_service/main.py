@@ -3,16 +3,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from prometheus_fastapi_instrumentator import Instrumentator
 
 from api_service.routers import auth, charts, chats, dashboards, feedback, files, reports, usage, workspaces
 from shared import intent_router
 from shared.config import get_settings
 from shared.db import close_client, ensure_indexes
 from shared.logging_config import configure_logging
+from shared.observability import init_observability, instrument_fastapi
 from shared.redis_client import close_redis
 
 configure_logging("api_service")
+init_observability("api_service")
 
 
 @asynccontextmanager
@@ -26,11 +27,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Data Analyzer API", lifespan=lifespan)
 
-# Client is on a different origin (localhost:3000 in dev, the duckdns domain in prod) and auth
-# relies on an httpOnly cookie (see shared/auth.py's ACCESS_TOKEN_COOKIE_NAME), so the browser
-# needs an explicit allow-list + allow_credentials=True - "*" isn't usable together with
-# credentialed requests. CORS_ORIGINS is comma-separated in .env for anyone adding more origins
-# later (e.g. a staging domain) without a code change; see shared/.env.example.
 _default_cors_origins = "http://localhost:3000,https://agentlytics.duckdns.org"
 _cors_origins = [
     origin.strip().rstrip("/")
@@ -46,9 +42,10 @@ app.add_middleware(
     allow_headers=["*"],  
 )
 
-# Exposes GET /metrics (request count/latency/status codes, broken down by
-# path+method) for Prometheus to scrape - see ../../observability/prometheus/prometheus.yml.
-Instrumentator().instrument(app).expose(app)
+# Auto-instruments every request with OTel spans + request count/latency/error/active-request
+# metrics, exported via the OTLP pipeline set up in shared/observability.py. No-ops if
+# OTEL_EXPORTER_OTLP_ENDPOINT isn't set (init_observability skipped setup above).
+instrument_fastapi(app)
 
 # "/api" prefix matches the client's NEXT_PUBLIC_API_URL in production (e.g.
 # https://agentlytics.duckdns.org/api - see Client/.env), which is forwarded to this service

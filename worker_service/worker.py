@@ -3,12 +3,14 @@ import logging
 import os
 import time
 
+from arq import cron
 from arq.worker import func as arq_func
 
 from worker_service import engine_bootstrap
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
 from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation, update_chat_memory
+from worker_service.tasks.reconciliation import reconcile_stuck_investigations
 
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
 from analyzerEngine.sandbox.sandbox_manager import get_manager as get_sandbox_manager
@@ -16,12 +18,44 @@ from analyzerEngine.vectordb.chroma_store import ChromaVectorStore
 
 from shared.db import close_client, ensure_indexes
 from shared.logging_config import configure_logging
-from shared.observability import start_prometheus_metrics_server
-from shared.redis_client import close_redis, get_arq_redis_settings
+from shared.observability import get_meter, init_observability, start_prometheus_metrics_server
+from shared.redis_client import close_redis, get_arq_redis_settings, get_redis
 
 configure_logging("worker_service")
+# Must run before on_startup constructs Mongo/Redis clients (ctx["storage"]/ctx["vector_store"]
+# etc. below), so those get auto-instrumented - see shared/observability.py.
+init_observability("worker_service")
 
 logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
+
+# arq's default queue is a Redis sorted set at this key (see arq.constants.default_queue_name) -
+# polled in the background below rather than read inline in the observable gauge callback, since
+# OTel's async-instrument callbacks run synchronously on the SDK's export path and shouldn't do
+# their own network I/O.
+_ARQ_QUEUE_KEY = "arq:queue"
+_queue_size_cache = {"value": 0}
+
+
+def _queue_size_callback(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(_queue_size_cache["value"], {"queue": _ARQ_QUEUE_KEY})
+
+
+_meter = get_meter("worker_service")
+_meter.create_observable_gauge(
+    "worker.queue.size", callbacks=[_queue_size_callback],
+    description="Pending arq job count (polled every ~15s)",
+)
+
+
+async def _poll_queue_size():
+    redis = get_redis()
+    while True:
+        try:
+            _queue_size_cache["value"] = await redis.zcard(_ARQ_QUEUE_KEY)
+        except Exception:
+            logging.getLogger("worker").exception("failed to poll arq queue size - leaving last known value")
+        await asyncio.sleep(15)
 
 
 async def on_startup(ctx):
@@ -36,6 +70,8 @@ async def on_startup(ctx):
                 "failed to start Prometheus metrics server on port %s - continuing without it",
                 metrics_port,
             )
+
+    ctx["queue_size_poll_task"] = asyncio.create_task(_poll_queue_size())
 
     ctx["storage"] = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
     ctx["vector_store"] = ChromaVectorStore()
@@ -65,6 +101,9 @@ async def on_startup(ctx):
 
 
 async def on_shutdown(ctx):
+    poll_task = ctx.get("queue_size_poll_task")
+    if poll_task is not None:
+        poll_task.cancel()
     sandbox_manager = ctx.get("sandbox_manager")
     if sandbox_manager is not None:
         await asyncio.to_thread(sandbox_manager.shutdown_all)
@@ -78,6 +117,13 @@ class WorkerSettings:
         run_investigation,
         refresh_dashboard,
         arq_func(update_chat_memory, max_tries=5),
+    ]
+    # Sweeps for investigations stuck at status="running" (worker died mid-run, or died after
+    # sending the result but before finishing background bookkeeping) - see reconciliation.py's
+    # module docstring. Every 5 minutes against a 10-minute stuck threshold there, so nothing sits
+    # broken for more than ~15 minutes worst case.
+    cron_jobs = [
+        cron(reconcile_stuck_investigations, minute=set(range(0, 60, 5)), timeout=300),
     ]
     redis_settings = get_arq_redis_settings()
     on_startup = on_startup

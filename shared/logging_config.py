@@ -16,58 +16,53 @@ def configure_logging(service_name: str, level: str | None = None) -> logging.Lo
     root = logging.getLogger()
     root.setLevel(resolved_level)
 
+    old_factory = logging.getLogRecordFactory()
+
+    def _record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        if not hasattr(record, "otelTraceID"):
+            record.otelTraceID = "-"
+        if not hasattr(record, "otelSpanID"):
+            record.otelSpanID = "-"
+        return record
+
+    logging.setLogRecordFactory(_record_factory)
+
     formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+        "%(asctime)s [%(levelname)s] [%(name)s] [trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] %(message)s"
     )
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     root.addHandler(console_handler)
 
-    loki_url = settings.get("LOKI_URL") or os.environ.get("LOKI_URL")
-    if loki_url:
-        _attach_loki_handler(root, loki_url, service_name, settings)
-    else:
-        logging.getLogger(service_name).info(
-            "LOKI_URL not set - logging to console only, Loki shipping disabled"
-        )
-
     _configured_services.add(service_name)
     return root
 
 
-class _SafeLokiHandler:
+def attach_otel_logging(service_name: str, resource, otlp_endpoint: str) -> None:
 
-    def emit(self, record):
-        try:
-            super().emit(record)
-        except Exception:
-            pass
-
-
-def _attach_loki_handler(root: logging.Logger, loki_url: str, service_name: str, settings) -> None:
     try:
-        import logging_loki
-    except ImportError:
-        logging.getLogger(service_name).warning(
-            "LOKI_URL is set but python-logging-loki isn't installed - "
-            "add it to requirements.txt (pip install python-logging-loki)"
+        from opentelemetry._logs import set_logger_provider
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(OTLPLogExporter(endpoint=otlp_endpoint))
         )
-        return
+        set_logger_provider(logger_provider)
 
-    environment = settings.get("ENVIRONMENT") or os.environ.get("ENVIRONMENT") or "development"
-
-    class SafeLokiHandler(_SafeLokiHandler, logging_loki.LokiHandler):
-        pass
-
-    loki_handler = SafeLokiHandler(
-        url=loki_url,
-        tags={"service": service_name, "environment": environment},
-        version="1",
-    )
-    loki_handler.setLevel(logging.INFO)
-    loki_handler.setFormatter(logging.Formatter("%(message)s"))
-    root.addHandler(loki_handler)
+        otel_handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
+        logging.getLogger().addHandler(otel_handler)
+        logging.getLogger("shared.logging_config").info(
+            "OTel log export attached: service=%s endpoint=%s", service_name, otlp_endpoint
+        )
+    except Exception:
+        logging.getLogger("shared.logging_config").exception(
+            "failed to attach OTel log export - continuing with console logging only"
+        )
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -2,7 +2,7 @@ import logging
 import os
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_owned_file, get_owned_workspace
@@ -13,6 +13,7 @@ from shared.models.file import File
 from shared.models.user import User
 from shared.redis_client import get_arq_pool
 from shared.storage import build_upload_key, delete_object, new_file_id, presign_put
+from shared.upload_limits import describe_limit, max_size_bytes
 
 logger = logging.getLogger("api.files")
 
@@ -65,8 +66,18 @@ async def presign_upload(
 ):
     await get_owned_workspace(workspace_id, user)
 
-    file_id = new_file_id()
     ext = os.path.splitext(body.filename)[1].lstrip(".").lower()
+    limit = max_size_bytes(ext)
+    if limit is not None and body.size_bytes is not None and body.size_bytes > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{describe_limit(ext)} - this file is "
+                f"{body.size_bytes / (1024 * 1024):.1f}MB."
+            ),
+        )
+
+    file_id = new_file_id()
     storage_key = build_upload_key(workspace_id, file_id, body.filename)
 
     file = File(

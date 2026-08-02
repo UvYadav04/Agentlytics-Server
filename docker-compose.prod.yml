@@ -15,6 +15,10 @@ services:
       - ./shared/.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      OTEL_SERVICE_NAME: api_service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4317
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     depends_on:
@@ -28,13 +32,13 @@ services:
       - ./analyzerEngine/.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      OTEL_SERVICE_NAME: worker_service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4317
       PARQUET_ROOT: /data/parquet
       SANDBOX_SOCKET_ROOT: /data/sandbox_sockets
       MEMORY_ROOT: /data/memory
-      # No PARQUET_VOLUME_NAME/SANDBOX_SOCKET_VOLUME_NAME override here on purpose - leave
-      # sandbox_manager.py's own defaults (dataanalyzer_parquet_data/dataanalyzer_sandbox_sockets)
-      # in effect, which now match the pinned `name:` values below exactly. One source of truth
-      # instead of two strings that have to be kept in sync by hand (see the volumes: block).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - parquet_data:/data/parquet
@@ -43,19 +47,6 @@ services:
     depends_on:
       - redis
 
-# Docker Compose prefixes unnamed volumes with the *project name*, which defaults to the name of
-# the directory the compose file lives in - this file previously ran from a folder called
-# `compose/`, so its volumes silently became compose_parquet_data, compose_sandbox_sockets, etc.,
-# DIFFERENT from the server_* names the dev compose file's directory produced - even though both
-# files declared "the same" volume names. sandbox_manager.py creates its pool containers via the
-# Docker SDK directly (not through this compose file) and mounts a volume by a literal name it
-# was told to use: when that name doesn't match whatever compose actually created, Docker just
-# silently auto-creates a fresh, empty volume under that name instead of erroring, so the pool
-# container and the worker container ended up on two unrelated volumes - which is why
-# sandbox_client couldn't find a socket file here specifically.
-#
-# Pinning `name:` makes the real volume name fixed and identical regardless of what
-# directory/project name compose is invoked with, on this box or any other.
 volumes:
   redis_data:
     name: dataanalyzer_redis_data

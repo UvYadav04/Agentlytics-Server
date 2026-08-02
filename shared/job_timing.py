@@ -1,6 +1,13 @@
 import logging
 from datetime import datetime, timezone
 
+from shared.observability import get_meter
+
+_meter = get_meter("worker_service.jobs")
+_job_duration = _meter.create_histogram(
+    "worker.job.duration_ms", unit="ms", description="arq job execution wall time, keyed by job name",
+)
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -51,3 +58,7 @@ def log_job_finished(logger: logging.Logger, job_name: str, picked_up_at: dateti
         job_name, finished_at.isoformat(timespec="milliseconds"), status, duration_ms,
         ", " if id_str else "", id_str,
     )
+    # Every arq job (run_investigation, run_ingestion, update_chat_memory, refresh_dashboard,
+    # reconcile_stuck_investigations) calls this on completion, so this one histogram covers
+    # "worker execution duration" for the whole worker service without per-task instrumentation.
+    _job_duration.record(duration_ms, {"job": job_name, "status": status})

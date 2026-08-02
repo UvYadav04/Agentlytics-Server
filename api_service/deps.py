@@ -14,26 +14,33 @@ from shared.models.user import COLLECTION as USERS
 from shared.models.user import User
 from shared.models.workspace import COLLECTION as WORKSPACES
 from shared.models.workspace import Workspace
+from shared.observability import get_tracer
+
+_tracer = get_tracer("api_service.auth")
 
 
 async def get_current_user(access_token: str | None = Cookie(default=None, alias=ACCESS_TOKEN_COOKIE_NAME)) -> User:
-    if not access_token:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
-    try:
-        payload = decode_access_token(access_token)
-    except jwt.PyJWTError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired session")
+    with _tracer.start_as_current_span("auth.authenticate") as span:
+        if not access_token:
+            span.set_attribute("auth.result", "no_token")
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
+        try:
+            payload = decode_access_token(access_token)
+        except jwt.PyJWTError:
+            span.set_attribute("auth.result", "invalid_token")
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired session")
 
-    doc = await get_db()[USERS].find_one({"_id": payload.sub})
-    user = User.from_mongo(doc)
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists")
-    return user
+        doc = await get_db()[USERS].find_one({"_id": payload.sub})
+        user = User.from_mongo(doc)
+        if user is None:
+            span.set_attribute("auth.result", "user_missing")
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists")
+        span.set_attribute("auth.result", "ok")
+        span.set_attribute("user.id", user.id)
+        return user
 
 
 async def get_owned_workspace(workspace_id: str, user: User) -> Workspace:
-    """Fetches a workspace and 404s (never 403s - don't leak existence) if it
-    doesn't exist or doesn't belong to the current user."""
     doc = await get_db()[WORKSPACES].find_one({"_id": workspace_id, "user_id": user.id})
     workspace = Workspace.from_mongo(doc)
     if workspace is None:

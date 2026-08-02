@@ -2,6 +2,6 @@
 fastapi
 uvicorn[standard]
 
-# Auto-instruments FastAPI with request count/latency/status-code metrics
-# and exposes them at GET /metrics for Prometheus to scrape - see main.py.
-prometheus-fastapi-instrumentator
+# Auto-instruments FastAPI with OTel spans + request count/latency/error/active-request metrics,
+# exported via the OTLP pipeline set up in shared/observability.py - see main.py.
+opentelemetry-instrumentation-fastapi

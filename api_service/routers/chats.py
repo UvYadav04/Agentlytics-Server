@@ -398,7 +398,10 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
         )
 
     message = Message(chat_id=chat_id, role="user", content=body.content)
-    investigation = Investigation(chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content)
+    investigation = Investigation(
+        chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content,
+        user_id=user.id, file_ids=body.file_ids or [], email=user.email,
+    )
     db = get_db()
     persist_task = asyncio.gather(
     db[MESSAGES].insert_one(message.to_mongo()),

@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 
 from worker_service import engine_bootstrap  # noqa: F401
@@ -40,8 +41,18 @@ from shared.models.message import COLLECTION as MESSAGES
 from shared.models.message import Message
 from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
+from shared.observability import get_langfuse_client, get_meter, get_tracer
 from shared.redis_client import get_redis, investigation_channel
 from shared.storage import build_chart_key, build_report_key, get_bucket_name, get_s3_client, new_file_id
+
+_tracer = get_tracer("worker_service.investigation")
+_meter = get_meter("worker_service.investigation")
+# Business metric: investigation outcomes by route (tabular/document/orchestrator) and
+# outcome (completed/failed/cancelled) - the top-level counterpart to the per-job duration
+# histogram in shared/job_timing.py.
+_investigation_outcomes = _meter.create_counter(
+    "investigation.outcomes", description="Investigations finished, keyed by route and outcome",
+)
 
 RECENT_TURNS_LIMIT = 5
 FILE_LIST_LIMIT = 30
@@ -384,11 +395,13 @@ async def _persist_artifacts(
 _background_tasks: set[asyncio.Task] = set()
 
 
+# Distinct from a legitimate `None` return (e.g. usage.increment_messages) - callers that need to
+# know whether the write actually happened (not just what it returned) check the result against
+# this sentinel rather than truthiness.
+_RETRY_FAILED = object()
+
+
 async def _with_retries(coro_fn, *, attempts: int = 3, base_delay: float = 1.0, description: str = "operation"):
-    """Small retry helper for best-effort background persistence: by the time anything calls
-    this, the user has already been sent their result (see _finalize_investigation_bookkeeping),
-    so nothing is awaiting this call - it just needs to keep trying instead of silently dropping a
-    write on a transient Mongo/S3/Redis hiccup, and log clearly if it never recovers."""
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -399,20 +412,13 @@ async def _with_retries(coro_fn, *, attempts: int = 3, base_delay: float = 1.0, 
             if attempt < attempts:
                 await asyncio.sleep(base_delay * attempt)
     logger.error("%s failed after %d attempt(s), giving up: %s", description, attempts, last_exc)
-    return None
+    return _RETRY_FAILED
 
 
 async def _finalize_investigation_bookkeeping(
     ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
     files_used: list, artifact_refs: list,
 ) -> None:
-    """Bookkeeping that has NO effect on what the user sees, so it's the only part of finishing
-    an investigation that's safe to push to the background - run_investigation already persisted
-    chart/report/CSV artifacts and inserted the Message with its chart_ids/report_id/csv_file_ids
-    before sending the "completed" event, since those chips are part of the result itself and
-    can't be deferred. This just marks the Investigation completed, bumps the usage counter, and
-    queues the chat-memory update - each through _with_retries so a transient Mongo/Redis failure
-    doesn't get silently dropped now that nothing is awaiting this."""
     await _with_retries(
         lambda: db[INVESTIGATIONS].update_one(
             {"_id": investigation_id},
@@ -421,12 +427,24 @@ async def _finalize_investigation_bookkeeping(
         description=f"investigation status update (investigation {investigation_id})",
     )
 
-    await _with_retries(
+    # usage_counted/chat_memory_enqueued let worker_service/tasks/reconciliation.py's sweep tell,
+    # for an investigation it finds stuck at status="running" with a Message already sitting on
+    # it, exactly which of these two already happened (e.g. this function got partway through
+    # before the worker died) so it never double-counts usage or double-enqueues the memory
+    # update when it backfills the rest.
+    usage_result = await _with_retries(
         lambda: usage.increment_messages(user_id),
         description=f"usage increment (investigation {investigation_id})",
     )
+    if usage_result is not _RETRY_FAILED:
+        await _with_retries(
+            lambda: db[INVESTIGATIONS].update_one(
+                {"_id": investigation_id}, {"$set": {"usage_counted": True}},
+            ),
+            description=f"usage_counted flag update (investigation {investigation_id})",
+        )
 
-    await _with_retries(
+    memory_result = await _with_retries(
         lambda: ctx["redis"].enqueue_job(
             "update_chat_memory",
             chat_id=chat_id, user_id=user_id, query=query, response=final_answer,
@@ -434,6 +452,13 @@ async def _finalize_investigation_bookkeeping(
         ),
         description=f"chat memory enqueue (investigation {investigation_id})",
     )
+    if memory_result is not _RETRY_FAILED:
+        await _with_retries(
+            lambda: db[INVESTIGATIONS].update_one(
+                {"_id": investigation_id}, {"$set": {"chat_memory_enqueued": True}},
+            ),
+            description=f"chat_memory_enqueued flag update (investigation {investigation_id})",
+        )
 
     logger.info("investigation %s: background bookkeeping complete", investigation_id)
 
@@ -442,7 +467,6 @@ def _schedule_finalize(
     ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
     files_used: list, artifact_refs: list,
 ) -> None:
-    """Fire-and-forget - see _background_tasks/_finalize_investigation_bookkeeping above."""
     task = asyncio.create_task(
         _finalize_investigation_bookkeeping(
             ctx, db, investigation_id, chat_id, user_id, query, final_answer, files_used, artifact_refs,
@@ -486,7 +510,7 @@ def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, k
 async def _run_tabular_direct(
     catalog: FileCatalog, storage: LocalParquetStore, chat_id: str, sandbox_manager,
     workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
-    thread_context: dict | None = None, chart_capacity_checker=None,
+    thread_context: dict | None = None, chart_capacity_checker=None, cancel_check=None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "tabular")
     if entries is None:
@@ -498,7 +522,9 @@ async def _run_tabular_direct(
         chat_id=chat_id, sandbox_manager=sandbox_manager, direct_route=True,
         reports_dir=engine_bootstrap.REPORTS_ROOT, chart_capacity_checker=chart_capacity_checker,
     )
-    findings = await agent.run(query, constraints={}, on_event=on_event, thread_context=thread_context)
+    findings = await agent.run(
+        query, constraints={}, on_event=on_event, thread_context=thread_context, cancel_check=cancel_check,
+    )
     result_collector.add_tabular_findings(
         findings, "invoke_tabular_agent", [e.file_id for e in entries],
     )
@@ -511,7 +537,7 @@ async def _run_tabular_direct(
 
 async def _run_document_direct(
     catalog: FileCatalog, vector_store, query: str, mentioned_file_ids: list, on_event,
-    result_collector: FinalResultCollector, thread_context: dict | None = None,
+    result_collector: FinalResultCollector, thread_context: dict | None = None, cancel_check=None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "document")
     if entries is None:
@@ -522,7 +548,7 @@ async def _run_document_direct(
     agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True)
     findings = await agent.run(
         query, constraints={}, on_event=on_event, metadata_brief=metadata_brief,
-        thread_context=thread_context,
+        thread_context=thread_context, cancel_check=cancel_check,
     )
     result_collector.add_document_findings(
         findings, "invoke_document_agent", [e.file_id for e in entries],
@@ -589,6 +615,40 @@ async def run_investigation(
 
     thread_context = await _thread_context(db, chat_id)
 
+    # Top-level span + Langfuse trace for the whole investigation - every LLM generation created
+    # underneath (agents/*/agent.py -> llm_provider -> langfuse_wrapper.py) nests under this via
+    # ambient OTel context/Langfuse's propagate_attributes, giving the documented hierarchy:
+    # User Request -> Orchestrator -> Planner -> Tool Selection -> Agent -> LLM -> Tool Calls ->
+    # Final Response. Entered/exited manually (not via `with`) so the large existing try/except
+    # structure below doesn't need reindenting; safe here because every branch below either
+    # `return`s or falls through to the end without re-raising past this point.
+    langfuse = get_langfuse_client()
+    span_cm = _tracer.start_as_current_span(
+        "investigation.run",
+        attributes={
+            "investigation.id": investigation_id,
+            "chat.id": chat_id,
+            "workspace.id": workspace_id,
+            "user.id": user_id or "",
+            "route": direct_route or "orchestrator",
+        },
+    )
+    span_cm.__enter__()
+    langfuse_cm = (
+        langfuse.propagate_attributes(
+            user_id=user_id,
+            session_id=chat_id,
+            trace_name="investigation",
+            metadata={
+                "investigation_id": investigation_id,
+                "workspace_id": workspace_id,
+                "route": direct_route or "orchestrator",
+            },
+        )
+        if langfuse is not None else nullcontext()
+    )
+    langfuse_cm.__enter__()
+
     try:
         try:
             result = None
@@ -606,7 +666,7 @@ async def run_investigation(
                 result = await _run_tabular_direct(
                     catalog, storage, chat_id, sandbox_manager, workspace_id, query,
                     mentioned_file_ids, on_event, result_collector, thread_context,
-                    chart_capacity_checker,
+                    chart_capacity_checker, cancel_check,
                 )
                 if result is None:
                     logger.info(
@@ -616,7 +676,7 @@ async def run_investigation(
             elif direct_route == "document":
                 result = await _run_document_direct(
                     catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
-                    thread_context,
+                    thread_context, cancel_check,
                 )
                 if result is None:
                     logger.info(
@@ -641,6 +701,7 @@ async def run_investigation(
                     on_event=on_event, cancel_check=cancel_check,
                 )
         except InvestigationCancelled:
+            _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "cancelled"})
             await db[INVESTIGATIONS].update_one(
                 {"_id": investigation_id}, {"$set": {"status": "cancelled", "completed_at": _now()}},
             )
@@ -683,6 +744,7 @@ async def run_investigation(
             message.csv_file_ids = csv_file_ids
             message.files_used = result_collector.files_used
 
+            _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "failed"})
             await _append_event(db, investigation_id, "error", user_facing)
             await db[INVESTIGATIONS].update_one(
                 {"_id": investigation_id}, {"$set": {"status": "failed", "completed_at": _now()}},
@@ -690,11 +752,6 @@ async def run_investigation(
             await db[MESSAGES].insert_one(message.to_mongo())
             return
 
-        # Chart/report/CSV chips are part of the result the user sees on this message, so they
-        # can't be deferred to the background - persist them and build the real message first.
-        # Everything past that point is pure bookkeeping with no effect on what's rendered
-        # (Investigation status, usage counters, the chat-memory update), so THAT'S what moves to
-        # the background via _schedule_finalize - the user isn't waiting on any of it.
         message = Message(
             chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
             follow_up_questions=result.follow_up_questions, files_used=result.files_used,
@@ -707,6 +764,7 @@ async def run_investigation(
         message.report_id = report_id
         message.csv_file_ids = csv_file_ids
         await db[MESSAGES].insert_one(message.to_mongo())
+        _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "completed"})
         await _append_event(
             db, investigation_id, "completed", "Investigation complete.",
             {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id},
@@ -723,3 +781,5 @@ async def run_investigation(
         )
     finally:
         log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)
+        langfuse_cm.__exit__(None, None, None)
+        span_cm.__exit__(None, None, None)
