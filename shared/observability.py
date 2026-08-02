@@ -67,22 +67,16 @@ def _init_otel(service_name: str, otlp_endpoint: str, settings) -> None:
     tracer_provider = TracerProvider(resource=resource)
     tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint)))
 
-    langfuse_public_key = settings.get("LANGFUSE_PUBLIC_KEY")
-    langfuse_secret_key = settings.get("LANGFUSE_SECRET_KEY")
-    if langfuse_public_key and langfuse_secret_key:
-        try:
-            from langfuse.opentelemetry import LangfuseSpanProcessor
-            tracer_provider.add_span_processor(LangfuseSpanProcessor())
-            logger.info("Langfuse span processor attached - LLM-shaped spans export to Langfuse Cloud")
-        except ImportError:
-            logger.warning("langfuse is not installed - Langfuse tracing disabled")
-        except Exception:
-            logger.exception("failed to attach LangfuseSpanProcessor - Langfuse tracing disabled")
-    else:
-        logger.info("LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY not set - Langfuse tracing disabled")
-
     trace.set_tracer_provider(tracer_provider)
     _tracer_provider = tracer_provider
+
+    langfuse_ready = False
+    if settings.get("LANGFUSE_PUBLIC_KEY") and settings.get("LANGFUSE_SECRET_KEY"):
+        langfuse_ready = get_langfuse_client() is not None
+        if langfuse_ready:
+            logger.info("Langfuse client constructed with the shared tracer_provider - LLM-shaped spans export to Langfuse Cloud")
+    else:
+        logger.info("LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY not set - Langfuse tracing disabled")
 
     metric_reader = PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=otlp_endpoint))
     meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
@@ -96,7 +90,7 @@ def _init_otel(service_name: str, otlp_endpoint: str, settings) -> None:
 
     logger.info(
         "OpenTelemetry initialized: service=%s endpoint=%s langfuse=%s",
-        service_name, otlp_endpoint, bool(langfuse_public_key and langfuse_secret_key),
+        service_name, otlp_endpoint, langfuse_ready,
     )
 
 
@@ -142,19 +136,26 @@ def get_meter(name: str):
     return metrics.get_meter(name)
 
 
+_langfuse_client = None
+
+
 def get_langfuse_client():
+    global _langfuse_client
+    if _langfuse_client is not None:
+        return _langfuse_client
     settings = get_settings()
     if not settings.get("LANGFUSE_PUBLIC_KEY") or not settings.get("LANGFUSE_SECRET_KEY"):
         return None
     try:
-        from langfuse import get_client
-        return get_client()
+        from langfuse import Langfuse
+        _langfuse_client = Langfuse(tracer_provider=_tracer_provider)
     except ImportError:
         logger.warning("langfuse is not installed - add it to requirements.txt")
         return None
     except Exception:
-        logger.exception("failed to get Langfuse client")
+        logger.exception("failed to construct Langfuse client")
         return None
+    return _langfuse_client
 
 
 def start_prometheus_metrics_server(port: int) -> None:
