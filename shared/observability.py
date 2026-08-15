@@ -63,23 +63,28 @@ def _is_noisy_span(span) -> bool:
     return False
 
 
-class _FilteringSpanProcessor:
-    def __init__(self, inner):
-        self._inner = inner
+def _make_filtering_span_processor(inner):
+    from opentelemetry.sdk.trace import SpanProcessor
 
-    def on_start(self, span, parent_context=None):
-        self._inner.on_start(span, parent_context=parent_context)
+    class _FilteringSpanProcessor(SpanProcessor):
+        def on_start(self, span, parent_context=None):
+            inner.on_start(span, parent_context=parent_context)
 
-    def on_end(self, span):
-        if _is_noisy_span(span):
-            return
-        self._inner.on_end(span)
+        def _on_ending(self, span):
+            inner._on_ending(span)
 
-    def shutdown(self):
-        self._inner.shutdown()
+        def on_end(self, span):
+            if _is_noisy_span(span):
+                return
+            inner.on_end(span)
 
-    def force_flush(self, timeout_millis=30000):
-        return self._inner.force_flush(timeout_millis)
+        def shutdown(self):
+            inner.shutdown()
+
+        def force_flush(self, timeout_millis=30000):
+            return inner.force_flush(timeout_millis)
+
+    return _FilteringSpanProcessor()
 
 
 def _init_otel(service_name: str, otlp_endpoint: str, settings) -> None:
@@ -104,7 +109,7 @@ def _init_otel(service_name: str, otlp_endpoint: str, settings) -> None:
         export_timeout_millis=export_timeout_ms,
         schedule_delay_millis=5000,
     )
-    tracer_provider.add_span_processor(_FilteringSpanProcessor(batch_processor))
+    tracer_provider.add_span_processor(_make_filtering_span_processor(batch_processor))
 
     trace.set_tracer_provider(tracer_provider)
     _tracer_provider = tracer_provider
