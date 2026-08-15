@@ -52,3 +52,7 @@ class Investigation(MongoModel):
     # request time) so reconciliation measures "how long has THIS attempt been running" rather
     # than re-triggering immediately on every sweep after a retry.
     last_attempt_at: Optional[datetime] = None
+
+    stage: Optional[str] = None
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -7,10 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from api_service.routers import auth, charts, chats, dashboards, feedback, files, reports, usage, workspaces
 from shared import intent_router
 from shared.config import get_settings
-from shared.db import close_client, ensure_indexes
+from shared.db import close_client, ensure_indexes, get_db
 from shared.logging_config import configure_logging
 from shared.observability import init_observability, instrument_fastapi
-from shared.redis_client import close_redis
+from shared.redis_client import close_redis, get_redis
 
 configure_logging("api_service")
 init_observability("api_service")
@@ -68,3 +69,35 @@ app.include_router(feedback.router, prefix=API_PREFIX)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+_ARQ_QUEUE_KEY = "arq:queue"
+
+
+@app.get("/health/detailed")
+async def health_detailed():
+    checks = {}
+
+    try:
+        await get_db().command("ping")
+        checks["mongo"] = {"status": "ok"}
+    except Exception as exc:
+        checks["mongo"] = {"status": "error", "detail": str(exc)}
+
+    try:
+        redis = get_redis()
+        await redis.ping()
+        queue_depth = await redis.zcard(_ARQ_QUEUE_KEY)
+        oldest = await redis.zrange(_ARQ_QUEUE_KEY, 0, 0, withscores=True)
+        oldest_age_s = None
+        if oldest:
+            _, score = oldest[0]
+            oldest_age_s = max(0.0, time.time() - score / 1000)
+        checks["redis"] = {
+            "status": "ok", "queue_depth": queue_depth, "oldest_queued_job_age_s": oldest_age_s,
+        }
+    except Exception as exc:
+        checks["redis"] = {"status": "error", "detail": str(exc)}
+
+    overall_ok = all(c["status"] == "ok" for c in checks.values())
+    return {"status": "ok" if overall_ok else "degraded", "checks": checks}

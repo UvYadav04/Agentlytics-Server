@@ -59,7 +59,15 @@ async def _poll_queue_size():
 
 
 async def on_startup(ctx):
-    await ensure_indexes()
+    try:
+        await ensure_indexes()
+    except Exception:
+        logging.getLogger("worker").exception(
+            "on_startup: ensure_indexes failed - worker cannot start without a working Mongo "
+            "connection, re-raising so the process exits with a clear traceback instead of "
+            "hanging or crashing silently"
+        )
+        raise
 
     metrics_port = os.environ.get("PROMETHEUS_METRICS_PORT")
     if metrics_port:
@@ -73,11 +81,17 @@ async def on_startup(ctx):
 
     ctx["queue_size_poll_task"] = asyncio.create_task(_poll_queue_size())
 
-    ctx["storage"] = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
-    ctx["vector_store"] = ChromaVectorStore()
-
-    sandbox_manager = get_sandbox_manager(socket_root=engine_bootstrap.SANDBOX_SOCKET_ROOT)
-    ctx["sandbox_manager"] = sandbox_manager
+    try:
+        ctx["storage"] = LocalParquetStore(root_dir=engine_bootstrap.PARQUET_ROOT)
+        ctx["vector_store"] = ChromaVectorStore()
+        sandbox_manager = get_sandbox_manager(socket_root=engine_bootstrap.SANDBOX_SOCKET_ROOT)
+        ctx["sandbox_manager"] = sandbox_manager
+    except Exception:
+        logging.getLogger("worker").exception(
+            "on_startup: failed to construct storage/vector_store/sandbox_manager - re-raising "
+            "so the crash reason is visible in logs instead of the container just exiting"
+        )
+        raise
 
     # Bring the pool up to min_size *now*, before this worker starts pulling jobs off the
     # queue - this is what actually eliminates first-request latency: previously each new

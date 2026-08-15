@@ -81,7 +81,7 @@ async def _reconcile_one(ctx, db, investigation: Investigation) -> None:
         # itself - no need to retry or fail-with-a-message, just close it out as cancelled.
         await db[INVESTIGATIONS].update_one(
             {"_id": investigation.id, "status": "running"},
-            {"$set": {"status": "cancelled", "completed_at": _now()}},
+            {"$set": {"status": "cancelled", "stage": "cancelled", "completed_at": _now()}},
         )
         return
 
@@ -114,7 +114,10 @@ async def _backfill_bookkeeping(ctx, db, investigation: Investigation, message_d
 
     update = await db[INVESTIGATIONS].update_one(
         {"_id": investigation.id, "status": "running"},
-        {"$set": {"status": "completed", "final_answer": final_answer, "completed_at": _now()}},
+        {"$set": {
+            "status": "completed", "stage": "completed",
+            "final_answer": final_answer, "completed_at": _now(),
+        }},
     )
     if update.matched_count == 0:
         # Lost the race to the original finalize task finishing late, or a concurrent sweep -
@@ -155,7 +158,7 @@ async def _retry(ctx, db, investigation: Investigation) -> None:
     )
     update = await db[INVESTIGATIONS].update_one(
         {"_id": investigation.id, "status": "running"},
-        {"$set": {"last_attempt_at": _now()}, "$inc": {"retry_count": 1}},
+        {"$set": {"last_attempt_at": _now(), "stage": "retrying"}, "$inc": {"retry_count": 1}},
     )
     if update.matched_count == 0:
         return
@@ -176,7 +179,10 @@ async def _give_up(db, investigation: Investigation) -> None:
     )
     update = await db[INVESTIGATIONS].update_one(
         {"_id": investigation.id, "status": "running"},
-        {"$set": {"status": "failed", "completed_at": _now()}},
+        {"$set": {
+            "status": "failed", "stage": "failed", "completed_at": _now(),
+            "error_type": "worker_crash", "error_message": FAILURE_MESSAGE,
+        }},
     )
     if update.matched_count == 0:
         return

@@ -13,7 +13,7 @@ from shared.models.file import File
 from shared.models.user import User
 from shared.redis_client import get_arq_pool
 from shared.storage import build_upload_key, delete_object, new_file_id, presign_put
-from shared.upload_limits import describe_limit, max_size_bytes
+from shared.upload_limits import describe_limit, is_supported_upload_extension, max_size_bytes
 
 logger = logging.getLogger("api.files")
 
@@ -67,6 +67,16 @@ async def presign_upload(
     await get_owned_workspace(workspace_id, user)
 
     ext = os.path.splitext(body.filename)[1].lstrip(".").lower()
+
+    if not is_supported_upload_extension(ext):
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f".{ext} files aren't supported - document uploads (PDF/TXT/DOCX) have been "
+                "removed. Only tabular files (CSV, XLSX) can be uploaded."
+            ),
+        )
+
     limit = max_size_bytes(ext)
     if limit is not None and body.size_bytes is not None and body.size_bytes > limit:
         raise HTTPException(

@@ -2,6 +2,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: data-analyzer-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
@@ -11,6 +12,7 @@ services:
   api_service:
     image: itzdineshyadav/data-analyzer:api
     container_name: data-analyzer-api
+    restart: unless-stopped
     env_file:
       - ./shared/.env
     environment:
@@ -27,6 +29,7 @@ services:
   worker_service:
     image: itzdineshyadav/data-analyzer:worker
     container_name: data-analyzer-worker
+    restart: unless-stopped
     env_file:
       - ./shared/.env
       - ./analyzerEngine/.env

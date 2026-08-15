@@ -21,7 +21,9 @@ from analyzerEngine.tools.orchestrator.memory import LongTermMemory
 from analyzerEngine.tools.orchestrator.models import (
     FileCatalogEntry, FileRef, FinalResultCollector, OrchestratorResult,
 )
-from analyzerEngine.tools.orchestrator.thread_summary import analyze_turn
+from analyzerEngine.tools.orchestrator.thread_summary import (
+    analyze_turn, compress_context, should_prune,
+)
 from analyzerEngine.tools.tabular.models import FileRef as TabularFileRef
 
 from arq import Retry
@@ -156,6 +158,30 @@ async def _append_event(db, investigation_id: str, event_type: str, message: str
 async def _is_cancelled(db, investigation_id: str) -> bool:
     doc = await db[INVESTIGATIONS].find_one({"_id": investigation_id}, {"cancel_requested": 1})
     return bool(doc and doc.get("cancel_requested"))
+
+
+async def _set_stage(db, investigation_id: str, stage: str) -> None:
+    try:
+        await db[INVESTIGATIONS].update_one({"_id": investigation_id}, {"$set": {"stage": stage}})
+    except Exception:
+        logger.exception("failed to persist stage=%s for investigation %s", stage, investigation_id)
+
+
+async def _maybe_prune_thread_context(db, chat_id: str, thread_context: dict, query: str, on_event) -> dict:
+    summary = thread_context.get("summary", "")
+    recent_turns = thread_context.get("recent_turns", [])
+    if not should_prune(summary, recent_turns, query):
+        return thread_context
+
+    await on_event({
+        "type": "status",
+        "message": "Compressing conversation history to stay within limits...",
+    })
+    new_summary, kept_turns = await compress_context(summary, recent_turns)
+    await db[CHATS].update_one(
+        {"_id": chat_id}, {"$set": {"summary": new_summary, "recent_turns": kept_turns}},
+    )
+    return {**thread_context, "summary": new_summary, "recent_turns": kept_turns}
 
 
 async def _thread_context(db, chat_id: str) -> dict:
@@ -422,7 +448,10 @@ async def _finalize_investigation_bookkeeping(
     await _with_retries(
         lambda: db[INVESTIGATIONS].update_one(
             {"_id": investigation_id},
-            {"$set": {"status": "completed", "final_answer": final_answer, "completed_at": _now()}},
+            {"$set": {
+                "status": "completed", "stage": "completed",
+                "final_answer": final_answer, "completed_at": _now(),
+            }},
         ),
         description=f"investigation status update (investigation {investigation_id})",
     )
@@ -589,6 +618,7 @@ async def run_investigation(
     async def cancel_check() -> bool:
         return await _is_cancelled(db, investigation_id)
 
+    await _set_stage(db, investigation_id, "building_catalog")
     storage = ctx["storage"]
     catalog_start = time.perf_counter()
     catalog, skipped_files = await _build_catalog(db, workspace_id, storage)
@@ -614,6 +644,7 @@ async def run_investigation(
         })
 
     thread_context = await _thread_context(db, chat_id)
+    thread_context = await _maybe_prune_thread_context(db, chat_id, thread_context, query, on_event)
 
     langfuse = get_langfuse_client()
     langfuse_cm = nullcontext()
@@ -655,56 +686,88 @@ async def run_investigation(
         langfuse_cm = nullcontext()
         langfuse_cm.__enter__()
 
+    async def _dispatch(ctx_thread_context: dict):
+        result = None
+        if direct_route == "tabular":
+            result = await _run_tabular_direct(
+                catalog, storage, chat_id, sandbox_manager, workspace_id, query,
+                mentioned_file_ids, on_event, result_collector, ctx_thread_context,
+                chart_capacity_checker, cancel_check,
+            )
+            if result is None:
+                logger.info(
+                    "investigation %s: tabular direct-route unsafe (no unambiguous file "
+                    "selection) - falling back to the Orchestrator", investigation_id,
+                )
+        elif direct_route == "document":
+            result = await _run_document_direct(
+                catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
+                ctx_thread_context, cancel_check,
+            )
+            if result is None:
+                logger.info(
+                    "investigation %s: document direct-route unsafe (no unambiguous file "
+                    "selection) - falling back to the Orchestrator", investigation_id,
+                )
+
+        if result is not None:
+            logger.info(
+                "investigation %s: handled directly by the %s agent (Orchestrator skipped)",
+                investigation_id, direct_route,
+            )
+        else:
+            orchestrator = OrchestratorAgent(
+                catalog, vector_store=vector_store, memory=memory, storage=storage,
+                reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
+                sandbox_manager=sandbox_manager, result_collector=result_collector,
+                chart_capacity_checker=chart_capacity_checker,
+            )
+            result = await orchestrator.run(
+                query, workspace_id=workspace_id, thread_context=ctx_thread_context,
+                on_event=on_event, cancel_check=cancel_check,
+            )
+        return result
+
     try:
         try:
-            result = None
             await on_event({
                 "type": "status",
                 "message": "Picked up your request",
             })
+            await _set_stage(db, investigation_id, "running")
 
-            if direct_route == "tabular":
-                result = await _run_tabular_direct(
-                    catalog, storage, chat_id, sandbox_manager, workspace_id, query,
-                    mentioned_file_ids, on_event, result_collector, thread_context,
-                    chart_capacity_checker, cancel_check,
+            try:
+                result = await _dispatch(thread_context)
+            except Exception as exc:
+                error_info = classify_llm_error(exc)
+                safe_to_retry = (
+                    error_info.kind == "token_limit"
+                    and len(thread_context.get("recent_turns", [])) > 1
+                    and not result_collector.chart_paths
+                    and not result_collector.artifacts
                 )
-                if result is None:
-                    logger.info(
-                        "investigation %s: tabular direct-route unsafe (no unambiguous file "
-                        "selection) - falling back to the Orchestrator", investigation_id,
+                if safe_to_retry:
+                    await on_event({
+                        "type": "status",
+                        "message": "Hit the AI provider's token limit - compressing context and retrying...",
+                    })
+                    await _set_stage(db, investigation_id, "retrying")
+                    new_summary, kept_turns = await compress_context(
+                        thread_context.get("summary", ""), thread_context.get("recent_turns", []),
                     )
-            elif direct_route == "document":
-                result = await _run_document_direct(
-                    catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
-                    thread_context, cancel_check,
-                )
-                if result is None:
-                    logger.info(
-                        "investigation %s: document direct-route unsafe (no unambiguous file "
-                        "selection) - falling back to the Orchestrator", investigation_id,
+                    thread_context = {**thread_context, "summary": new_summary, "recent_turns": kept_turns}
+                    await db[CHATS].update_one(
+                        {"_id": chat_id}, {"$set": {"summary": new_summary, "recent_turns": kept_turns}},
                     )
-
-            if result is not None:
-                logger.info(
-                    "investigation %s: handled directly by the %s agent (Orchestrator skipped)",
-                    investigation_id, direct_route,
-                )
-            else:
-                orchestrator = OrchestratorAgent(
-                    catalog, vector_store=vector_store, memory=memory, storage=storage,
-                    reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
-                    sandbox_manager=sandbox_manager, result_collector=result_collector,
-                    chart_capacity_checker=chart_capacity_checker,
-                )
-                result = await orchestrator.run(
-                    query, workspace_id=workspace_id, thread_context=thread_context,
-                    on_event=on_event, cancel_check=cancel_check,
-                )
+                    await _set_stage(db, investigation_id, "running")
+                    result = await _dispatch(thread_context)
+                else:
+                    raise
         except InvestigationCancelled:
             _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "cancelled"})
             await db[INVESTIGATIONS].update_one(
-                {"_id": investigation_id}, {"$set": {"status": "cancelled", "completed_at": _now()}},
+                {"_id": investigation_id},
+                {"$set": {"status": "cancelled", "stage": "cancelled", "completed_at": _now()}},
             )
             logger.info("investigation %s cancelled", investigation_id)
             return
@@ -746,13 +809,18 @@ async def run_investigation(
             message.files_used = result_collector.files_used
 
             _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "failed"})
-            await _append_event(db, investigation_id, "error", user_facing)
+            await _append_event(db, investigation_id, "error", user_facing, {"error_type": error_info.kind})
             await db[INVESTIGATIONS].update_one(
-                {"_id": investigation_id}, {"$set": {"status": "failed", "completed_at": _now()}},
+                {"_id": investigation_id},
+                {"$set": {
+                    "status": "failed", "stage": "failed", "completed_at": _now(),
+                    "error_type": error_info.kind, "error_message": str(exc)[:2000],
+                }},
             )
             await db[MESSAGES].insert_one(message.to_mongo())
             return
 
+        await _set_stage(db, investigation_id, "persisting_results")
         message = Message(
             chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
             follow_up_questions=result.follow_up_questions, files_used=result.files_used,

@@ -51,6 +51,16 @@
     "summarize all uploads",
     "multiple source analysis",
     "combine spreadsheet report",
-    "complete investigation"
+    "complete investigation",
+    "export as csv",
+    "generate a csv export",
+    "download this as csv",
+    "create a csv file",
+    "generate a report",
+    "write a report",
+    "export the results",
+    "generate a dashboard",
+    "download a spreadsheet",
+    "give me a downloadable report"
   ]
 }

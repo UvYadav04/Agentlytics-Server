@@ -51,6 +51,37 @@ def _build_resource(service_name: str, settings):
     return Resource.create(attributes)
 
 
+_NOISY_REDIS_COMMANDS = {"ZRANGEBYSCORE", "ZADD", "ZREM", "ZCARD", "PING", "BRPOPLPUSH", "EVALSHA", "HSET", "HGET"}
+
+
+def _is_noisy_span(span) -> bool:
+    attrs = getattr(span, "attributes", None) or {}
+    if attrs.get("db.system") == "redis":
+        command = (span.name or "").split(" ")[0].upper()
+        if command in _NOISY_REDIS_COMMANDS:
+            return True
+    return False
+
+
+class _FilteringSpanProcessor:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def on_start(self, span, parent_context=None):
+        self._inner.on_start(span, parent_context=parent_context)
+
+    def on_end(self, span):
+        if _is_noisy_span(span):
+            return
+        self._inner.on_end(span)
+
+    def shutdown(self):
+        self._inner.shutdown()
+
+    def force_flush(self, timeout_millis=30000):
+        return self._inner.force_flush(timeout_millis)
+
+
 def _init_otel(service_name: str, otlp_endpoint: str, settings) -> None:
     global _tracer_provider, _otel_enabled
 
@@ -64,8 +95,16 @@ def _init_otel(service_name: str, otlp_endpoint: str, settings) -> None:
 
     resource = _build_resource(service_name, settings)
 
+    export_timeout_ms = int(settings.get("OTEL_EXPORT_TIMEOUT_MS", 15000) or 15000)
+
     tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint)))
+    span_exporter = OTLPSpanExporter(endpoint=otlp_endpoint, timeout=export_timeout_ms // 1000)
+    batch_processor = BatchSpanProcessor(
+        span_exporter,
+        export_timeout_millis=export_timeout_ms,
+        schedule_delay_millis=5000,
+    )
+    tracer_provider.add_span_processor(_FilteringSpanProcessor(batch_processor))
 
     trace.set_tracer_provider(tracer_provider)
     _tracer_provider = tracer_provider
@@ -78,7 +117,10 @@ def _init_otel(service_name: str, otlp_endpoint: str, settings) -> None:
     else:
         logger.info("LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY not set - Langfuse tracing disabled")
 
-    metric_reader = PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=otlp_endpoint))
+    metric_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=otlp_endpoint, timeout=export_timeout_ms // 1000),
+        export_timeout_millis=export_timeout_ms,
+    )
     meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
     metrics.set_meter_provider(meter_provider)
 

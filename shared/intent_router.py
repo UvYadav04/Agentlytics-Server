@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -13,6 +14,32 @@ from shared.intent_classifier import CANDIDATE_LABELS, IntentResult, classify_in
 from shared.onnx_intent import embed as _onnx_embed
 
 logger = logging.getLogger("intent_router")
+
+# Deterministic safety net on top of the embedding classifier below: "tabular"/"document" are
+# DIRECT routes that skip the Orchestrator entirely (see worker_service/tasks/investigation.py's
+# _run_tabular_direct/_run_document_direct) - and generate_csv/generate_report/generate_dashboard
+# only exist as Orchestrator tools (agents/orchestrator/capabilities.py). A query asking to
+# generate/export/download a file is semantically very close to an ordinary analysis request in
+# embedding space ("generate a CSV export of monthly sales" scores high against "tabular"
+# examples like "analyze csv data"/"calculate total sales"), so the embedding tier alone
+# misroutes these often enough to matter - a real, observed bug: the direct-routed agent has no
+# tool to actually produce a file, but nothing stops its own summary text from claiming it did
+# anyway, and direct routes bypass the Orchestrator's FORMAT_SYSTEM_MESSAGE fabrication check
+# too. Regardless of what the embedding/LLM tiers below decide, force these to the Orchestrator.
+_DELIVERABLE_VERBS = r"(?:export|download|generate|create|produce|make|write|build)"
+_DELIVERABLE_NOUNS = r"(?:csv|report|dashboard|spreadsheet|excel|xlsx|pdf|file|document)"
+_DELIVERABLE_PATTERN = re.compile(
+    rf"\b{_DELIVERABLE_VERBS}\b(?:\s+\w+){{0,4}}?\s+{_DELIVERABLE_NOUNS}\b"
+    rf"|\bas\s+an?\s+{_DELIVERABLE_NOUNS}\b"
+    rf"|\bto\s+(?:a\s+|an\s+)?{_DELIVERABLE_NOUNS}\b"
+    rf"|\bready\s+for\s+download\b"
+    rf"|\bdownload(?:able)?\s+(?:link|file|version)\b",
+    re.IGNORECASE,
+)
+
+
+def wants_generated_deliverable(query: str) -> bool:
+    return bool(_DELIVERABLE_PATTERN.search(query))
 
 _EXAMPLES_PATH_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intent_examples.json")
 
@@ -210,6 +237,20 @@ def route_query_intent_fast(query: str) -> RouteResult:
 
 
 def _finish(result: RouteResult, start: float) -> RouteResult:
+    # Deterministic override, applied after whichever tier decided `intent` - see
+    # wants_generated_deliverable's comment above for why this can't be left to the embedding/LLM
+    # classifiers alone. "orchestrator" (or None, which the caller also treats as "go through the
+    # Orchestrator" - see chats.py) is always safe to fall through to; "tabular"/"document" are
+    # the only routes this needs to override, since those are the only ones that skip it.
+    if result.intent in ("tabular", "document") and wants_generated_deliverable(result.query):
+        logger.info(
+            "intent_router: query=%r overriding intent %s -> orchestrator (query asks for a "
+            "generated file/export - tabular/document direct routes have no generate_csv/"
+            "generate_report tool)",
+            result.query, result.intent,
+        )
+        result.intent = "orchestrator"
+
     result.latency_ms = (time.perf_counter() - start) * 1000
     logger.info(
         "intent_router: query=%r method=%s final_intent=%s top_intent=%s top_similarity=%.3f "
