@@ -36,6 +36,8 @@ def configure_logging(service_name: str, level: str | None = None) -> logging.Lo
     console_handler.setFormatter(formatter)
     root.addHandler(console_handler)
 
+    logging.getLogger("opentelemetry.context").setLevel(logging.CRITICAL)
+
     _configured_services.add(service_name)
     return root
 

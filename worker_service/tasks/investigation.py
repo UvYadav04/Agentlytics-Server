@@ -850,5 +850,17 @@ async def run_investigation(
         )
     finally:
         log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)
-        langfuse_cm.__exit__(None, None, None)
-        span_cm.__exit__(None, None, None)
+        try:
+            langfuse_cm.__exit__(None, None, None)
+        except Exception:
+            logger.exception(
+                "investigation %s: langfuse_cm.__exit__ raised - context bookkeeping only, "
+                "the investigation result itself is unaffected", investigation_id,
+            )
+        try:
+            span_cm.__exit__(None, None, None)
+        except Exception:
+            logger.exception(
+                "investigation %s: span_cm.__exit__ raised - context bookkeeping only, the "
+                "investigation result itself is unaffected", investigation_id,
+            )
