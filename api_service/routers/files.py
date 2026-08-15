@@ -71,10 +71,7 @@ async def presign_upload(
     if not is_supported_upload_extension(ext):
         raise HTTPException(
             status_code=415,
-            detail=(
-                f".{ext} files aren't supported - document uploads (PDF/TXT/DOCX) have been "
-                "removed. Only tabular files (CSV, XLSX) can be uploaded."
-            ),
+            detail=f".{ext} files aren't supported. CSV, XLSX, PDF, and TXT files can be uploaded.",
         )
 
     limit = max_size_bytes(ext)

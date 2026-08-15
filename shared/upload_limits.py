@@ -4,11 +4,9 @@ DEFAULT_MAX_DOCUMENT_MB = 25
 
 _LIMITED_TYPES = {"pdf", "txt"}
 
-# Document uploads (PDF/TXT/DOCX) are not supported - api_service/routers/files.py's
-# presign_upload rejects these before a File doc is ever created (the real, authoritative gate -
-# see that router), and analyzerEngine/ingestion/registry.py's EXTENSION_REGISTRY has no
-# ingestor for them either as a defense-in-depth backstop. Only tabular formats are accepted.
-UNSUPPORTED_UPLOAD_EXTENSIONS = {"pdf", "txt", "docx", "doc"}
+# DOCX/DOC uploads aren't supported - there's no ingestor for them under
+# analyzerEngine/ingestion/file_types/ (PDF and TXT both have one and are accepted below).
+UNSUPPORTED_UPLOAD_EXTENSIONS = {"docx", "doc"}
 
 
 def is_supported_upload_extension(ext: str) -> bool:
