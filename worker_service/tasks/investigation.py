@@ -85,6 +85,12 @@ async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> t
     t0 = time.perf_counter()
     docs = await db[FILES].find({"workspace_id": workspace_id, "status": "ready"}).to_list(length=None)
 
+    # Dummy (sample) files are only ever used as a fallback for a workspace with zero real
+    # ready files - the moment a real one exists, dummy entries are excluded from the catalog
+    # entirely rather than mixed in. See shared/dummy_files.py.
+    real_docs = [d for d in docs if not d.get("dummy")]
+    docs = real_docs or docs
+
     refs_to_check: set[str] = set()
     for doc in docs:
         output_ref = doc.get("output_ref") or ""

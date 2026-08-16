@@ -28,6 +28,7 @@ from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
 from shared.intent_router import route_query_intent_fast
+from shared.dummy_files import ensure_dummy_files
 from shared.chat_title import generate_title
 from api_service.light_investigation import schedule_light_response
 from shared.admin import is_admin_email
@@ -416,10 +417,15 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     # than counting before the insert) is what lets this run inside the same gather as
     # persist_task's insert below without a race - the count is correct regardless of whether
     # that insert has landed yet by the time this query runs.
-    route_result, files_doc, prior_message_count = await asyncio.gather(
+    # Defensive/self-healing only - the primary, race-free seeding happens at workspace creation
+    # (workspaces.py's create_workspace) so sample files normally already exist and are "ready"
+    # well before a user's first message. This call is a cheap no-op in that case; it only does
+    # real work for a workspace that predates this feature or somehow ended up with zero files.
+    route_result, files_doc, prior_message_count, _ = await asyncio.gather(
         asyncio.to_thread(route_query_intent_fast, body.content),
         db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
         db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
+        ensure_dummy_files(db, chat.workspace_id),
     )
     has_files = files_doc is not None
     is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE

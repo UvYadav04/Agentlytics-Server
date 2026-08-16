@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_owned_file, get_owned_workspace
 from shared.db import get_db
+from shared.dummy_files import ensure_dummy_files
 from shared.job_timing import now_iso
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
@@ -31,12 +32,14 @@ class FileOut(BaseModel):
     error: str | None
     row_count: int | None
     page_count: int | None
+    dummy: bool = False
 
 
 class PresignRequest(BaseModel):
     filename: str
     content_type: str = "application/octet-stream"
     size_bytes: int | None = None
+    batch_id: str | None = None
 
 
 class PresignResponse(BaseModel):
@@ -57,6 +60,7 @@ def _out(f: File) -> FileOut:
         error=f.error,
         row_count=f.row_count,
         page_count=f.page_count,
+        dummy=f.dummy,
     )
 
 
@@ -95,6 +99,7 @@ async def presign_upload(
         storage_key=storage_key,
         size_bytes=body.size_bytes,
         status="pending_upload",
+        batch_id=body.batch_id,
     )
     await get_db()[FILES].insert_one(file.to_mongo())
 
@@ -146,8 +151,14 @@ async def cancel_upload(file_id: str, user: User = Depends(get_current_user)):
 @router.get("/workspaces/{workspace_id}/files", response_model=list[FileOut])
 async def list_files(workspace_id: str, user: User = Depends(get_current_user)):
     await get_owned_workspace(workspace_id, user)
-    cursor = get_db()[FILES].find({"workspace_id": workspace_id}).sort("uploaded_at", 1)
+    db = get_db()
+    await ensure_dummy_files(db, workspace_id)
+    cursor = db[FILES].find({"workspace_id": workspace_id}).sort("uploaded_at", 1)
     docs = await cursor.to_list(length=500)
+    # Dummy files are only ever shown as a fallback - the instant the workspace has a real
+    # (non-dummy) file, hide the samples entirely rather than listing both side by side.
+    real_docs = [d for d in docs if not d.get("dummy")]
+    docs = real_docs or docs
     return [_out(File.from_mongo(d)) for d in docs]
 
 

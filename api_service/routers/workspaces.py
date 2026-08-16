@@ -5,6 +5,7 @@ from api_service.deps import get_current_user, get_owned_workspace
 from shared import usage
 from shared.admin import is_admin_email
 from shared.db import get_db
+from shared.dummy_files import ensure_dummy_files
 from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
 from shared.models.report import COLLECTION as REPORTS
@@ -75,6 +76,13 @@ async def create_workspace(body: CreateWorkspaceRequest, user: User = Depends(ge
     await get_db()[WORKSPACES].insert_one(workspace.to_mongo())
     if not is_admin_email(user.email):
         await usage.increment_workspaces(user.id)
+
+    # Eager, race-free path: by the time a user looks around and types their first message, the
+    # sample files below have had a real chance to finish ingesting. list_files/send_message also
+    # call this defensively (it's a no-op once any file exists), covering workspaces that predate
+    # this or somehow end up empty again later.
+    await ensure_dummy_files(get_db(), workspace.id)
+
     return _out(workspace)
 
 

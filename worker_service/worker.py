@@ -8,6 +8,7 @@ from arq.worker import func as arq_func
 
 from worker_service import engine_bootstrap
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
+from worker_service.tasks.dummy_files import clone_dummy_files
 from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation, update_chat_memory
 from worker_service.tasks.reconciliation import reconcile_stuck_investigations
@@ -130,6 +131,7 @@ class WorkerSettings:
         run_ingestion,
         run_investigation,
         refresh_dashboard,
+        clone_dummy_files,
         arq_func(update_chat_memory, max_tries=5),
     ]
     # Sweeps for investigations stuck at status="running" (worker died mid-run, or died after
