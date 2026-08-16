@@ -36,6 +36,3 @@ logs/
 **/logs/
 
 shared/onnx_intent/weights/model.onnx
-scripts/
-shared/dummy_files.py
-worker_service/tasks/dummy_files.py
