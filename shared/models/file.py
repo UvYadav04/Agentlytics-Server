@@ -27,6 +27,14 @@ class File(MongoModel):
     columns: Optional[list[str]] = None
     extracted_tables: list[dict] = Field(default_factory=list)
 
+    # Live progress while status="processing" - only ever set for PDFs, which are the only
+    # file type ingested page-by-page (see PDFIngestor.ingest's progress_callback). Both None
+    # for every other file type/status; the client only renders a page-progress bar when
+    # pages_total is present. Cleared back to None once ingestion finishes either way, since a
+    # stale "24/24" would be confusing to show forever alongside status="ready"/"failed".
+    pages_done: Optional[int] = None
+    pages_total: Optional[int] = None
+
     # Set once, at presign time, from whatever the client sent - all files picked in the same
     # "Upload" click share one batch_id. Used by worker_service/tasks/ingestion.py to roll back
     # already-ingested siblings if a later file in the same batch fails ingestion because the

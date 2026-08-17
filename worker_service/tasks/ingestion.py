@@ -21,7 +21,34 @@ logger = logging.getLogger("worker.ingestion")
 
 async def _mark_failed(db, file: File, error: str) -> None:
     logger.warning("ingestion failed for file %s: %s", file.id, error)
-    await db[FILES].update_one({"_id": file.id}, {"$set": {"status": "failed", "error": error}})
+    await db[FILES].update_one(
+        {"_id": file.id},
+        {"$set": {"status": "failed", "error": error, "pages_done": None, "pages_total": None}},
+    )
+
+
+def _make_progress_reporter(db, loop, file_id: str):
+    """Returns a plain sync function safe to call from the worker thread ingestion actually runs
+    in (manager.ingest_file is dispatched via asyncio.to_thread - it's not on the event loop, so
+    it can't just `await` a motor call directly). Schedules the Mongo update back onto the main
+    event loop via run_coroutine_threadsafe and returns immediately - fire-and-forget, since a
+    dropped progress tick just means the client's next 3s poll shows a slightly stale number, not
+    a real problem worth blocking ingestion over."""
+    async def _update(done: int, total: int) -> None:
+        try:
+            await db[FILES].update_one(
+                {"_id": file_id}, {"$set": {"pages_done": done, "pages_total": total}},
+            )
+        except Exception:
+            logger.exception("run_ingestion: failed to write progress for file %s", file_id)
+
+    def _report(done: int, total: int) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(_update(done, total), loop)
+        except Exception:
+            logger.exception("run_ingestion: failed to schedule progress update for file %s", file_id)
+
+    return _report
 
 
 def _delete_parquet_output(storage, workspace_id: str, artifact_id: str | None) -> None:
@@ -151,7 +178,11 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
 
             manager = IngestionManager(storage=ctx["storage"], vector_store=ctx["vector_store"])
 
-            result = await asyncio.to_thread(manager.ingest_file, local_path, file.workspace_id, file.id)
+            progress_reporter = _make_progress_reporter(db, asyncio.get_running_loop(), file.id)
+            result = await asyncio.to_thread(
+                manager.ingest_file, local_path, file.workspace_id, file.id,
+                progress_callback=progress_reporter,
+            )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True   )
 
@@ -181,6 +212,8 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
             "columns": schema_summary.get("columns"),
             "extracted_tables": result.extracted_tables or [],
             "error": "; ".join(result.errors) if result.errors else None,
+            "pages_done": None,
+            "pages_total": None,
         }
         await db[FILES].update_one({"_id": file.id}, {"$set": update})
         logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)

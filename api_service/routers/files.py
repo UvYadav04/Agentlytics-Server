@@ -33,6 +33,8 @@ class FileOut(BaseModel):
     row_count: int | None
     page_count: int | None
     dummy: bool = False
+    pages_done: int | None = None
+    pages_total: int | None = None
 
 
 class PresignRequest(BaseModel):
@@ -61,6 +63,8 @@ def _out(f: File) -> FileOut:
         row_count=f.row_count,
         page_count=f.page_count,
         dummy=f.dummy,
+        pages_done=f.pages_done,
+        pages_total=f.pages_total,
     )
 
 
