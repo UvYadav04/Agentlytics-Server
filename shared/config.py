@@ -1,5 +1,10 @@
 import os
 
+
+def _is_production() -> bool:
+    return os.environ.get("ENV", "").strip().lower() == "production"
+
+
 class Settings:
     _instance = None
     _initialized = False
@@ -12,17 +17,20 @@ class Settings:
     def __init__(self, env_path: str = None):
         if self._initialized:
             return
-        
+
         if env_path is None:
             env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-        
+
         self.env_path = env_path
         self.settings_dict = {}
         self.load_env()
         self._initialized = True
 
     def load_env(self):
-        if os.path.exists(self.env_path):
+        # In production all services run in a single container and every variable is injected
+        # directly into the environment (no .env files shipped), so skip reading one there and
+        # rely on os.environ only.
+        if not _is_production() and os.path.exists(self.env_path):
             try:
                 with open(self.env_path, 'r', encoding='utf-8') as f:
                     for line in f:

@@ -30,11 +30,12 @@ from shared.query_router import classify as classify_query
 from shared.intent_router import route_query_intent_fast
 from shared.dummy_files import ensure_dummy_files
 from shared.chat_title import generate_title
+from shared.chat_summary import generate_chat_summary
 from api_service.light_investigation import schedule_light_response
 from shared.admin import is_admin_email
 from shared.job_timing import now_iso
 from shared.redis_client import get_arq_pool, get_redis, investigation_channel
-from shared.storage import delete_object
+from shared.storage import delete_object, presign_get
 
 logger = logging.getLogger("api.chats")
 shadow_logger = logging.getLogger("query_router.shadow")
@@ -346,6 +347,98 @@ async def list_messages(chat_id: str, user: User = Depends(get_current_user)):
     cursor = get_db()[MESSAGES].find({"chat_id": chat_id}).sort("created_at", 1)
     docs = await cursor.to_list(length=2000)
     return [_message_out(Message.from_mongo(d)) for d in docs]
+
+
+class ChatExportChartOut(BaseModel):
+    id: str
+    title: str
+    url: str
+
+
+class ChatExportCSVOut(BaseModel):
+    id: str
+    title: str
+    url: str
+
+
+class ChatExportSummaryOut(BaseModel):
+    chat_id: str
+    chat_title: str
+    turns_count: int
+    summary: str
+    charts: list[ChatExportChartOut]
+    csv_files: list[ChatExportCSVOut]
+
+
+@router.get("/chats/{chat_id}/export/summary", response_model=ChatExportSummaryOut)
+async def export_chat_summary(chat_id: str, user: User = Depends(get_current_user)):
+    """Backs the client's "Export chat" action: the chat's answers concatenated into one summary
+    (shared/chat_summary.py - no LLM call, the stored final_answers are already short and
+    distilled), plus every chart and CSV export produced along the way. Deliberately excludes
+    markdown reports (generate_report) - those stay a separate, explicit deliverable rather than
+    something bundled into every export. Computed on demand, not persisted - cheap enough (plain
+    string work plus a couple of Mongo lookups) that caching isn't worth the added lifecycle
+    complexity of a new artifact type yet."""
+    chat = await get_owned_chat(chat_id, user)
+    db = get_db()
+
+    cursor = db[MESSAGES].find({"chat_id": chat_id}).sort("created_at", 1)
+    docs = await cursor.to_list(length=2000)
+
+    turns: list[tuple[str, str]] = []
+    chart_ids: list[str] = []
+    csv_file_ids: list[str] = []
+    last_user_content = ""
+    for doc in docs:
+        message = Message.from_mongo(doc)
+        if message.role == "user":
+            last_user_content = message.content
+            continue
+        if message.content and message.content.strip():
+            turns.append((last_user_content, message.content))
+        for chart_id in message.chart_ids:
+            if chart_id not in chart_ids:
+                chart_ids.append(chart_id)
+        for csv_id in message.csv_file_ids:
+            if csv_id not in csv_file_ids:
+                csv_file_ids.append(csv_id)
+
+    if not turns:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This chat has no answers yet - nothing to export.")
+
+    summary = generate_chat_summary(turns)
+
+    charts_out: list[ChatExportChartOut] = []
+    if chart_ids:
+        chart_docs = await db[CHARTS].find({"_id": {"$in": chart_ids}}).to_list(length=len(chart_ids))
+        charts_by_id = {d["_id"]: Chart.from_mongo(d) for d in chart_docs}
+        for chart_id in chart_ids:
+            chart = charts_by_id.get(chart_id)
+            if chart is None:
+                continue
+            charts_out.append(
+                ChatExportChartOut(id=chart.id, title=chart.title, url=presign_get(chart.storage_key))
+            )
+
+    csv_out: list[ChatExportCSVOut] = []
+    if csv_file_ids:
+        report_docs = await db[REPORTS].find({"_id": {"$in": csv_file_ids}}).to_list(length=len(csv_file_ids))
+        reports_by_id = {d["_id"]: Report.from_mongo(d) for d in report_docs}
+        for csv_id in csv_file_ids:
+            report = reports_by_id.get(csv_id)
+            if report is None or not report.storage_key:
+                continue
+            csv_out.append(ChatExportCSVOut(id=report.id, title=report.title, url=presign_get(report.storage_key)))
+
+    logger.info(
+        "export_chat_summary: chat=%s turns=%d charts=%d csv_files=%d",
+        chat_id, len(turns), len(charts_out), len(csv_out),
+    )
+
+    return ChatExportSummaryOut(
+        chat_id=chat.id, chat_title=chat.title, turns_count=len(turns),
+        summary=summary, charts=charts_out, csv_files=csv_out,
+    )
 
 
 @router.get("/chats/{chat_id}/active-investigation")
