@@ -50,5 +50,5 @@ jobs:
           username: ubuntu
           key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
           script: |
-            cd /agentlytics/scripts
+            cd agentlytics/scripts
             ./deploy-server.sh
