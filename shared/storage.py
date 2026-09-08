@@ -12,15 +12,13 @@ def get_s3_client():
     global _s3_client
     if _s3_client is None:
         settings = get_settings()
-        print("AWS ACCESS KEY:", settings.get("AWS_ACCESS_KEY"))
-        print("AWS SECRET ACCESS KEY:", settings.get("AWS_ACCESS_SECRET"))
-        print("AWS REGION:", settings.get("AWS_REGION"))
-        print("AWS BUCKET:", settings.get("AWS_BUCKET"))
+        region = settings.get("AWS_REGION") or "us-north-1"
         _s3_client = boto3.client(
             "s3",
             aws_access_key_id=settings.get("AWS_ACCESS_KEY"),
             aws_secret_access_key=settings.get("AWS_ACCESS_SECRET"),
-            region_name=settings.get("AWS_REGION"),
+            region_name=region,
+            endpoint_url=f"https://s3.{region}.amazonaws.com",
             config=BotoConfig(signature_version="s3v4"),
         )
     return _s3_client
