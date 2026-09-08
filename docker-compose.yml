@@ -10,6 +10,9 @@ services:
     command: redis-server --save 60 1 --loglevel warning
 
   api_service:
+    build:
+      context: .
+      dockerfile: api_service/Dockerfile
     image: itzdineshyadav/data-analyzer:api
     container_name: data-analyzer-api
     restart: unless-stopped
@@ -27,6 +30,9 @@ services:
       - redis
 
   worker_service:
+    build:
+      context: .
+      dockerfile: worker_service/Dockerfile
     image: itzdineshyadav/data-analyzer:worker
     container_name: data-analyzer-worker
     restart: unless-stopped

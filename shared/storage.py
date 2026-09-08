@@ -12,6 +12,10 @@ def get_s3_client():
     global _s3_client
     if _s3_client is None:
         settings = get_settings()
+        print("AWS ACCESS KEY:", settings.get("AWS_ACCESS_KEY"))
+        print("AWS SECRET ACCESS KEY:", settings.get("AWS_ACCESS_SECRET"))
+        print("AWS REGION:", settings.get("AWS_REGION"))
+        print("AWS BUCKET:", settings.get("AWS_BUCKET"))
         _s3_client = boto3.client(
             "s3",
             aws_access_key_id=settings.get("AWS_ACCESS_KEY"),
@@ -23,7 +27,7 @@ def get_s3_client():
 
 
 def get_bucket_name() -> str:
-    return get_settings().get("AWS_BUCKET", "data-analyzer")
+    return get_settings().get("AWS_BUCKET", "agentlytics")
 
 
 def build_upload_key(workspace_id: str, file_id: str, filename: str) -> str:
@@ -38,10 +42,10 @@ def build_report_key(workspace_id: str, report_id: str, ext: str = "html") -> st
     return f"workspaces/{workspace_id}/reports/{report_id}.{ext.lstrip('.')}"
 
 
-def presign_put(key: str, content_type: str = "application/octet-stream", expires_in: int = 3600) -> str:
+def presign_put(key: str, expires_in: int = 3600) -> str:
     return get_s3_client().generate_presigned_url(
         "put_object",
-        Params={"Bucket": get_bucket_name(), "Key": key, "ContentType": content_type},
+        Params={"Bucket": get_bucket_name(), "Key": key},
         ExpiresIn=expires_in,
     )
 

@@ -5,6 +5,7 @@ from pymongo.errors import DuplicateKeyError
 from shared.job_timing import now_iso
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
+from shared.models.workspace import COLLECTION as WORKSPACES
 from shared.redis_client import get_arq_pool
 
 logger = logging.getLogger("shared.dummy_files")
@@ -73,6 +74,10 @@ async def ensure_dummy_files(db, workspace_id: str) -> None:
     if workspace_id == TEMPLATE_WORKSPACE_ID:
         return
 
+    ws_doc = await db[WORKSPACES].find_one({"_id": workspace_id}, {"has_uploaded_file": 1})
+    if ws_doc and ws_doc.get("has_uploaded_file"):
+        return
+
     existing = await db[FILES].count_documents({"workspace_id": workspace_id}, limit=1)
     if existing:
         return
@@ -81,3 +86,12 @@ async def ensure_dummy_files(db, workspace_id: str) -> None:
 
     pool = await get_arq_pool()
     await pool.enqueue_job("clone_dummy_files", workspace_id=workspace_id, requested_at=now_iso())
+
+
+async def mark_real_upload(db, workspace_id: str) -> None:
+    result = await db[WORKSPACES].update_one(
+        {"_id": workspace_id, "has_uploaded_file": {"$ne": True}},
+        {"$set": {"has_uploaded_file": True}},
+    )
+    if result.modified_count:
+        await db[FILES].delete_many({"workspace_id": workspace_id, "dummy": True})

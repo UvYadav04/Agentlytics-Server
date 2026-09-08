@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_owned_file, get_owned_workspace
 from shared.db import get_db
-from shared.dummy_files import ensure_dummy_files
+from shared.dummy_files import ensure_dummy_files, mark_real_upload
 from shared.job_timing import now_iso
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
@@ -48,6 +48,10 @@ class PresignResponse(BaseModel):
     file_id: str
     upload_url: str
     storage_key: str
+
+
+class FailRequest(BaseModel):
+    error: str | None = None
 
 
 def _out(f: File) -> FileOut:
@@ -107,7 +111,7 @@ async def presign_upload(
     )
     await get_db()[FILES].insert_one(file.to_mongo())
 
-    upload_url = presign_put(storage_key, content_type=body.content_type)
+    upload_url = presign_put(storage_key)
     return PresignResponse(file_id=file_id, upload_url=upload_url, storage_key=storage_key)
 
 
@@ -125,6 +129,9 @@ async def confirm_upload(file_id: str, user: User = Depends(get_current_user)):
     file.error = None
     logger.info("confirm_upload: file %s marked processing at +%.1fms",
                 file.id, (time.perf_counter() - t0) * 1000)
+
+    if not file.dummy:
+        await mark_real_upload(get_db(), file.workspace_id)
 
     pool = await get_arq_pool()
     job = await pool.enqueue_job("run_ingestion", file_id=file.id, requested_at=request_received_at)
@@ -152,6 +159,25 @@ async def cancel_upload(file_id: str, user: User = Depends(get_current_user)):
     return _out(file)
 
 
+@router.post("/files/{file_id}/fail", response_model=FileOut)
+async def fail_upload(file_id: str, body: FailRequest, user: User = Depends(get_current_user)):
+    file = await get_owned_file(file_id, user)
+    error_message = (body.error or "Upload failed")[:500]
+
+    await get_db()[FILES].update_one(
+        {"_id": file.id}, {"$set": {"status": "failed", "error": error_message}}
+    )
+    file.status = "failed"
+    file.error = error_message
+
+    try:
+        delete_object(file.storage_key)
+    except Exception:
+        pass
+
+    return _out(file)
+
+
 @router.get("/workspaces/{workspace_id}/files", response_model=list[FileOut])
 async def list_files(workspace_id: str, user: User = Depends(get_current_user)):
     await get_owned_workspace(workspace_id, user)
@@ -169,6 +195,8 @@ async def list_files(workspace_id: str, user: User = Depends(get_current_user)):
 @router.delete("/files/{file_id}")
 async def delete_file(file_id: str, user: User = Depends(get_current_user)):
     file = await get_owned_file(file_id, user)
+    if file.dummy:
+        raise HTTPException(status_code=400, detail="Sample files can't be deleted.")
 
     try:
         delete_object(file.storage_key)

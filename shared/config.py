@@ -27,9 +27,6 @@ class Settings:
         self._initialized = True
 
     def load_env(self):
-        # In production all services run in a single container and every variable is injected
-        # directly into the environment (no .env files shipped), so skip reading one there and
-        # rely on os.environ only.
         if not _is_production() and os.path.exists(self.env_path):
             try:
                 with open(self.env_path, 'r', encoding='utf-8') as f:

@@ -11,3 +11,4 @@ class Workspace(MongoModel):
     user_id: str
     name: str
     created_at: datetime = Field(default_factory=utcnow)
+    has_uploaded_file: bool = False
