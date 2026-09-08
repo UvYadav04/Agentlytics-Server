@@ -46,9 +46,9 @@ jobs:
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ secrets.LIGHTSAIL_HOST }}
           username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
+          key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
           script: |
-            cd /opt/data-analyzer/scripts
+            cd agentlytics/scripts
             ./deploy-server.sh
