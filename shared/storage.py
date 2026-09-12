@@ -12,7 +12,7 @@ def get_s3_client():
     global _s3_client
     if _s3_client is None:
         settings = get_settings()
-        region = settings.get("AWS_REGION") or "us-north-1"
+        region = settings.get("AWS_REGION") or "eu-north-1"
         _s3_client = boto3.client(
             "s3",
             aws_access_key_id=settings.get("AWS_ACCESS_KEY"),
