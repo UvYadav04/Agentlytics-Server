@@ -46,3 +46,6 @@ class File(MongoModel):
     # to ask questions about without uploading anything first. Never shown/used once the workspace
     # has at least one real (non-dummy) file - see list_files and _build_catalog.
     dummy: bool = False
+
+    source_url: Optional[str] = None
+    previous_storage_key: Optional[str] = None

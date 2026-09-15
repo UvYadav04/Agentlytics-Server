@@ -136,6 +136,23 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
             status_for_log = "skipped_cancelled"
             return
 
+        storage = ctx["storage"]
+        vector_store = ctx["vector_store"]
+
+        if file.output_ref or file.extracted_tables:
+            try:
+                old_chunks = await asyncio.to_thread(vector_store.get_by_filter, {"file_id": file.id})
+                old_chunk_ids = [c.chunk_id for c in old_chunks]
+                if old_chunk_ids:
+                    await asyncio.to_thread(vector_store.delete, old_chunk_ids)
+            except Exception:
+                logger.exception("run_ingestion: failed to clear old vector store entries for file %s", file.id)
+
+            if file.file_type in ("csv", "xlsx"):
+                _delete_parquet_output(storage, file.workspace_id, file.output_ref)
+            for table in file.extracted_tables or []:
+                _delete_parquet_output(storage, file.workspace_id, table.get("output_ref"))
+
         tmp_dir = tempfile.mkdtemp(prefix="ingest_")
         local_path = os.path.join(tmp_dir, file.filename)
         s3 = get_s3_client()
@@ -176,7 +193,7 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
                 status_for_log = "failed_too_large"
                 return
 
-            manager = IngestionManager(storage=ctx["storage"], vector_store=ctx["vector_store"])
+            manager = IngestionManager(storage=storage, vector_store=vector_store)
 
             progress_reporter = _make_progress_reporter(db, asyncio.get_running_loop(), file.id)
             result = await asyncio.to_thread(
@@ -218,14 +235,6 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
         await db[FILES].update_one({"_id": file.id}, {"$set": update})
         logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
         status_for_log = result.status
-        if not file.dummy:
-            try:
-                await asyncio.to_thread(delete_object, file.storage_key)
-                logger.info("run_ingestion: deleted raw upload from S3 for file %s (key=%s)",
-                            file.id, file.storage_key)
-            except Exception:
-                logger.exception("run_ingestion: failed to delete raw upload from S3 for file %s (key=%s)",
-                                  file.id, file.storage_key)
     except Exception as exc:
         # Belt-and-suspenders on top of ingest_file's own try/except (manager.py): anything else
         # unexpected in this function - IngestionManager construction, the "mark ready" update,

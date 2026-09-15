@@ -18,7 +18,6 @@ def get_s3_client():
             aws_access_key_id=settings.get("AWS_ACCESS_KEY"),
             aws_secret_access_key=settings.get("AWS_ACCESS_SECRET"),
             region_name=region,
-            endpoint_url=f"https://s3.{region}.amazonaws.com",
             config=BotoConfig(signature_version="s3v4"),
         )
     return _s3_client

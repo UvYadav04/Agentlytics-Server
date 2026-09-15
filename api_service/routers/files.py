@@ -13,7 +13,14 @@ from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
 from shared.models.user import User
 from shared.redis_client import get_arq_pool
-from shared.storage import build_upload_key, delete_object, new_file_id, presign_put
+from shared.storage import (
+    build_upload_key,
+    delete_object,
+    get_bucket_name,
+    get_s3_client,
+    new_file_id,
+    presign_put,
+)
 from shared.upload_limits import describe_limit, is_supported_upload_extension, max_size_bytes
 
 logger = logging.getLogger("api.files")
@@ -35,6 +42,7 @@ class FileOut(BaseModel):
     dummy: bool = False
     pages_done: int | None = None
     pages_total: int | None = None
+    source_url: str | None = None
 
 
 class PresignRequest(BaseModel):
@@ -42,6 +50,7 @@ class PresignRequest(BaseModel):
     content_type: str = "application/octet-stream"
     size_bytes: int | None = None
     batch_id: str | None = None
+    source_url: str | None = None
 
 
 class PresignResponse(BaseModel):
@@ -52,6 +61,17 @@ class PresignResponse(BaseModel):
 
 class FailRequest(BaseModel):
     error: str | None = None
+
+
+class ReplacePresignRequest(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+    size_bytes: int | None = None
+    source_url: str | None = None
+
+
+class PatchCsvRequest(BaseModel):
+    content: str
 
 
 def _out(f: File) -> FileOut:
@@ -69,7 +89,20 @@ def _out(f: File) -> FileOut:
         dummy=f.dummy,
         pages_done=f.pages_done,
         pages_total=f.pages_total,
+        source_url=f.source_url,
     )
+
+
+_INGESTION_RESET_FIELDS = {
+    "output_ref": None,
+    "schema_summary": None,
+    "row_count": None,
+    "page_count": None,
+    "columns": None,
+    "extracted_tables": [],
+    "pages_done": None,
+    "pages_total": None,
+}
 
 
 @router.post("/workspaces/{workspace_id}/files/presign", response_model=PresignResponse)
@@ -108,6 +141,7 @@ async def presign_upload(
         size_bytes=body.size_bytes,
         status="pending_upload",
         batch_id=body.batch_id,
+        source_url=body.source_url,
     )
     await get_db()[FILES].insert_one(file.to_mongo())
 
@@ -174,6 +208,109 @@ async def fail_upload(file_id: str, body: FailRequest, user: User = Depends(get_
         delete_object(file.storage_key)
     except Exception:
         pass
+
+    return _out(file)
+
+
+@router.post("/files/{file_id}/replace/presign", response_model=PresignResponse)
+async def replace_file_presign(
+    file_id: str, body: ReplacePresignRequest, user: User = Depends(get_current_user)
+):
+    file = await get_owned_file(file_id, user)
+    if file.dummy:
+        raise HTTPException(status_code=400, detail="Sample files can't be replaced.")
+
+    ext = os.path.splitext(body.filename)[1].lstrip(".").lower()
+    if not is_supported_upload_extension(ext):
+        raise HTTPException(
+            status_code=415,
+            detail=f".{ext} files aren't supported. CSV, XLSX, PDF, and TXT files can be uploaded.",
+        )
+
+    limit = max_size_bytes(ext)
+    if limit is not None and body.size_bytes is not None and body.size_bytes > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{describe_limit(ext)} - this file is "
+                f"{body.size_bytes / (1024 * 1024):.1f}MB."
+            ),
+        )
+
+    new_storage_key = build_upload_key(file.workspace_id, file.id, body.filename)
+    previous_storage_key = file.storage_key if file.storage_key != new_storage_key else None
+
+    update = {
+        "filename": body.filename,
+        "file_type": ext,
+        "storage_key": new_storage_key,
+        "size_bytes": body.size_bytes,
+        "status": "pending_upload",
+        "error": None,
+        "batch_id": None,
+        "previous_storage_key": previous_storage_key,
+    }
+    if body.source_url is not None:
+        update["source_url"] = body.source_url
+
+    await get_db()[FILES].update_one({"_id": file.id}, {"$set": update})
+
+    upload_url = presign_put(new_storage_key)
+    return PresignResponse(file_id=file.id, upload_url=upload_url, storage_key=new_storage_key)
+
+
+@router.post("/files/{file_id}/replace/confirm", response_model=FileOut)
+async def replace_file_confirm(file_id: str, user: User = Depends(get_current_user)):
+    file = await get_owned_file(file_id, user)
+    if file.dummy:
+        raise HTTPException(status_code=400, detail="Sample files can't be replaced.")
+
+    if file.previous_storage_key:
+        try:
+            delete_object(file.previous_storage_key)
+        except Exception:
+            pass
+
+    update = dict(_INGESTION_RESET_FIELDS)
+    update.update({"status": "processing", "error": None, "previous_storage_key": None})
+    await get_db()[FILES].update_one({"_id": file.id}, {"$set": update})
+    for key, value in update.items():
+        setattr(file, key, value)
+
+    pool = await get_arq_pool()
+    await pool.enqueue_job("run_ingestion", file_id=file.id, requested_at=now_iso())
+
+    return _out(file)
+
+
+@router.patch("/files/{file_id}/csv", response_model=FileOut)
+async def patch_csv_file(file_id: str, body: PatchCsvRequest, user: User = Depends(get_current_user)):
+    file = await get_owned_file(file_id, user)
+    if file.dummy:
+        raise HTTPException(status_code=400, detail="Sample files can't be edited.")
+    if file.file_type != "csv":
+        raise HTTPException(status_code=400, detail="Only CSV files can be edited directly.")
+
+    data = body.content.encode("utf-8")
+    limit = max_size_bytes("csv")
+    if limit is not None and len(data) > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{describe_limit('csv')} - this file is {len(data) / (1024 * 1024):.1f}MB.",
+        )
+
+    get_s3_client().put_object(
+        Bucket=get_bucket_name(), Key=file.storage_key, Body=data, ContentType="text/csv",
+    )
+
+    update = dict(_INGESTION_RESET_FIELDS)
+    update.update({"status": "processing", "error": None, "size_bytes": len(data)})
+    await get_db()[FILES].update_one({"_id": file.id}, {"$set": update})
+    for key, value in update.items():
+        setattr(file, key, value)
+
+    pool = await get_arq_pool()
+    await pool.enqueue_job("run_ingestion", file_id=file.id, requested_at=now_iso())
 
     return _out(file)
 
