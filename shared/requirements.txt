@@ -9,6 +9,9 @@ google-auth
 requests
 openai
 bcrypt
+cryptography
+psycopg[binary]>=3.1
+dnspython
 numpy
 
 onnxruntime

@@ -5,7 +5,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api_service.routers import auth, charts, chats, dashboards, feedback, files, reports, usage, workspaces
+from api_service.routers import (
+    auth, charts, chats, dashboards, databases, feedback, files, reports, usage, workspaces,
+)
 from shared import intent_router
 from shared.config import get_settings
 from shared.db import close_client, ensure_indexes, get_db
@@ -56,6 +58,7 @@ app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(dashboards.router, prefix=API_PREFIX)
 app.include_router(usage.router, prefix=API_PREFIX)
 app.include_router(feedback.router, prefix=API_PREFIX)
+app.include_router(databases.router, prefix=API_PREFIX)
 
 
 @app.get("/health")

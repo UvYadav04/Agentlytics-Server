@@ -8,6 +8,7 @@ from arq.worker import func as arq_func
 
 from worker_service import engine_bootstrap
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
+from worker_service.tasks.database_connections import purge_expired_database_credentials
 from worker_service.tasks.dummy_files import clone_dummy_files
 from worker_service.tasks.ingestion import run_ingestion
 from worker_service.tasks.investigation import run_investigation, update_chat_memory
@@ -125,6 +126,7 @@ class WorkerSettings:
     ]
     cron_jobs = [
         cron(reconcile_stuck_investigations, minute=set(range(0, 60, 5)), timeout=300),
+        cron(purge_expired_database_credentials, minute=set(range(0, 60, 15)), timeout=120),
     ]
     redis_settings = get_arq_redis_settings()
     on_startup = on_startup
