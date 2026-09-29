@@ -4,8 +4,9 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from worker_service import engine_bootstrap  # noqa: F401
 
@@ -44,20 +45,31 @@ from shared.models.message import Message
 from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.observability import get_langfuse_client, get_meter, get_tracer
-from shared.redis_client import get_redis, investigation_channel
+from shared.redis_client import get_redis, investigation_answer_key, investigation_channel
 from shared.storage import build_chart_key, build_report_key, get_bucket_name, get_s3_client, new_file_id
 
 _tracer = get_tracer("worker_service.investigation")
 _meter = get_meter("worker_service.investigation")
-# Business metric: investigation outcomes by route (tabular/document/orchestrator) and
-# outcome (completed/failed/cancelled) - the top-level counterpart to the per-job duration
-# histogram in shared/job_timing.py.
 _investigation_outcomes = _meter.create_counter(
     "investigation.outcomes", description="Investigations finished, keyed by route and outcome",
 )
 
 RECENT_TURNS_LIMIT = 5
 FILE_LIST_LIMIT = 30
+
+QUESTION_TIMEOUT_SECONDS = 300
+ANSWER_POLL_SECONDS = 2
+MAX_QUESTIONS_PER_INVESTIGATION = 3
+
+NO_ANSWER_REPLY = (
+    "The user did not answer in time. Continue with the most reasonable assumption and state "
+    "that assumption clearly in your answer. Do not ask this question again."
+)
+CANCELLED_REPLY = "The investigation was cancelled while waiting for the user's answer. Stop here."
+QUESTION_LIMIT_REPLY = (
+    "You have already asked the user the maximum number of questions for this request. Continue "
+    "with the most reasonable assumption and state it in your answer."
+)
 
 logger = logging.getLogger("worker.investigation")
 
@@ -85,9 +97,6 @@ async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> t
     t0 = time.perf_counter()
     docs = await db[FILES].find({"workspace_id": workspace_id, "status": "ready"}).to_list(length=None)
 
-    # Dummy (sample) files are only ever used as a fallback for a workspace with zero real
-    # ready files - the moment a real one exists, dummy entries are excluded from the catalog
-    # entirely rather than mixed in. See shared/dummy_files.py.
     real_docs = [d for d in docs if not d.get("dummy")]
     docs = real_docs or docs
 
@@ -164,6 +173,98 @@ async def _append_event(db, investigation_id: str, event_type: str, message: str
 async def _is_cancelled(db, investigation_id: str) -> bool:
     doc = await db[INVESTIGATIONS].find_one({"_id": investigation_id}, {"cancel_requested": 1})
     return bool(doc and doc.get("cancel_requested"))
+
+
+async def _wait_for_answer(redis, answer_key: str, question_id: str, expires_at: datetime, cancel_check):
+    while True:
+        if cancel_check is not None and await cancel_check():
+            return None, "cancelled"
+        remaining = (expires_at - _now()).total_seconds()
+        if remaining <= 0:
+            return None, "expired"
+        popped = await redis.blpop([answer_key], timeout=max(1, min(ANSWER_POLL_SECONDS, int(remaining))))
+        if not popped:
+            continue
+        try:
+            payload = json.loads(popped[1])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if payload.get("question_id") != question_id:
+            continue
+        answer = str(payload.get("answer") or "").strip()
+        if answer:
+            return answer, "answered"
+
+
+def _make_ask_user(db, investigation_id: str, cancel_check):
+    asked_count = 0
+
+    async def ask_user(question: str, options: list, asked_by: str) -> str:
+        nonlocal asked_count
+        if not question:
+            return "ask_user needs a non-empty question."
+        if asked_count >= MAX_QUESTIONS_PER_INVESTIGATION:
+            return QUESTION_LIMIT_REPLY
+        asked_count += 1
+
+        question_id = uuid.uuid4().hex[:12]
+        asked_at = _now()
+        expires_at = asked_at + timedelta(seconds=QUESTION_TIMEOUT_SECONDS)
+        pending = {
+            "question_id": question_id,
+            "question": question,
+            "options": options,
+            "asked_by": asked_by,
+            "asked_at": asked_at,
+            "expires_at": expires_at,
+        }
+        redis = get_redis()
+        answer_key = investigation_answer_key(investigation_id)
+        await redis.delete(answer_key)
+        await db[INVESTIGATIONS].update_one(
+            {"_id": investigation_id},
+            {"$set": {"pending_question": pending, "stage": "awaiting_input", "last_attempt_at": asked_at}},
+        )
+        await _append_event(db, investigation_id, "question", question, {
+            "question_id": question_id,
+            "options": options,
+            "asked_by": asked_by,
+            "expires_at": expires_at.isoformat(),
+            "timeout_seconds": QUESTION_TIMEOUT_SECONDS,
+        })
+        logger.info(
+            "investigation %s: %s asked question %s: %r", investigation_id, asked_by, question_id, question,
+        )
+
+        answer, outcome = await _wait_for_answer(redis, answer_key, question_id, expires_at, cancel_check)
+
+        resolved_at = _now()
+        await db[INVESTIGATIONS].update_one(
+            {"_id": investigation_id},
+            {
+                "$set": {"pending_question": None, "stage": "running", "last_attempt_at": resolved_at},
+                "$push": {"questions": {**pending, "answer": answer, "outcome": outcome, "resolved_at": resolved_at}},
+            },
+        )
+        try:
+            await redis.delete(answer_key)
+        except Exception:
+            logger.exception("failed to clear answer key for investigation %s", investigation_id)
+        logger.info("investigation %s: question %s resolved (%s)", investigation_id, question_id, outcome)
+
+        if outcome == "answered":
+            await _append_event(db, investigation_id, "question_answered", answer, {"question_id": question_id})
+            return f"The user answered: {answer}"
+        if outcome == "cancelled":
+            return CANCELLED_REPLY
+        await _append_event(
+            db, investigation_id, "question_expired",
+            "No answer received - continuing with the most reasonable assumption.",
+            {"question_id": question_id},
+        )
+        return NO_ANSWER_REPLY
+
+    return ask_user
 
 
 async def _set_stage(db, investigation_id: str, stage: str) -> None:
@@ -339,11 +440,6 @@ async def _persist_artifacts(
     bucket = get_bucket_name()
     chart_ids: list = []
     report_id = None
-    # Separate from report_id: generate_csv/generate_report can both produce a "report" kind
-    # artifact in the same investigation (e.g. a markdown report AND a CSV export), and a single
-    # report_id used to just get silently clobbered by whichever one persisted last - the other
-    # would still upload fine but nothing on the Message would ever point back to it. CSVs get
-    # their own list so every one of them stays reachable (see MessageList.tsx's CSV Files row).
     csv_file_ids: list = []
 
     for chart in chart_paths:
@@ -419,17 +515,9 @@ async def _persist_artifacts(
     return chart_ids, report_id, csv_file_ids
 
 
-# Same "hold a reference so it isn't GC'd mid-flight" pattern used by api_service/
-# light_investigation.py and chats.py's shadow-classification tasks. arq's worker runs one
-# persistent event loop across jobs (not one loop per job), so a task scheduled here keeps
-# running after run_investigation itself returns and the job is marked done - see
-# _schedule_finalize below.
 _background_tasks: set[asyncio.Task] = set()
 
 
-# Distinct from a legitimate `None` return (e.g. usage.increment_messages) - callers that need to
-# know whether the write actually happened (not just what it returned) check the result against
-# this sentinel rather than truthiness.
 _RETRY_FAILED = object()
 
 
@@ -462,11 +550,6 @@ async def _finalize_investigation_bookkeeping(
         description=f"investigation status update (investigation {investigation_id})",
     )
 
-    # usage_counted/chat_memory_enqueued let worker_service/tasks/reconciliation.py's sweep tell,
-    # for an investigation it finds stuck at status="running" with a Message already sitting on
-    # it, exactly which of these two already happened (e.g. this function got partway through
-    # before the worker died) so it never double-counts usage or double-enqueues the memory
-    # update when it backfills the rest.
     usage_result = await _with_retries(
         lambda: usage.increment_messages(user_id),
         description=f"usage increment (investigation {investigation_id})",
@@ -512,18 +595,6 @@ def _schedule_finalize(
 
 
 def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, kind: str) -> list | None:
-    """Files to hand a direct-routed Tabular/Document agent, or None if direct-routing isn't
-    safe here - the caller falls back to the full Orchestrator in that case, same as if route
-    had been None/"orchestrator" to begin with.
-
-    Only two cases count as safe:
-    - the user explicitly @-mentioned file_id(s) (SendMessageRequest.file_ids) that resolve to
-      at least one eligible file of the right kind, or
-    - the workspace has EXACTLY ONE eligible file, so there's nothing to disambiguate.
-
-    Anything else (zero eligible files, or more than one with no explicit mention) is NOT
-    direct-routed - guessing which file a request means is exactly the judgment call the
-    Orchestrator exists for, and this router makes no attempt to replace that judgment."""
     if kind == "tabular":
         eligible = [e for e in catalog.browsable() if is_tabular_output_ref(e.output_ref)]
     else:
@@ -545,7 +616,7 @@ def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, k
 async def _run_tabular_direct(
     catalog: FileCatalog, storage: LocalParquetStore, chat_id: str, sandbox_manager,
     workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
-    thread_context: dict | None = None, chart_capacity_checker=None, cancel_check=None,
+    thread_context: dict | None = None, chart_capacity_checker=None, cancel_check=None, ask_user=None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "tabular")
     if entries is None:
@@ -559,6 +630,7 @@ async def _run_tabular_direct(
     )
     findings = await agent.run(
         query, constraints={}, on_event=on_event, thread_context=thread_context, cancel_check=cancel_check,
+        ask_user=ask_user,
     )
     result_collector.add_tabular_findings(
         findings, "invoke_tabular_agent", [e.file_id for e in entries],
@@ -573,6 +645,7 @@ async def _run_tabular_direct(
 async def _run_document_direct(
     catalog: FileCatalog, vector_store, query: str, mentioned_file_ids: list, on_event,
     result_collector: FinalResultCollector, thread_context: dict | None = None, cancel_check=None,
+    ask_user=None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "document")
     if entries is None:
@@ -583,7 +656,7 @@ async def _run_document_direct(
     agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True)
     findings = await agent.run(
         query, constraints={}, on_event=on_event, metadata_brief=metadata_brief,
-        thread_context=thread_context, cancel_check=cancel_check,
+        thread_context=thread_context, cancel_check=cancel_check, ask_user=ask_user,
     )
     result_collector.add_document_findings(
         findings, "invoke_document_agent", [e.file_id for e in entries],
@@ -623,6 +696,8 @@ async def run_investigation(
 
     async def cancel_check() -> bool:
         return await _is_cancelled(db, investigation_id)
+
+    ask_user = _make_ask_user(db, investigation_id, cancel_check)
 
     await _set_stage(db, investigation_id, "building_catalog")
     storage = ctx["storage"]
@@ -698,7 +773,7 @@ async def run_investigation(
             result = await _run_tabular_direct(
                 catalog, storage, chat_id, sandbox_manager, workspace_id, query,
                 mentioned_file_ids, on_event, result_collector, ctx_thread_context,
-                chart_capacity_checker, cancel_check,
+                chart_capacity_checker, cancel_check, ask_user,
             )
             if result is None:
                 logger.info(
@@ -708,7 +783,7 @@ async def run_investigation(
         elif direct_route == "document":
             result = await _run_document_direct(
                 catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
-                ctx_thread_context, cancel_check,
+                ctx_thread_context, cancel_check, ask_user,
             )
             if result is None:
                 logger.info(
@@ -730,7 +805,7 @@ async def run_investigation(
             )
             result = await orchestrator.run(
                 query, workspace_id=workspace_id, thread_context=ctx_thread_context,
-                on_event=on_event, cancel_check=cancel_check,
+                on_event=on_event, cancel_check=cancel_check, ask_user=ask_user,
             )
         return result
 

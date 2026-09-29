@@ -28,12 +28,6 @@ async def _mark_failed(db, file: File, error: str) -> None:
 
 
 def _make_progress_reporter(db, loop, file_id: str):
-    """Returns a plain sync function safe to call from the worker thread ingestion actually runs
-    in (manager.ingest_file is dispatched via asyncio.to_thread - it's not on the event loop, so
-    it can't just `await` a motor call directly). Schedules the Mongo update back onto the main
-    event loop via run_coroutine_threadsafe and returns immediately - fire-and-forget, since a
-    dropped progress tick just means the client's next 3s poll shows a slightly stale number, not
-    a real problem worth blocking ingestion over."""
     async def _update(done: int, total: int) -> None:
         try:
             await db[FILES].update_one(
@@ -65,11 +59,6 @@ def _delete_parquet_output(storage, workspace_id: str, artifact_id: str | None) 
 
 
 async def _rollback_batch_siblings(ctx, db, file: File) -> list[str]:
-    """Called when `file` failed ingestion because the vector store rejected it for being too
-    large (IngestionResult.error_kind == "vector_store_size_exceeded"). Rolls back every OTHER
-    file from the same upload batch that already finished successfully - the user picked these
-    files together as one unit, so a partial batch (some indexed, one silently too big to fit)
-    is more confusing than starting the whole batch over."""
     if not file.batch_id:
         return []
 
@@ -160,9 +149,6 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
 
         try:
             if file.dummy:
-                # Ships as a static asset in the image (Server/analyzerEngine/sample_data/) -
-                # every workspace's dummy File doc points at the SAME shared sample content, so
-                # there's nothing to download from S3 for these, just a local copy.
                 sample_path = os.path.join(
                     engine_bootstrap.ENGINE_DIR, "sample_data", file.filename,
                 )
@@ -180,10 +166,6 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
                     status_for_log = "failed_download"
                     return
 
-            # Re-check the actual downloaded size against the same cap presign_upload enforces -
-            # that check only trusts whatever size_bytes the client reported at presign time, so
-            # this catches a client that lied (or, since size_bytes is optional, omitted it
-            # entirely and skipped the check altogether).
             limit = max_size_bytes(file.file_type)
             if limit is not None and os.path.getsize(local_path) > limit:
                 actual_mb = os.path.getsize(local_path) / (1024 * 1024)
@@ -236,11 +218,6 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
         logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
         status_for_log = result.status
     except Exception as exc:
-        # Belt-and-suspenders on top of ingest_file's own try/except (manager.py): anything else
-        # unexpected in this function - IngestionManager construction, the "mark ready" update,
-        # etc. - previously propagated straight out to arq uncaught, leaving the File stuck at
-        # status="processing" forever (arq would retry/eventually give up on the *job*, but
-        # nothing ever told the File doc itself). Always mark it failed instead.
         logger.exception("run_ingestion: unexpected failure for file %s", file_id)
         status_for_log = "failed_unexpected"
         if file is not None:

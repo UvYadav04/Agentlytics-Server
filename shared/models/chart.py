@@ -12,5 +12,5 @@ class Chart(MongoModel):
     workspace_id: str
     message_id: Optional[str] = None
     title: str = "Untitled chart"
-    storage_key: str  # R2 key for the generated chart HTML
+    storage_key: str
     created_at: datetime = Field(default_factory=utcnow)

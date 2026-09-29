@@ -62,10 +62,6 @@ def _send_sync(to_email: str, subject: str, html_body: str, text_body: str) -> N
 
 
 async def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> None:
-    """smtplib is blocking - the actual send runs in a worker thread (same asyncio.to_thread
-    pattern used elsewhere for blocking I/O, e.g. worker_service's sandbox_manager calls)
-    rather than stalling the event loop for however long the SMTP round trip takes. Never
-    raises - see module docstring."""
     try:
         await asyncio.to_thread(_send_sync, to_email, subject, html_body, text_body)
     except Exception:

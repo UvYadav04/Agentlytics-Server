@@ -1,32 +1,8 @@
-"""
-One-time seed script for the 3 sample files (dummy.csv, dummy.xlsx, dummy.pdf).
-
-Put the actual files at Server/analyzerEngine/sample_data/dummy.{csv,xlsx,pdf}, then run:
-
-    cd Server
-    python -m scripts.seed_dummy_template
-
-This is the ONLY place the real ingestion work happens - Docling/LlamaParse PDF parsing, table
-extraction, pandas parsing, embedding. It runs the 3 files through the exact same
-IngestionManager used for real user uploads, but writes the result under the reserved
-TEMPLATE_WORKSPACE_ID (not a real user workspace) and marks each File doc dummy=True.
-
-After this has been run once, every new workspace just gets a cheap COPY of this result - see
-worker_service/tasks/dummy_files.py's clone_dummy_files (parquet file copy + chunk re-upsert,
-no re-parsing). shared/dummy_files.py's ensure_dummy_files() also has a lazy fallback that
-enqueues this same ingestion via arq if a workspace ever needs the template before this script
-has been run - but running it up front (e.g. once per deploy) means the very first user never
-has to wait on it.
-
-Safe to re-run: uses upsert, so it's also how you refresh the sample files if you replace
-dummy.csv/xlsx/pdf on disk later - existing per-workspace clones aren't touched by this, only
-the template itself.
-"""
 import asyncio
 import logging
 import os
 
-from worker_service import engine_bootstrap  # noqa: F401  (sets up analyzerEngine's sys.path)
+from worker_service import engine_bootstrap  # noqa: F401
 
 from analyzerEngine.ingestion.manager import IngestionManager
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore

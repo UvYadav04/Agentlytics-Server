@@ -34,15 +34,13 @@ from shared.chat_summary import generate_chat_summary
 from api_service.light_investigation import schedule_light_response
 from shared.admin import is_admin_email
 from shared.job_timing import now_iso
-from shared.redis_client import get_arq_pool, get_redis, investigation_channel
+from shared.models.base import utcnow
+from shared.redis_client import get_arq_pool, get_redis, investigation_answer_key, investigation_channel
 from shared.storage import delete_object, presign_get
 
 logger = logging.getLogger("api.chats")
 shadow_logger = logging.getLogger("query_router.shadow")
 
-# Shadow-test only: classification never gates the real request, so it runs
-# fire-and-forget. Keep a reference to each task so it isn't garbage
-# collected mid-flight (a known asyncio footgun for "unawaited" tasks).
 _shadow_tasks: set[asyncio.Task] = set()
 
 
@@ -60,11 +58,6 @@ async def _shadow_classify_and_log(
     chat_id: str, message_id: str, user_id: str, query: str,
 ) -> None:
     try:
-        # Shadow test only, so this Mongo round-trip - previously done synchronously in
-        # send_message before the real work even started - happens here instead, off the
-        # request's critical path. Excludes the message we just inserted (by id, not a
-        # before/after ordering trick) so "does this chat have earlier turns" still means
-        # exactly what it always did, regardless of when this background task actually runs.
         has_prior_context = await get_db()[MESSAGES].count_documents(
             {"chat_id": chat_id, "_id": {"$ne": message_id}}
         ) > 0
@@ -92,24 +85,13 @@ async def _shadow_classify_and_log(
         )
         await get_db()[QUERY_SHADOW_LOGS].insert_one(log.to_mongo())
     except Exception:
-        # Shadow logging must never affect the real request path.
         shadow_logger.exception("shadow classification failed for message %s", message_id)
 
 
-# Same "hold a reference so it isn't GC'd mid-flight" pattern as _shadow_tasks above and
-# light_investigation.py's _tasks - titling runs entirely in this process now (no arq round
-# trip), fired once per chat right after its first message lands.
 _title_tasks: set[asyncio.Task] = set()
 
 
 def _schedule_chat_title(*, chat_id: str, query: str) -> None:
-    """Fire-and-forget - titles a brand-new chat off the request's critical path. Calls the same
-    kind of small, latency-sensitive DeepInfra call as api_service/light_investigation.py's light
-    path (shared/chat_title.generate_title is deliberately shaped the same way - see its
-    docstring), run in-process via asyncio.to_thread instead of round-tripping through arq: this
-    only ever needs to happen once, right after the first message, with no queue/retry semantics
-    worth the extra hop - generate_title() itself never raises and always returns a usable title
-    (falling back to a deterministic heuristic), so there's nothing here to retry."""
     task = asyncio.create_task(_generate_and_set_chat_title(chat_id, query))
     _title_tasks.add(task)
     task.add_done_callback(_title_tasks.discard)
@@ -117,8 +99,6 @@ def _schedule_chat_title(*, chat_id: str, query: str) -> None:
 
 async def _generate_and_set_chat_title(chat_id: str, query: str) -> None:
     try:
-        # generate_title() wraps a blocking `openai` SDK call - offloaded to a thread so it
-        # never stalls this process's event loop (same pattern as route_query_intent_fast below).
         result = await asyncio.to_thread(generate_title, query)
         update = await get_db()[CHATS].update_one(
             {"_id": chat_id, "title": DEFAULT_CHAT_TITLE},
@@ -130,23 +110,11 @@ async def _generate_and_set_chat_title(chat_id: str, query: str) -> None:
             result.latency_ms, result.error,
         )
     except Exception:
-        # Worst case the chat just keeps its default title - never worth surfacing to the user.
         logger.exception("chat title generation/update failed for chat_id=%s", chat_id)
 
 
 router = APIRouter(tags=["chats"])
 
-# route_query_intent_fast's own confidence gate (shared/intent_router.py's similarity_threshold/
-# margin_threshold) already decides embedding vs. none - nothing left to threshold here.
-# run_investigation applies a second, independent safety check on top of that (whether the file
-# selection is actually unambiguous for tabular/document routes - see its
-# _select_direct_route_files) before a route is actually allowed to skip the Orchestrator.
-#
-# Two cases skip the arq queue (and the Orchestrator) entirely, straight to
-# api_service/light_investigation.py's light-model path: the query classifies as "greeting", or
-# the workspace has zero ready files (nothing for Tabular/Document tools to act on regardless of
-# what the intent tier thinks the query is about - see send_message below for exactly how these
-# two are decided, and why "no files" is its own reason rather than being folded into "greeting").
 
 LIMIT_MESSAGE = (
     "You've used all 20 free messages. Upgrade for more, or check back once your plan resets."
@@ -193,16 +161,45 @@ class UpdateChatRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str
-    # File ids the user explicitly referenced via "@" in the client's message
-    # composer (see InputBar.tsx) - passed through to the worker job below.
     file_ids: list[str] = []
+    answer_to: str | None = None
 
 
 class SendMessageResponse(BaseModel):
-    message_id: str
+    message_id: str | None
     investigation_id: str | None
     limited: bool = False
     limit_message: str | None = None
+    answered_question: bool = False
+
+
+ANSWER_KEY_TTL_SECONDS = 900
+
+
+async def _deliver_pending_answer(chat_id: str, body: SendMessageRequest) -> str | None:
+    answer = body.content.strip()
+    if not answer:
+        return None
+    query = {
+        "chat_id": chat_id,
+        "status": "running",
+        "stage": "awaiting_input",
+        "pending_question.expires_at": {"$gt": utcnow()},
+    }
+    if body.answer_to:
+        query["pending_question.question_id"] = body.answer_to
+    doc = await get_db()[INVESTIGATIONS].find_one_and_update(
+        query, {"$set": {"stage": "answer_received"}}, projection={"_id": 1, "pending_question": 1},
+    )
+    if doc is None:
+        return None
+    investigation_id = doc["_id"]
+    question_id = (doc.get("pending_question") or {}).get("question_id")
+    redis = get_redis()
+    key = investigation_answer_key(investigation_id)
+    await redis.rpush(key, json.dumps({"question_id": question_id, "answer": answer}))
+    await redis.expire(key, ANSWER_KEY_TTL_SECONDS)
+    return investigation_id
 
 
 def _chat_out(c: Chat) -> ChatOut:
@@ -223,10 +220,6 @@ def _message_out(m: Message) -> MessageOut:
 async def create_chat(workspace_id: str, body: CreateChatRequest, user: User = Depends(get_current_user)):
     await get_owned_workspace(workspace_id, user)
 
-    # Free-tier checkpoint: at most 2 chats per user (lifetime, tracked on Usage.chats_created -
-    # see shared/usage.py). Checked before insert, same "check before the gated action starts"
-    # pattern as send_message's message-capacity check below. Bypassed entirely for admin emails
-    # (see shared/admin.py).
     if not await usage.has_chat_creation_capacity(user.id, email=user.email):
         raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, CHAT_LIMIT_MESSAGE)
 
@@ -256,17 +249,6 @@ async def rename_chat(chat_id: str, body: UpdateChatRequest, user: User = Depend
 
 @router.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str, user: User = Depends(get_current_user)):
-    """Deleting a chat cascades to everything it produced: its messages, the
-    investigations behind them, and the charts/reports those investigations
-    generated (all keyed by message_id, so they're never shared with another
-    chat - safe to hard-delete outright).
-
-    Files are the one exception: they're workspace-level (see shared/models/file.py -
-    no chat_id) and can be reused across chats via Chat.files_used/files_created,
-    so we only hard-delete the ones this chat touched that no *other* chat in
-    the same workspace still references. Otherwise deleting one chat could
-    silently pull a file out from under another chat's history.
-    """
     chat = await get_owned_chat(chat_id, user)
     db = get_db()
 
@@ -372,13 +354,6 @@ class ChatExportSummaryOut(BaseModel):
 
 @router.get("/chats/{chat_id}/export/summary", response_model=ChatExportSummaryOut)
 async def export_chat_summary(chat_id: str, user: User = Depends(get_current_user)):
-    """Backs the client's "Export chat" action: the chat's answers concatenated into one summary
-    (shared/chat_summary.py - no LLM call, the stored final_answers are already short and
-    distilled), plus every chart and CSV export produced along the way. Deliberately excludes
-    markdown reports (generate_report) - those stay a separate, explicit deliverable rather than
-    something bundled into every export. Computed on demand, not persisted - cheap enough (plain
-    string work plus a couple of Mongo lookups) that caching isn't worth the added lifecycle
-    complexity of a new artifact type yet."""
     chat = await get_owned_chat(chat_id, user)
     db = get_db()
 
@@ -464,6 +439,18 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
 
     chat = await get_owned_chat(chat_id, user)
 
+    answered_investigation_id = await _deliver_pending_answer(chat_id, body)
+    if answered_investigation_id is not None:
+        logger.info(
+            "send_message: delivered answer to investigation %s at +%.1fms (chat_id=%s)",
+            answered_investigation_id, (time.perf_counter() - t0) * 1000, chat_id,
+        )
+        return SendMessageResponse(
+            message_id=None, investigation_id=answered_investigation_id, answered_question=True,
+        )
+    if body.answer_to:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This question is no longer waiting for an answer.")
+
     chat_has_capacity, user_has_capacity = await asyncio.gather(
         usage.has_chat_message_capacity(chat_id, email=user.email),
         usage.has_message_capacity(user.id, email=user.email),
@@ -504,16 +491,6 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
 )
 
     
-    # "Is this the chat's first message" is decided the same way _shadow_classify_and_log
-    # decides "does this chat have prior context": count everything under chat_id EXCLUDING the
-    # message we're inserting right now, by its own already-known id. Excluding by id (rather
-    # than counting before the insert) is what lets this run inside the same gather as
-    # persist_task's insert below without a race - the count is correct regardless of whether
-    # that insert has landed yet by the time this query runs.
-    # Defensive/self-healing only - the primary, race-free seeding happens at workspace creation
-    # (workspaces.py's create_workspace) so sample files normally already exist and are "ready"
-    # well before a user's first message. This call is a cheap no-op in that case; it only does
-    # real work for a workspace that predates this feature or somehow ended up with zero files.
     route_result, files_doc, prior_message_count, _ = await asyncio.gather(
         asyncio.to_thread(route_query_intent_fast, body.content),
         db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),

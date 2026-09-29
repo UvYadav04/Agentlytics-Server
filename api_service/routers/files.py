@@ -184,7 +184,6 @@ async def cancel_upload(file_id: str, user: User = Depends(get_current_user)):
     await get_db()[FILES].update_one({"_id": file.id}, {"$set": {"status": "cancelled"}})
     file.status = "cancelled"   
 
-    # Best-effort cleanup of whatever was (partially) uploaded.
     try:
         delete_object(file.storage_key)
     except Exception:
@@ -322,8 +321,6 @@ async def list_files(workspace_id: str, user: User = Depends(get_current_user)):
     await ensure_dummy_files(db, workspace_id)
     cursor = db[FILES].find({"workspace_id": workspace_id}).sort("uploaded_at", 1)
     docs = await cursor.to_list(length=500)
-    # Dummy files are only ever shown as a fallback - the instant the workspace has a real
-    # (non-dummy) file, hide the samples entirely rather than listing both side by side.
     real_docs = [d for d in docs if not d.get("dummy")]
     docs = real_docs or docs
     return [_out(File.from_mongo(d)) for d in docs]
@@ -340,9 +337,6 @@ async def delete_file(file_id: str, user: User = Depends(get_current_user)):
     except Exception:
         pass
     if file.output_ref:
-        # Parquet output living in R2 under the engine's own key scheme -
-        # best-effort, ingestion R2 store is keyed the same as storage_key's
-        # bucket so delete_object works for it too.
         try:
             delete_object(file.output_ref)
         except Exception:

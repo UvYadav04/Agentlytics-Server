@@ -58,7 +58,4 @@ def log_job_finished(logger: logging.Logger, job_name: str, picked_up_at: dateti
         job_name, finished_at.isoformat(timespec="milliseconds"), status, duration_ms,
         ", " if id_str else "", id_str,
     )
-    # Every arq job (run_investigation, run_ingestion, update_chat_memory, refresh_dashboard,
-    # reconcile_stuck_investigations) calls this on completion, so this one histogram covers
-    # "worker execution duration" for the whole worker service without per-task instrumentation.
     _job_duration.record(duration_ms, {"job": job_name, "status": status})

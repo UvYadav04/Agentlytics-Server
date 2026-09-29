@@ -1,4 +1,3 @@
-
 import jwt
 from fastapi import Cookie, HTTPException, status
 
@@ -53,7 +52,6 @@ async def get_owned_file(file_id: str, user: User) -> File:
     file = File.from_mongo(doc)
     if file is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
-    # Ownership is transitive through the workspace.
     await get_owned_workspace(file.workspace_id, user)
     return file
 

@@ -33,6 +33,10 @@ def investigation_channel(investigation_id: str) -> str:
     return f"investigation:{investigation_id}"
 
 
+def investigation_answer_key(investigation_id: str) -> str:
+    return f"investigation:{investigation_id}:answer"
+
+
 async def _close(conn) -> None:
     closer = getattr(conn, "aclose", None) or getattr(conn, "close", None)
     if closer is not None:

@@ -77,7 +77,7 @@ def generate_light_reply(query: str, route: str, timeout: float = 20.0) -> Light
         if not content:
             error = "empty reply from model"
             content = None
-    except Exception as exc:  # noqa: BLE001 - caller decides whether to retry/fall back
+    except Exception as exc:  # noqa: BLE001
         error = str(exc)
 
     latency_ms = (time.perf_counter() - start) * 1000

@@ -79,15 +79,10 @@ class IntentResult:
     scores: list[float]
     latency_ms: float
     error: str | None = None
-    cached: bool = False  # True when top_label/top_score came from shared/semantic_cache.py
-    # instead of an actual DeepInfra call this time - purely informational (logging/debugging),
-    # every other field means the same thing either way.
+    cached: bool = False
 
 
 def _parse_reply(raw_text: str) -> tuple[str | None, float, str | None]:
-    """The model is told to return ONLY JSON, but instruct models still sometimes wrap it
-    in markdown fences or add a stray sentence - pull the first {...} block out rather than
-    assuming the whole reply is clean JSON, then validate the intent is one we know."""
     match = _JSON_BLOCK_RE.search(raw_text or "")
     if not match:
         return None, 0.0, f"no JSON object found in reply: {raw_text!r}"
@@ -165,7 +160,7 @@ def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
                     distance_threshold=_CACHE_DISTANCE_THRESHOLD, ttl=_CACHE_TTL_SECONDS,
                 )
         error = parse_error
-    except Exception as exc:  # noqa: BLE001 - test harness must never crash the request
+    except Exception as exc:  # noqa: BLE001
         error = str(exc)
 
     latency_ms = (time.perf_counter() - start) * 1000

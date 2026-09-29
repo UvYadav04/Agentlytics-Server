@@ -16,7 +16,7 @@ MAX_PASSWORD_BYTES = 72
 
 
 class TokenPayload(BaseModel):
-    sub: str  # user id
+    sub: str
     email: str
     exp: int
 

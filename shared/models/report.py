@@ -17,6 +17,6 @@ class Report(MongoModel):
     title: str = "Untitled report"
     status: ReportStatus = "generating"
     format: ReportFormat = "markdown"
-    storage_key: Optional[str] = None  # R2 key, set once status == "ready"
+    storage_key: Optional[str] = None
     error: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)

@@ -1,22 +1,3 @@
-"""Periodic safety net for investigations a worker died before finishing - see
-worker_service/tasks/investigation.py's run_investigation/_schedule_finalize docstrings for the
-two crash windows this covers:
-
-1. The worker died before producing any result at all (mid-orchestration). arq's own job lock
-   only expires after job_timeout (1800s in worker.py), so left alone this can leave a chat
-   looking stuck for up to 30 minutes before arq even considers the job abandoned - and even then
-   it only retries the exact same job, it doesn't notice anything is wrong on its own faster than
-   that.
-2. The worker died after run_investigation already inserted the Message and pushed "completed"
-   (the user got their answer) but before the fire-and-forget background bookkeeping
-   (_finalize_investigation_bookkeeping) finished. arq considers that job successfully done the
-   moment run_investigation returns, so nothing about arq's own retry machinery ever notices this
-   case - the Investigation is just permanently stuck at status="running", usage never gets
-   counted, and update_chat_memory never gets enqueued for that turn.
-
-Neither case self-heals without something checking Mongo state directly, which is what this does.
-Registered as an arq cron job (see worker.py) - not triggered by anything user-facing.
-"""
 import logging
 from datetime import timedelta
 
@@ -30,14 +11,8 @@ from worker_service.tasks.investigation import _RETRY_FAILED, _append_event, _no
 
 logger = logging.getLogger("worker.reconciliation")
 
-# How long an investigation can sit at status="running" with no progress before it's considered
-# stuck rather than just slow - generously above how long a normal investigation ever takes, to
-# avoid false positives on a legitimately long-running one.
 STUCK_THRESHOLD_MINUTES = 10
 
-# Investigations with no result at all get re-dispatched to a fresh run_investigation job at most
-# this many times before reconciliation gives up and fails them loudly instead of retrying a
-# systematically broken request (bad file, a bug) forever.
 MAX_AUTO_RETRIES = 1
 
 FAILURE_MESSAGE = (
@@ -77,8 +52,6 @@ async def reconcile_stuck_investigations(ctx) -> None:
 
 async def _reconcile_one(ctx, db, investigation: Investigation) -> None:
     if investigation.cancel_requested:
-        # Cancelled before the worker got far enough to see it and raise InvestigationCancelled
-        # itself - no need to retry or fail-with-a-message, just close it out as cancelled.
         await db[INVESTIGATIONS].update_one(
             {"_id": investigation.id, "status": "running"},
             {"$set": {"status": "cancelled", "stage": "cancelled", "completed_at": _now()}},
@@ -93,9 +66,6 @@ async def _reconcile_one(ctx, db, investigation: Investigation) -> None:
         return
 
     if investigation.retry_count >= MAX_AUTO_RETRIES or not investigation.user_id:
-        # No result ever got produced, and either we're out of retries or this investigation
-        # pre-dates user_id/file_ids/email being stored (nothing safe to retry with) - fail it
-        # rather than leaving it stuck forever or guessing at missing parameters.
         await _give_up(db, investigation)
         return
 
@@ -103,8 +73,6 @@ async def _reconcile_one(ctx, db, investigation: Investigation) -> None:
 
 
 async def _backfill_bookkeeping(ctx, db, investigation: Investigation, message_doc: dict) -> None:
-    """The user already has their answer (the Message exists) - this only ever repairs
-    bookkeeping a crashed worker didn't get to, never touches the Message/answer itself."""
     logger.warning(
         "reconcile_stuck_investigations: investigation %s has message %s but is still "
         "status=running - backfilling the bookkeeping a crashed worker didn't finish",
@@ -120,8 +88,6 @@ async def _backfill_bookkeeping(ctx, db, investigation: Investigation, message_d
         }},
     )
     if update.matched_count == 0:
-        # Lost the race to the original finalize task finishing late, or a concurrent sweep -
-        # whoever got there first already did this, nothing left to do.
         return
 
     if not investigation.usage_counted and investigation.user_id:

@@ -1,15 +1,3 @@
-"""Auto-titles a chat from its first message, the same way most chat products title a new
-thread - see worker_service/tasks/chat_title.py for the arq job that calls generate_title() and
-api_service/routers/chats.py's send_message for where that job gets enqueued (only when the
-message that just landed was the chat's first).
-
-Mirrors shared/light_response.py's DeepInfra call shape on purpose (same client construction,
-same "thinking disabled" extra_body, same settings-driven model/api-key lookup) - this is the
-same class of problem: a small, latency-sensitive LLM call that must never be allowed to break
-the caller. Unlike light_response, a bad/missing model call here isn't fatal to anything - it
-just means a slightly worse title - so generate_title() always returns *something* usable
-(never None/empty), falling back to a deterministic heuristic built from the query itself.
-"""
 from __future__ import annotations
 
 import logging
@@ -44,17 +32,15 @@ refusing or explaining that you can't."""
 @dataclass
 class ChatTitleResult:
     query: str
-    title: str  # always non-empty - see generate_title()
+    title: str
     model: str
     latency_ms: float
     error: str | None = None
-    fallback: bool = False  # True if `title` came from the heuristic, not the model
+    fallback: bool = False
 
 
 def _clean(text: str) -> str:
     text = text.strip()
-    # Strip one layer of surrounding quotes/backticks - models add these despite being told
-    # not to often enough that it's worth handling rather than shipping "\"Sales Trends\"".
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
         text = text[1:-1].strip()
     text = re.sub(r"\s+", " ", text)
@@ -64,13 +50,10 @@ def _clean(text: str) -> str:
 def _cap_length(title: str) -> str:
     if len(title) <= MAX_TITLE_CHARS:
         return title
-    # Truncate on a word boundary rather than mid-word.
     return title[:MAX_TITLE_CHARS].rsplit(" ", 1)[0].rstrip(" .!:;-")
 
 
 def _heuristic_title(query: str) -> str:
-    """Deterministic, dependency-free fallback so a chat is never left without SOME title, even
-    if DEEPINFRA_API_KEY isn't configured or the model call fails/times out/returns junk."""
     words = query.strip().split()
     title = _cap_length(_clean(" ".join(words[:FALLBACK_WORD_COUNT])))
     if not title:
@@ -99,8 +82,6 @@ def generate_title(query: str, timeout: float = 15.0) -> ChatTitleResult:
             model=model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                # Titling only needs the opening of a long message - capped so an unusually
-                # long first query doesn't blow up prompt size for zero benefit to the title.
                 {"role": "user", "content": query[:2000]},
             ],
             max_tokens=30,
@@ -111,7 +92,7 @@ def generate_title(query: str, timeout: float = 15.0) -> ChatTitleResult:
         title = _cap_length(_clean(raw))
         if not title:
             error = "empty/unusable title from model"
-    except Exception as exc:  # noqa: BLE001 - falls back to the heuristic below either way
+    except Exception as exc:  # noqa: BLE001
         error = str(exc)
 
     latency_ms = (time.perf_counter() - start) * 1000

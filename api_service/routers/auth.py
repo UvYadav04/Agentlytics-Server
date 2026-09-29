@@ -31,7 +31,6 @@ logger = logging.getLogger("api.auth")
 router = APIRouter(tags=["auth"])
 
 MIN_PASSWORD_LENGTH = 8
-# Deliberately generic - never reveal which half was wrong, or whether the email exists at all.
 INVALID_CREDENTIALS_MESSAGE = "Invalid email or password"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -100,9 +99,6 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    # Omit current_password when the account has no password yet (a Google-only account
-    # setting one for the first time) - see change_password below, which checks that against
-    # the real user record rather than trusting a flag in the request body.
     current_password: Optional[str] = None
     new_password: str
     confirm_new_password: str
@@ -145,9 +141,6 @@ def _cookie_max_age() -> int:
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
-    # secure=True in production (HTTPS) - set via env-driven flag if you also
-    # deploy dev over http. Left True here since prod is the deploy target
-    # in Phase 11; flip to settings-driven if you need local http testing.
     response.set_cookie(
         key=ACCESS_TOKEN_COOKIE_NAME,
         value=token,
@@ -174,11 +167,6 @@ async def google_login(body: GoogleLoginRequest, response: Response):
     try:
         profile = verify_google_id_token(body.id_token)
     except Exception as exc:
-        # The client only ever sees the generic 401 below (don't leak verifier
-        # internals) - but log the real reason, since "invalid token" collapses
-        # a handful of very different root causes (wrong/missing
-        # GOOGLE_CLIENT_ID, expired token, clock skew, wrong token type) into
-        # one message that's impossible to debug blind.
         logger.warning("Google ID token verification failed: %s", exc)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid Google token")
 
@@ -186,16 +174,11 @@ async def google_login(body: GoogleLoginRequest, response: Response):
     existing = await db[USERS].find_one({"google_id": profile.google_id})
 
     if existing is None:
-        # A password account may already own this email (signed up manually, then hits "Log in
-        # with Google" later) - link Google onto that SAME User doc instead of failing on the
-        # email unique index / silently creating a confusing second account for one person.
         existing_by_email = await db[USERS].find_one({"email": profile.email})
         if existing_by_email is not None:
             user = User.from_mongo(existing_by_email)
             user.google_id = profile.google_id
             user.picture = user.picture or profile.picture
-            # Google already verified this email before issuing the ID token we just checked -
-            # trust that even if the password-signup verification link was never clicked.
             user.email_verified = True
             await db[USERS].update_one(
                 {"_id": user.id},
@@ -207,7 +190,7 @@ async def google_login(body: GoogleLoginRequest, response: Response):
                 picture=profile.picture, email_verified=True,
             )
             await db[USERS].insert_one(user.to_mongo())
-            await _create_default_workspace(user.id)  # first login: create the default workspace
+            await _create_default_workspace(user.id)
     else:
         user = User.from_mongo(existing)
 
@@ -218,10 +201,6 @@ async def google_login(body: GoogleLoginRequest, response: Response):
 
 @router.post("/auth/signup", response_model=MessageOut)
 async def signup(body: SignupRequest):
-    """Creates the account but does NOT log the user in - see /auth/verify-email. Returns a
-    generic confirmation regardless of outcome details beyond the one real failure case (email
-    already registered) so the response never has to distinguish "email sent" from "email
-    delivery failed" (send_verification_email never raises - see shared/email.py)."""
     db = get_db()
 
     user = User(
@@ -241,10 +220,6 @@ async def signup(body: SignupRequest):
 
 @router.get("/auth/verify-email", response_model=MessageOut)
 async def verify_email(token: str):
-    """Idempotent by design: the token is never cleared once used (see User.
-    email_verification_token's docstring), so clicking the same link twice - or a user re-
-    opening an old email - looks the token up either way and just reports which state it's in,
-    rather than the second click erroring with "invalid token"."""
     db = get_db()
     doc = await db[USERS].find_one({"email_verification_token": token})
     if doc is None:
@@ -266,8 +241,6 @@ async def verify_email(token: str):
 
 @router.post("/auth/resend-verification", response_model=MessageOut)
 async def resend_verification(body: ResendVerificationRequest):
-    # Same generic response whether or not the account exists/is already verified - avoids
-    # leaking which emails are registered.
     generic = MessageOut(message="If that account exists and isn't verified yet, we've sent a new link.")
     db = get_db()
     doc = await db[USERS].find_one({"email": _normalize_email(body.email)})
@@ -309,8 +282,6 @@ async def login(body: LoginRequest, response: Response):
 
 @router.post("/auth/forgot-password", response_model=MessageOut)
 async def forgot_password(body: ForgotPasswordRequest):
-    # Same generic response regardless of whether the account exists - avoids leaking which
-    # emails are registered. The actual rotation only happens when a real account is found.
     generic = MessageOut(message="If that email is registered, we've sent a new password to it.")
     db = get_db()
     doc = await db[USERS].find_one({"email": _normalize_email(body.email)})
@@ -321,9 +292,6 @@ async def forgot_password(body: ForgotPasswordRequest):
     temporary_password = generate_temporary_password()
     await db[USERS].update_one(
         {"_id": user.id},
-        # Receiving this email proves ownership of the address either way (Google-linked or
-        # not) - mark it verified too, so a Google-only account that just gained a password
-        # this way isn't immediately blocked from using it by the /auth/login check above.
         {"$set": {"password_hash": hash_password(temporary_password), "email_verified": True}},
     )
     await send_temporary_password_email(user.email, user.name, temporary_password)
@@ -335,8 +303,6 @@ async def change_password(body: ChangePasswordRequest, user: User = Depends(get_
     if user.password_hash is not None:
         if not body.current_password or not verify_password(body.current_password, user.password_hash):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Current password is incorrect")
-    # else: Google-only account setting a password for the first time - nothing to check
-    # against yet.
 
     await get_db()[USERS].update_one(
         {"_id": user.id}, {"$set": {"password_hash": hash_password(body.new_password)}},

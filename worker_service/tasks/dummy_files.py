@@ -35,13 +35,6 @@ def _copy_parquet(storage, src_workspace_id: str, src_ref: str, dst_workspace_id
 
 
 async def clone_dummy_files(ctx, workspace_id: str, requested_at: str | None = None) -> None:
-    """The expensive part of the 3 sample files - Docling/LlamaParse PDF parsing, table
-    extraction, pandas parsing - already happened exactly once, into TEMPLATE_WORKSPACE_ID (see
-    shared/dummy_files.py's _ensure_template_ingested). Every other empty workspace just needs a
-    workspace-scoped COPY of that already-computed output: the parquet bytes on disk, and the
-    already-chunked text re-upserted into the vector store under new ids (embeddings are cheap to
-    recompute - that's not the part being optimized away here). No PDF parsing, no LLM calls, no
-    pandas - just file copies and a vector upsert, so this finishes in well under a second."""
     picked_up_at = log_job_picked_up(
         logger, ctx, "clone_dummy_files", requested_at=requested_at, workspace_id=workspace_id,
     )
@@ -58,9 +51,6 @@ async def clone_dummy_files(ctx, workspace_id: str, requested_at: str | None = N
             "workspace_id": TEMPLATE_WORKSPACE_ID, "status": "ready",
         }).to_list(length=len(DUMMY_FILES))
         if len(template_docs) < len(DUMMY_FILES):
-            # Template hasn't finished ingesting yet (or hasn't started) - nothing to clone yet.
-            # The next ensure_dummy_files call for this workspace (next list_files poll, next
-            # message) will enqueue another clone_dummy_files and pick it up once it's ready.
             logger.info(
                 "clone_dummy_files: template not ready yet (%d/%d files), will retry later",
                 len(template_docs), len(DUMMY_FILES),

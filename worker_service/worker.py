@@ -23,16 +23,10 @@ from shared.observability import get_meter, init_observability, start_prometheus
 from shared.redis_client import close_redis, get_arq_redis_settings, get_redis
 
 configure_logging("worker_service")
-# Must run before on_startup constructs Mongo/Redis clients (ctx["storage"]/ctx["vector_store"]
-# etc. below), so those get auto-instrumented - see shared/observability.py.
 init_observability("worker_service")
 
 logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
 
-# arq's default queue is a Redis sorted set at this key (see arq.constants.default_queue_name) -
-# polled in the background below rather than read inline in the observable gauge callback, since
-# OTel's async-instrument callbacks run synchronously on the SDK's export path and shouldn't do
-# their own network I/O.
 _ARQ_QUEUE_KEY = "arq:queue"
 _queue_size_cache = {"value": 0}
 
@@ -94,11 +88,6 @@ async def on_startup(ctx):
         )
         raise
 
-    # Bring the pool up to min_size *now*, before this worker starts pulling jobs off the
-    # queue - this is what actually eliminates first-request latency: previously each new
-    # chat paid full container-create/start on its first run_python call (fire-and-forget
-    # pre-warmed, but still awaited before the investigation could finish). With a shared
-    # warm pool there's no per-chat sandbox to create - jobs just acquire whatever's idle.
     warm_start = time.perf_counter()
     try:
         await asyncio.to_thread(sandbox_manager.warm_pool)
@@ -134,10 +123,6 @@ class WorkerSettings:
         clone_dummy_files,
         arq_func(update_chat_memory, max_tries=5),
     ]
-    # Sweeps for investigations stuck at status="running" (worker died mid-run, or died after
-    # sending the result but before finishing background bookkeeping) - see reconciliation.py's
-    # module docstring. Every 5 minutes against a 10-minute stuck threshold there, so nothing sits
-    # broken for more than ~15 minutes worst case.
     cron_jobs = [
         cron(reconcile_stuck_investigations, minute=set(range(0, 60, 5)), timeout=300),
     ]

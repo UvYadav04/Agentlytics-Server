@@ -128,10 +128,6 @@ async def delete_dashboard(dashboard_id: str, user: User = Depends(get_current_u
 
 @router.post("/dashboards/{dashboard_id}/refresh")
 async def refresh_dashboard(dashboard_id: str, user: User = Depends(get_current_user)):
-    """Re-run a real-time dashboard's stored script against its files' current data and
-    update its charts in place. Enqueues the same arq job the relink endpoint below triggers
-    automatically after swapping a data source - returns immediately, the dashboard's
-    last_refreshed_at updates once the worker job finishes (poll GET /dashboards/{id})."""
     request_received_at = now_iso()
     t0 = time.perf_counter()
     logger.info("refresh_dashboard route: request arrived at %s (dashboard_id=%s, user_id=%s)",
@@ -154,11 +150,6 @@ async def refresh_dashboard(dashboard_id: str, user: User = Depends(get_current_
 async def relink_dashboard_file(
     dashboard_id: str, body: RelinkFileRequest, user: User = Depends(get_current_user),
 ):
-    """Swap one of a real-time dashboard's data sources for a different file (the user
-    replaced/re-uploaded it under a new file_id - see the files router) and immediately
-    trigger a refresh so the dashboard picks up the new data. Deliberately does NOT delete
-    old_file_id itself - only this dashboard's reference to it moves, so a bad swap can be
-    undone and anything else still pointing at old_file_id is unaffected."""
     request_received_at = now_iso()
     t0 = time.perf_counter()
     logger.info("relink_dashboard_file: request arrived at %s (dashboard_id=%s, user_id=%s)",

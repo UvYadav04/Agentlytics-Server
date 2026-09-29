@@ -66,9 +66,6 @@ async def list_workspaces(user: User = Depends(get_current_user)):
 
 @router.post("", response_model=WorkspaceOut)
 async def create_workspace(body: CreateWorkspaceRequest, user: User = Depends(get_current_user)):
-    # Free-tier checkpoint: at most 2 workspaces per user (lifetime, tracked on
-    # Usage.workspaces_created - see shared/usage.py), checked before insert. Bypassed entirely
-    # for admin emails (see shared/admin.py).
     if not await usage.has_workspace_creation_capacity(user.id, email=user.email):
         raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, WORKSPACE_LIMIT_MESSAGE)
 
@@ -77,10 +74,6 @@ async def create_workspace(body: CreateWorkspaceRequest, user: User = Depends(ge
     if not is_admin_email(user.email):
         await usage.increment_workspaces(user.id)
 
-    # Eager, race-free path: by the time a user looks around and types their first message, the
-    # sample files below have had a real chance to finish ingesting. list_files/send_message also
-    # call this defensively (it's a no-op once any file exists), covering workspaces that predate
-    # this or somehow end up empty again later.
     await ensure_dummy_files(get_db(), workspace.id)
 
     return _out(workspace)
@@ -115,8 +108,6 @@ async def list_charts(workspace_id: str, user: User = Depends(get_current_user))
 @router.get("/{workspace_id}/reports", response_model=list[ReportSummaryOut])
 async def list_reports(workspace_id: str, user: User = Depends(get_current_user)):
     await get_owned_workspace(workspace_id, user)
-    # Only "ready" reports have a storage_key to presign - a still-generating or failed one has
-    # nothing to link to yet, and would just be a dead entry in the sidebar list.
     cursor = (
         get_db()[REPORTS]
         .find({"workspace_id": workspace_id, "status": "ready"})

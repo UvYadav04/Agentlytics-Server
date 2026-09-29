@@ -54,7 +54,7 @@ def normalize(text: str) -> str:
 class ClassificationResult:
     query: str
     normalized: str
-    tier: str  # "exact" | "fuzzy" | "hf" | "hf_unavailable" | "none"
+    tier: str
     intent: str | None
     score: float
     has_prior_context: bool
@@ -100,13 +100,13 @@ def _load_hf_model() -> None:
         _canned_embeddings = _hf_model.encode(phrases, convert_to_tensor=True)
         _hf_ready = True
         logger.info("query_router: HF model %s loaded (%d canned phrases)", model_name, len(phrases))
-    except Exception as exc:  # noqa: BLE001 - any load failure just disables tier 2
+    except Exception as exc:  # noqa: BLE001
         _hf_load_failed = True
         logger.warning("query_router: HF tier unavailable (%s)", exc)
 
 
 def _hf_match(text: str, threshold: float) -> tuple[str, float] | None:
-    from sentence_transformers import util  # only reached once load succeeded
+    from sentence_transformers import util
 
     query_emb = _hf_model.encode(text, convert_to_tensor=True)
     scores = util.cos_sim(query_emb, _canned_embeddings)[0]
@@ -144,7 +144,7 @@ def classify(query: str, has_prior_context: bool) -> ClassificationResult:
                         if match:
                             tier, (intent, score) = "hf", match
                         else:
-                            tier = "hf"  # ran, no confident match
+                            tier = "hf"
                     else:
                         tier = "hf_unavailable"
     except Exception as exc:  # noqa: BLE001

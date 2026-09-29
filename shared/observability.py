@@ -40,7 +40,6 @@ def _build_resource(service_name: str, settings):
 
     attributes = {"service.name": settings.get("OTEL_SERVICE_NAME") or service_name}
     raw_extra = settings.get("OTEL_RESOURCE_ATTRIBUTES") or os.environ.get("OTEL_RESOURCE_ATTRIBUTES")
-    # Standard OTel format: comma-separated key=value pairs, e.g. "deployment.environment=prod".
     for pair in (raw_extra or "").split(","):
         if "=" not in pair:
             continue

@@ -43,16 +43,8 @@ app.add_middleware(
     allow_headers=["*"],  
 )
 
-# Auto-instruments every request with OTel spans + request count/latency/error/active-request
-# metrics, exported via the OTLP pipeline set up in shared/observability.py. No-ops if
-# OTEL_EXPORTER_OTLP_ENDPOINT isn't set (init_observability skipped setup above).
 instrument_fastapi(app)
 
-# "/api" prefix matches the client's NEXT_PUBLIC_API_URL in production (e.g.
-# https://agentlytics.duckdns.org/api - see Client/.env), which is forwarded to this service
-# path-and-all by the reverse proxy rather than stripped. /health below is deliberately NOT under
-# this prefix - it's for container/EC2-level liveness checks hitting the service directly on its
-# own port, not traffic coming through the public reverse proxy.
 API_PREFIX = "/api"
 
 app.include_router(auth.router, prefix=API_PREFIX)
