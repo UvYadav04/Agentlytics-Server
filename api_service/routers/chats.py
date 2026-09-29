@@ -15,6 +15,7 @@ from shared.models.chart import Chart
 from shared.models.chat import COLLECTION as CHATS
 from shared.models.chat import DEFAULT_TITLE as DEFAULT_CHAT_TITLE
 from shared.models.chat import Chat
+from shared.models.database_connection import COLLECTION as DATABASE_CONNECTIONS
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
 from shared.models.investigation import COLLECTION as INVESTIGATIONS
@@ -146,6 +147,7 @@ class MessageOut(BaseModel):
     chart_ids: list[str]
     report_id: str | None
     csv_file_ids: list[str]
+    dashboard_ids: list[str]
     files_used: list[str]
     follow_up_questions: list[str]
     created_at: str
@@ -210,7 +212,7 @@ def _message_out(m: Message) -> MessageOut:
     return MessageOut(
         id=m.id, chat_id=m.chat_id, role=m.role, content=m.content,
         investigation_id=m.investigation_id, chart_ids=m.chart_ids, report_id=m.report_id,
-        csv_file_ids=m.csv_file_ids,
+        csv_file_ids=m.csv_file_ids, dashboard_ids=m.dashboard_ids,
         files_used=m.files_used, follow_up_questions=m.follow_up_questions,
         created_at=m.created_at.isoformat(),
     )
@@ -491,13 +493,16 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
 )
 
     
-    route_result, files_doc, prior_message_count, _ = await asyncio.gather(
+    route_result, files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
         asyncio.to_thread(route_query_intent_fast, body.content),
         db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
+        db[DATABASE_CONNECTIONS].find_one(
+            {"workspace_id": chat.workspace_id, "encrypted_connection_string": {"$ne": None}}, {"_id": 1},
+        ),
         db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
         ensure_dummy_files(db, chat.workspace_id),
     )
-    has_files = files_doc is not None
+    has_files = files_doc is not None or connection_doc is not None
     is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
     route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
 

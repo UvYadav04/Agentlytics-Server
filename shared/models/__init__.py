@@ -1,6 +1,7 @@
 from shared.models.chart import Chart
 from shared.models.chat import Chat
 from shared.models.dashboard import Dashboard
+from shared.models.dashboard_share import DashboardShare
 from shared.models.database_connection import DatabaseConnection
 from shared.models.feedback import Feedback
 from shared.models.file import File
@@ -15,6 +16,7 @@ __all__ = [
     "Chart",
     "Chat",
     "Dashboard",
+    "DashboardShare",
     "DatabaseConnection",
     "Feedback",
     "File",

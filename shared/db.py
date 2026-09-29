@@ -41,6 +41,8 @@ async def ensure_indexes() -> None:
     await db["usage"].create_index("user_id", unique=True)
     await db["database_connections"].create_index("workspace_id")
     await db["database_connections"].create_index("expires_at")
+    await db["dashboard_shares"].create_index("dashboard_id")
+    await db["dashboard_shares"].create_index("shared_to")
 
 
 async def close_client() -> None:

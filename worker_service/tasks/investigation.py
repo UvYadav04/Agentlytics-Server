@@ -36,7 +36,7 @@ from shared.models.chart import COLLECTION as CHARTS
 from shared.models.chart import Chart
 from shared.models.chat import COLLECTION as CHATS
 from shared.models.dashboard import COLLECTION as DASHBOARDS
-from shared.models.dashboard import ChartConfig, Dashboard
+from shared.models.dashboard import ChartAxis, ChartConfig, Dashboard, TimeWindow
 from shared.models.file import COLLECTION as FILES
 from shared.models.investigation import COLLECTION as INVESTIGATIONS
 from shared.models.investigation import InvestigationEvent
@@ -46,6 +46,7 @@ from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.observability import get_langfuse_client, get_meter, get_tracer
 from shared.redis_client import get_redis, investigation_answer_key, investigation_channel
+from worker_service.tasks.database_access import WorkspaceDatabaseAccess
 from shared.storage import build_chart_key, build_report_key, get_bucket_name, get_s3_client, new_file_id
 
 _tracer = get_tracer("worker_service.investigation")
@@ -432,15 +433,83 @@ async def _persist_dashboard_bundle(
     return chart_ids
 
 
+async def _persist_live_dashboard(
+    db, workspace_id: str, investigation_id: str, message_id: str, user_id: str, artifact: dict,
+    email: str | None = None,
+) -> str | None:
+    spec = artifact.get("spec") or {}
+    charts: list[ChartConfig] = []
+    for chart in spec.get("charts", []):
+        if not await usage.has_chart_capacity(user_id, email):
+            await _append_event(
+                db, investigation_id, "status",
+                "Chart limit reached - some live dashboard charts were not saved.",
+            )
+            break
+        value_columns = chart.get("value_columns") or []
+        charts.append(ChartConfig(
+            name=chart["title"],
+            title=chart["title"],
+            description=chart.get("description"),
+            chart_type=chart["chart_type"],
+            x_column=chart.get("x_column"),
+            label_column=chart.get("x_column"),
+            value_columns=value_columns,
+            value_column=value_columns[0] if len(value_columns) == 1 else None,
+            series_column=chart.get("series_column"),
+            aggregation=chart.get("aggregation"),
+            axis=ChartAxis(**(chart.get("axis") or {})),
+            labels=chart.get("labels") or {},
+            query=chart.get("query"),
+            validated_at=chart.get("validated_at"),
+        ))
+        await usage.increment_charts(user_id)
+    if not charts:
+        return None
+    now = datetime.now(timezone.utc)
+    window = spec.get("time_window")
+    dashboard = Dashboard(
+        workspace_id=workspace_id,
+        name=spec.get("title") or "Live dashboard",
+        description=spec.get("description"),
+        created_by=user_id,
+        created_at=now,
+        updated_at=now,
+        source=spec["db_type"],
+        connection_id=artifact.get("connection_id"),
+        database=spec.get("database"),
+        tables=spec.get("tables") or [],
+        time_window=TimeWindow(**window) if window else None,
+        message_id=message_id,
+        real_time=True,
+        charts=charts,
+    )
+    await db[DASHBOARDS].insert_one(dashboard.to_mongo())
+    return dashboard.id
+
+
 async def _persist_artifacts(
     db, workspace_id: str, investigation_id: str, message_id: str, user_id: str,
     chart_paths: list, artifacts: list, email: str | None = None,
-) -> tuple[list, str | None, list]:
+) -> tuple[list, str | None, list, list]:
     s3 = get_s3_client()
     bucket = get_bucket_name()
     chart_ids: list = []
     report_id = None
     csv_file_ids: list = []
+    dashboard_ids: list = []
+
+    for artifact in artifacts:
+        if artifact.get("type") != "live_dashboard":
+            continue
+        try:
+            dashboard_id = await _persist_live_dashboard(
+                db, workspace_id, investigation_id, message_id, user_id, artifact, email,
+            )
+            if dashboard_id:
+                dashboard_ids.append(dashboard_id)
+        except Exception:
+            logger.exception("failed to persist live dashboard %s", artifact.get("ref"))
 
     for chart in chart_paths:
         ref = chart.get("location")
@@ -512,7 +581,7 @@ async def _persist_artifacts(
         finally:
             shutil.rmtree(os.path.dirname(ref), ignore_errors=True)
 
-    return chart_ids, report_id, csv_file_ids
+    return chart_ids, report_id, csv_file_ids, dashboard_ids
 
 
 _background_tasks: set[asyncio.Task] = set()
@@ -712,7 +781,14 @@ async def run_investigation(
     vector_store = ctx["vector_store"]
     memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
 
-    direct_route = route if route in ("tabular", "document") else None
+    database_access = WorkspaceDatabaseAccess(db, workspace_id)
+    try:
+        database_connections = await database_access.summaries()
+    except Exception:
+        logger.exception("investigation %s: failed to load database connections", investigation_id)
+        database_connections = []
+
+    direct_route = route if route in ("tabular", "document") and not database_connections else None
 
     if skipped_files:
         await on_event({
@@ -801,11 +877,12 @@ async def run_investigation(
                 catalog, vector_store=vector_store, memory=memory, storage=storage,
                 reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
                 sandbox_manager=sandbox_manager, result_collector=result_collector,
-                chart_capacity_checker=chart_capacity_checker,
+                chart_capacity_checker=chart_capacity_checker, database_access=database_access,
             )
             result = await orchestrator.run(
                 query, workspace_id=workspace_id, thread_context=ctx_thread_context,
                 on_event=on_event, cancel_check=cancel_check, ask_user=ask_user,
+                database_connections=database_connections,
             )
         return result
 
@@ -869,9 +946,10 @@ async def run_investigation(
             chart_ids: list = []
             report_id = None
             csv_file_ids: list = []
+            dashboard_ids: list = []
             if result_collector.chart_paths or result_collector.artifacts:
                 try:
-                    chart_ids, report_id, csv_file_ids = await _persist_artifacts(
+                    chart_ids, report_id, csv_file_ids, dashboard_ids = await _persist_artifacts(
                         db, workspace_id, investigation_id, message.id, user_id,
                         result_collector.chart_paths, result_collector.artifacts, email,
                     )
@@ -880,13 +958,14 @@ async def run_investigation(
                         "investigation %s: failed to persist partial results after error",
                         investigation_id,
                     )
-                if chart_ids or report_id or csv_file_ids:
+                if chart_ids or report_id or csv_file_ids or dashboard_ids:
                     message.content += (
                         "\n\n_Some results were produced before this error - see below._"
                     )
             message.chart_ids = chart_ids
             message.report_id = report_id
             message.csv_file_ids = csv_file_ids
+            message.dashboard_ids = dashboard_ids
             message.files_used = result_collector.files_used
 
             _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "failed"})
@@ -906,18 +985,19 @@ async def run_investigation(
             chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
             follow_up_questions=result.follow_up_questions, files_used=result.files_used,
         )
-        chart_ids, report_id, csv_file_ids = await _persist_artifacts(
+        chart_ids, report_id, csv_file_ids, dashboard_ids = await _persist_artifacts(
             db, workspace_id, investigation_id, message.id, user_id,
             result.chart_paths, result.artifacts, email,
         )
         message.chart_ids = chart_ids
         message.report_id = report_id
         message.csv_file_ids = csv_file_ids
+        message.dashboard_ids = dashboard_ids
         await db[MESSAGES].insert_one(message.to_mongo())
         _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "completed"})
         await _append_event(
             db, investigation_id, "completed", "Investigation complete.",
-            {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id},
+            {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id, "dashboard_ids": dashboard_ids},
         )
         logger.info(
             "investigation %s: result sent (message %s, %d chart(s), report=%s, %d csv(s)); "

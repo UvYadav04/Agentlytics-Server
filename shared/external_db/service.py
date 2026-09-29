@@ -1,15 +1,17 @@
 import asyncio
 import logging
 
-from shared.external_db import mongodb, postgresql
+from shared.external_db import mongodb, postgresql, queries
 from shared.external_db.errors import ConnectionStringError, DatabaseInspectionError
 from shared.external_db.models import InspectionResult
 from shared.external_db.network import ensure_public_hosts
+from shared.external_db.time_window import ResolvedWindow
 from shared.external_db.uri import LABELS, ParsedConnection, parse_connection_string, scrub_secrets
 
 logger = logging.getLogger("shared.external_db")
 
 INSPECTION_TIMEOUT_SECONDS = 60
+QUERY_BATCH_TIMEOUT_SECONDS = 90
 
 _INSPECTORS = {"mongodb": mongodb.inspect, "postgresql": postgresql.inspect}
 
@@ -68,3 +70,33 @@ async def inspect_database(db_type: str, connection_string: str) -> tuple[Parsed
         )
         raise DatabaseInspectionError(friendly) from None
     return parsed, result
+
+
+def _run_queries(db_type: str, raw: str, database, query_list: list, window):
+    if db_type == "postgresql":
+        return queries.run_postgres_queries(raw, query_list, window)
+    return queries.run_mongo_queries(raw, database, query_list, window)
+
+
+async def run_dashboard_queries(
+    db_type: str, connection_string: str, database, query_list: list[dict], window: ResolvedWindow | None,
+) -> list:
+    parsed = parse_connection_string(db_type, connection_string)
+    await asyncio.to_thread(ensure_public_hosts, parsed)
+    raw = connection_string.strip()
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_run_queries, db_type, raw, database or parsed.database, query_list, window),
+            timeout=QUERY_BATCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise DatabaseInspectionError(f"{LABELS[db_type]} took too long to answer the dashboard queries.") from None
+    except (ConnectionStringError, DatabaseInspectionError):
+        raise
+    except Exception as exc:
+        friendly = _friendly_error(db_type, exc, raw, parsed)
+        logger.warning(
+            "dashboard queries failed: db_type=%s host=%s error_type=%s",
+            db_type, parsed.host_label, type(exc).__name__,
+        )
+        raise DatabaseInspectionError(friendly) from None
