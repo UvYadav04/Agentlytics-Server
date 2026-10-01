@@ -36,3 +36,7 @@ class File(MongoModel):
 
     source_url: Optional[str] = None
     previous_storage_key: Optional[str] = None
+    replace_backup: Optional[dict] = None
+    pending_cleanup: Optional[dict] = None
+    previous_columns: Optional[dict] = None
+    warning: Optional[str] = None

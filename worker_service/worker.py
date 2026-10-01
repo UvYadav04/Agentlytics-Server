@@ -10,7 +10,7 @@ from worker_service import engine_bootstrap
 from worker_service.tasks.dashboard_refresh import refresh_dashboard
 from worker_service.tasks.database_connections import purge_expired_database_credentials
 from worker_service.tasks.dummy_files import clone_dummy_files
-from worker_service.tasks.ingestion import run_ingestion
+from worker_service.tasks.ingestion import purge_file_artifacts, run_ingestion
 from worker_service.tasks.investigation import run_investigation, update_chat_memory
 from worker_service.tasks.reconciliation import reconcile_stuck_investigations
 
@@ -119,6 +119,7 @@ async def on_shutdown(ctx):
 class WorkerSettings:
     functions = [
         run_ingestion,
+        purge_file_artifacts,
         run_investigation,
         refresh_dashboard,
         clone_dummy_files,

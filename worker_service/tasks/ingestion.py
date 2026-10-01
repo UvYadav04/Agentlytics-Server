@@ -10,7 +10,8 @@ from analyzerEngine.ingestion.manager import IngestionManager
 from analyzerEngine.sandbox.path_resolver import InvalidArtifactIdError, get_parquet_path
 
 from shared.db import get_db
-from shared.job_timing import log_job_finished, log_job_picked_up
+from shared.job_timing import log_job_finished, log_job_picked_up, now_iso
+from shared.models.dashboard import COLLECTION as DASHBOARDS
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
 from shared.storage import delete_object, get_bucket_name, get_s3_client
@@ -56,6 +57,74 @@ def _delete_parquet_output(storage, workspace_id: str, artifact_id: str | None) 
         storage.delete(path)
     except Exception:
         logger.exception("rollback: failed to delete parquet output %s", path)
+
+
+async def _clear_vectors(vector_store, file_id: str) -> None:
+    try:
+        old_chunks = await asyncio.to_thread(vector_store.get_by_filter, {"file_id": file_id})
+        old_chunk_ids = [c.chunk_id for c in old_chunks]
+        if old_chunk_ids:
+            await asyncio.to_thread(vector_store.delete, old_chunk_ids)
+    except Exception:
+        logger.exception("failed to clear vector store entries for file %s", file_id)
+
+
+def _cleanup_targets(file: File) -> tuple[list[str], bool]:
+    pending = file.pending_cleanup or {}
+    refs = [file.output_ref, *(pending.get("output_refs") or [])]
+    refs += [t.get("output_ref") for t in (file.extracted_tables or [])]
+    refs += [t.get("output_ref") for t in (pending.get("extracted_tables") or [])]
+    has_previous = bool(file.output_ref or file.extracted_tables or pending)
+    return sorted({ref for ref in refs if ref and not ref.startswith("workspace_")}), has_previous
+
+
+def _schema_warning(previous: dict | None, file_id: str, columns: list | None, tables: list) -> str | None:
+    if not previous:
+        return None
+    current: dict = {}
+    if columns:
+        current[file_id] = [str(c) for c in columns]
+    for table in tables or []:
+        if table.get("file_id") and isinstance(table.get("columns"), list):
+            current[table["file_id"]] = [str(c) for c in table["columns"]]
+    missing_tables = [key for key in previous if key != file_id and key not in current]
+    missing_columns: list[str] = []
+    for key, old_columns in previous.items():
+        if key in current:
+            missing_columns += [c for c in old_columns if c not in set(current[key])]
+    parts = []
+    if missing_columns:
+        shown = ", ".join(sorted(set(missing_columns))[:8])
+        more = len(set(missing_columns)) - 8
+        parts.append(f"Columns no longer present: {shown}{f' (+{more} more)' if more > 0 else ''}.")
+    if missing_tables:
+        parts.append(f"{len(missing_tables)} table(s) from the previous version are gone.")
+    if not parts:
+        return None
+    return " ".join(parts) + " Charts and dashboards that used them may need updating."
+
+
+async def _refresh_dependent_dashboards(ctx, db, file_id: str) -> int:
+    docs = await db[DASHBOARDS].find(
+        {"real_time": True, "file_ids": file_id, "source": {"$nin": ["postgresql", "mongodb"]}},
+        {"_id": 1},
+    ).to_list(length=100)
+    for doc in docs:
+        try:
+            await ctx["redis"].enqueue_job("refresh_dashboard", dashboard_id=doc["_id"], requested_at=now_iso())
+        except Exception:
+            logger.exception("failed to enqueue dashboard refresh for %s after file %s changed", doc["_id"], file_id)
+    return len(docs)
+
+
+async def purge_file_artifacts(ctx, workspace_id: str, file_id: str, cleanup: dict | None = None) -> None:
+    cleanup = cleanup or {}
+    storage = ctx["storage"]
+    refs = [*(cleanup.get("output_refs") or []), *(t.get("output_ref") for t in cleanup.get("extracted_tables") or [])]
+    for ref in {r for r in refs if r}:
+        _delete_parquet_output(storage, workspace_id, ref)
+    await _clear_vectors(ctx["vector_store"], file_id)
+    logger.info("purge_file_artifacts: cleaned %d parquet output(s) and vectors for deleted file %s", len(refs), file_id)
 
 
 async def _rollback_batch_siblings(ctx, db, file: File) -> list[str]:
@@ -128,19 +197,16 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
         storage = ctx["storage"]
         vector_store = ctx["vector_store"]
 
-        if file.output_ref or file.extracted_tables:
-            try:
-                old_chunks = await asyncio.to_thread(vector_store.get_by_filter, {"file_id": file.id})
-                old_chunk_ids = [c.chunk_id for c in old_chunks]
-                if old_chunk_ids:
-                    await asyncio.to_thread(vector_store.delete, old_chunk_ids)
-            except Exception:
-                logger.exception("run_ingestion: failed to clear old vector store entries for file %s", file.id)
-
-            if file.file_type in ("csv", "xlsx"):
-                _delete_parquet_output(storage, file.workspace_id, file.output_ref)
-            for table in file.extracted_tables or []:
-                _delete_parquet_output(storage, file.workspace_id, table.get("output_ref"))
+        stale_refs, has_previous = _cleanup_targets(file)
+        if has_previous:
+            await _clear_vectors(vector_store, file.id)
+            for ref in stale_refs:
+                _delete_parquet_output(storage, file.workspace_id, ref)
+            await db[FILES].update_one({"_id": file.id}, {"$set": {"pending_cleanup": None}})
+            logger.info(
+                "run_ingestion: cleared previous outputs for file %s (%d parquet output(s))",
+                file.id, len(stale_refs),
+            )
 
         tmp_dir = tempfile.mkdtemp(prefix="ingest_")
         local_path = os.path.join(tmp_dir, file.filename)
@@ -213,10 +279,18 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
             "error": "; ".join(result.errors) if result.errors else None,
             "pages_done": None,
             "pages_total": None,
+            "warning": _schema_warning(
+                file.previous_columns, file.id, schema_summary.get("columns"), result.extracted_tables or [],
+            ),
+            "previous_columns": None,
         }
         await db[FILES].update_one({"_id": file.id}, {"$set": update})
         logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
         status_for_log = result.status
+        if has_previous:
+            refreshed = await _refresh_dependent_dashboards(ctx, db, file.id)
+            if refreshed:
+                logger.info("run_ingestion: queued refresh for %d dashboard(s) using file %s", refreshed, file.id)
     except Exception as exc:
         logger.exception("run_ingestion: unexpected failure for file %s", file_id)
         status_for_log = "failed_unexpected"
