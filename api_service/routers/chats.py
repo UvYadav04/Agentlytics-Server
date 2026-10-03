@@ -22,6 +22,14 @@ from shared.models.investigation import COLLECTION as INVESTIGATIONS
 from shared.models.investigation import Investigation
 from shared.models.message import COLLECTION as MESSAGES
 from shared.models.message import Message
+from shared.models.message_feedback import COLLECTION as MESSAGE_FEEDBACK
+from shared.models.message_feedback import (
+    FEEDBACK_REASONS,
+    MAX_COMMENT_LENGTH,
+    FeedbackRating,
+    MessageFeedback,
+)
+from shared.retry_modes import DEFAULT_RETRY_MODE, RetryMode
 from shared.models.query_shadow_log import COLLECTION as QUERY_SHADOW_LOGS
 from shared.models.query_shadow_log import QueryShadowLog
 from shared.models.report import COLLECTION as REPORTS
@@ -138,6 +146,13 @@ class ChatOut(BaseModel):
     created_at: str
 
 
+class MessageFeedbackOut(BaseModel):
+    rating: FeedbackRating | None
+    reasons: list[str]
+    comment: str | None
+    updated_at: str
+
+
 class MessageOut(BaseModel):
     id: str
     chat_id: str
@@ -150,6 +165,11 @@ class MessageOut(BaseModel):
     dashboard_ids: list[str]
     files_used: list[str]
     follow_up_questions: list[str]
+    reply_to: str | None = None
+    version: int = 1
+    retry_of: str | None = None
+    retry_mode: str | None = None
+    feedback: MessageFeedbackOut | None = None
     created_at: str
 
 
@@ -167,6 +187,23 @@ class SendMessageRequest(BaseModel):
     answer_to: str | None = None
 
 
+class RetryMessageRequest(BaseModel):
+    mode: RetryMode = DEFAULT_RETRY_MODE
+
+
+class RetryMessageResponse(BaseModel):
+    investigation_id: str | None
+    message_id: str
+    limited: bool = False
+    limit_message: str | None = None
+
+
+class MessageFeedbackRequest(BaseModel):
+    rating: FeedbackRating | None = None
+    reasons: list[str] = []
+    comment: str | None = None
+
+
 class SendMessageResponse(BaseModel):
     message_id: str | None
     investigation_id: str | None
@@ -176,6 +213,8 @@ class SendMessageResponse(BaseModel):
 
 
 ANSWER_KEY_TTL_SECONDS = 900
+
+RETRY_LOCK_SECONDS = 15
 
 
 async def _deliver_pending_answer(chat_id: str, body: SendMessageRequest) -> str | None:
@@ -208,13 +247,23 @@ def _chat_out(c: Chat) -> ChatOut:
     return ChatOut(id=c.id, workspace_id=c.workspace_id, title=c.title, created_at=c.created_at.isoformat())
 
 
-def _message_out(m: Message) -> MessageOut:
+def _feedback_out(feedback: MessageFeedback | None) -> MessageFeedbackOut | None:
+    if feedback is None:
+        return None
+    return MessageFeedbackOut(
+        rating=feedback.rating, reasons=feedback.reasons, comment=feedback.comment,
+        updated_at=feedback.updated_at.isoformat(),
+    )
+
+
+def _message_out(m: Message, feedback: MessageFeedback | None = None) -> MessageOut:
     return MessageOut(
         id=m.id, chat_id=m.chat_id, role=m.role, content=m.content,
         investigation_id=m.investigation_id, chart_ids=m.chart_ids, report_id=m.report_id,
         csv_file_ids=m.csv_file_ids, dashboard_ids=m.dashboard_ids,
         files_used=m.files_used, follow_up_questions=m.follow_up_questions,
-        created_at=m.created_at.isoformat(),
+        reply_to=m.reply_to, version=m.version, retry_of=m.retry_of, retry_mode=m.retry_mode,
+        feedback=_feedback_out(feedback), created_at=m.created_at.isoformat(),
     )
 
 
@@ -319,6 +368,7 @@ async def delete_chat(chat_id: str, user: User = Depends(get_current_user)):
 
     await db[INVESTIGATIONS].delete_many({"chat_id": chat_id})
     await db[QUERY_SHADOW_LOGS].delete_many({"chat_id": chat_id})
+    await db[MESSAGE_FEEDBACK].delete_many({"chat_id": chat_id})
     await db[MESSAGES].delete_many({"chat_id": chat_id})
     await db[CHATS].delete_one({"_id": chat.id})
 
@@ -328,9 +378,18 @@ async def delete_chat(chat_id: str, user: User = Depends(get_current_user)):
 @router.get("/chats/{chat_id}/messages", response_model=list[MessageOut])
 async def list_messages(chat_id: str, user: User = Depends(get_current_user)):
     await get_owned_chat(chat_id, user)
-    cursor = get_db()[MESSAGES].find({"chat_id": chat_id}).sort("created_at", 1)
+    db = get_db()
+    cursor = db[MESSAGES].find({"chat_id": chat_id, "superseded_by": None}).sort("created_at", 1)
     docs = await cursor.to_list(length=2000)
-    return [_message_out(Message.from_mongo(d)) for d in docs]
+    messages = [Message.from_mongo(d) for d in docs]
+    assistant_ids = [m.id for m in messages if m.role == "assistant"]
+    feedback_by_message: dict[str, MessageFeedback] = {}
+    if assistant_ids:
+        feedback_docs = await db[MESSAGE_FEEDBACK].find(
+            {"message_id": {"$in": assistant_ids}, "user_id": user.id},
+        ).to_list(length=len(assistant_ids))
+        feedback_by_message = {d["message_id"]: MessageFeedback.from_mongo(d) for d in feedback_docs}
+    return [_message_out(m, feedback_by_message.get(m.id)) for m in messages]
 
 
 class ChatExportChartOut(BaseModel):
@@ -359,7 +418,7 @@ async def export_chat_summary(chat_id: str, user: User = Depends(get_current_use
     chat = await get_owned_chat(chat_id, user)
     db = get_db()
 
-    cursor = db[MESSAGES].find({"chat_id": chat_id}).sort("created_at", 1)
+    cursor = db[MESSAGES].find({"chat_id": chat_id, "superseded_by": None}).sort("created_at", 1)
     docs = await cursor.to_list(length=2000)
 
     turns: list[tuple[str, str]] = []
@@ -484,7 +543,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     message = Message(chat_id=chat_id, role="user", content=body.content)
     investigation = Investigation(
         chat_id=chat_id, workspace_id=chat.workspace_id, objective=body.content,
-        user_id=user.id, file_ids=body.file_ids or [], email=user.email,
+        user_id=user.id, file_ids=body.file_ids or [], email=user.email, reply_to=message.id,
     )
     db = get_db()
     persist_task = asyncio.gather(
@@ -537,6 +596,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
             investigation_id=investigation.id, chat_id=chat_id, workspace_id=chat.workspace_id,
             user_id=user.id, query=body.content, route=light_route,
             requested_at=request_received_at, file_ids=body.file_ids, email=user.email,
+            reply_to=message.id,
         )
         logger.info(
             "send_message: investigation %s dispatched to light-response path (%s) at +%.1fms "
@@ -626,3 +686,144 @@ async def cancel_investigation(investigation_id: str, user: User = Depends(get_c
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Investigation is not running")
     await get_db()[INVESTIGATIONS].update_one({"_id": investigation.id}, {"$set": {"cancel_requested": True}})
     return {"ok": True}
+
+
+async def _owned_assistant_message(message_id: str, user: User) -> tuple[Message, Chat]:
+    doc = await get_db()[MESSAGES].find_one({"_id": message_id})
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Message not found")
+    message = Message.from_mongo(doc)
+    chat = await get_owned_chat(message.chat_id, user)
+    if message.role != "assistant":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only assistant answers can be retried or rated.")
+    return message, chat
+
+
+async def _question_for(db, message: Message) -> Message | None:
+    if message.reply_to:
+        doc = await db[MESSAGES].find_one({"_id": message.reply_to, "role": "user"})
+        if doc is not None:
+            return Message.from_mongo(doc)
+    doc = await db[MESSAGES].find_one(
+        {
+            "chat_id": message.chat_id, "role": "user", "superseded_by": None,
+            "created_at": {"$lt": message.created_at},
+        },
+        sort=[("created_at", -1)],
+    )
+    return Message.from_mongo(doc) if doc is not None else None
+
+
+@router.post("/messages/{message_id}/retry", response_model=RetryMessageResponse)
+async def retry_message(message_id: str, body: RetryMessageRequest, user: User = Depends(get_current_user)):
+    request_received_at = now_iso()
+    message, chat = await _owned_assistant_message(message_id, user)
+    db = get_db()
+
+    if message.superseded_by:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This answer has already been regenerated.")
+
+    latest = await db[MESSAGES].find_one(
+        {"chat_id": message.chat_id, "superseded_by": None}, {"_id": 1}, sort=[("created_at", -1)],
+    )
+    if latest is None or latest["_id"] != message.id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Only the latest answer in a chat can be retried.")
+
+    lock_acquired = await get_redis().set(
+        f"message-retry-lock:{message.id}", "1", nx=True, ex=RETRY_LOCK_SECONDS,
+    )
+    if not lock_acquired:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This answer is already being regenerated.")
+
+    running = await db[INVESTIGATIONS].find_one({"chat_id": message.chat_id, "status": "running"}, {"_id": 1})
+    if running is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Wait for the current answer to finish before retrying.")
+
+    question = await _question_for(db, message)
+    if question is None or not question.content.strip():
+        raise HTTPException(status.HTTP_409_CONFLICT, "Couldn't find the question this answer belongs to.")
+
+    if not await usage.has_message_capacity(user.id, email=user.email):
+        return RetryMessageResponse(
+            investigation_id=None, message_id=message.id, limited=True, limit_message=LIMIT_MESSAGE,
+        )
+
+    file_ids: list[str] = []
+    if message.investigation_id:
+        original = await db[INVESTIGATIONS].find_one({"_id": message.investigation_id}, {"file_ids": 1})
+        file_ids = (original or {}).get("file_ids") or []
+
+    investigation = Investigation(
+        chat_id=chat.id, workspace_id=chat.workspace_id, objective=question.content,
+        user_id=user.id, file_ids=file_ids, email=user.email, reply_to=question.id,
+        retry_of_message_id=message.id, retry_mode=body.mode,
+    )
+    await db[INVESTIGATIONS].insert_one(investigation.to_mongo())
+
+    route_result = await asyncio.to_thread(route_query_intent_fast, question.content)
+    route = route_result.intent if route_result.intent in ("tabular", "document") else None
+
+    pool = await get_arq_pool()
+    await pool.enqueue_job(
+        "run_investigation",
+        investigation_id=investigation.id,
+        chat_id=chat.id,
+        workspace_id=chat.workspace_id,
+        user_id=user.id,
+        email=user.email,
+        query=question.content,
+        file_ids=file_ids,
+        requested_at=request_received_at,
+        route=route,
+    )
+    logger.info(
+        "retry_message: message %s regenerating as investigation %s (mode=%s, route=%s, chat_id=%s)",
+        message.id, investigation.id, body.mode, route or "orchestrator", chat.id,
+    )
+    return RetryMessageResponse(investigation_id=investigation.id, message_id=message.id)
+
+
+@router.put("/messages/{message_id}/feedback", response_model=MessageFeedbackOut | None)
+async def set_message_feedback(
+    message_id: str, body: MessageFeedbackRequest, user: User = Depends(get_current_user),
+):
+    message, chat = await _owned_assistant_message(message_id, user)
+
+    reasons = list(dict.fromkeys(r for r in body.reasons if r))
+    unknown = [r for r in reasons if r not in FEEDBACK_REASONS]
+    if unknown:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown feedback reason: {unknown[0]}")
+    comment = (body.comment or "").strip() or None
+    if comment and len(comment) > MAX_COMMENT_LENGTH:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"Feedback can be at most {MAX_COMMENT_LENGTH} characters.",
+        )
+
+    db = get_db()
+    if body.rating is None and not reasons and not comment:
+        await db[MESSAGE_FEEDBACK].delete_one({"message_id": message.id, "user_id": user.id})
+        return None
+
+    now = utcnow()
+    existing = await db[MESSAGE_FEEDBACK].find_one({"message_id": message.id, "user_id": user.id})
+    feedback = MessageFeedback(
+        message_id=message.id, chat_id=chat.id, workspace_id=chat.workspace_id, user_id=user.id,
+        investigation_id=message.investigation_id, reply_to=message.reply_to,
+        message_version=message.version, retry_mode=message.retry_mode,
+        rating=body.rating, reasons=reasons, comment=comment,
+        created_at=existing["created_at"] if existing else now, updated_at=now,
+    )
+    if existing:
+        feedback.id = existing["_id"]
+    payload = feedback.to_mongo()
+    payload.pop("_id", None)
+    await db[MESSAGE_FEEDBACK].update_one(
+        {"message_id": message.id, "user_id": user.id},
+        {"$set": payload, "$setOnInsert": {"_id": feedback.id}},
+        upsert=True,
+    )
+    logger.info(
+        "message_feedback: message=%s rating=%s reasons=%s has_comment=%s",
+        message.id, feedback.rating, ",".join(reasons) or "-", bool(comment),
+    )
+    return _feedback_out(feedback)

@@ -26,9 +26,13 @@ _tasks: set[asyncio.Task] = set()
 def schedule_light_response(
     *, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str, route: str,
     requested_at: str | None = None, file_ids: list[str] | None = None, email: str | None = None,
+    reply_to: str | None = None,
 ) -> None:
     task = asyncio.create_task(
-        _run(investigation_id, chat_id, workspace_id, user_id, query, route, requested_at, file_ids or [], email)
+        _run(
+            investigation_id, chat_id, workspace_id, user_id, query, route, requested_at, file_ids or [], email,
+            reply_to,
+        )
     )
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
@@ -65,6 +69,7 @@ async def _fallback_to_orchestrator(
 async def _run(
     investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str, route: str,
     requested_at: str | None, file_ids: list[str], email: str | None = None,
+    reply_to: str | None = None,
 ) -> None:
     db = get_db()
     result = None
@@ -88,6 +93,7 @@ async def _run(
 
         message = Message(
             chat_id=chat_id, role="assistant", content=result.content, investigation_id=investigation_id,
+            reply_to=reply_to,
         )
         await db[MESSAGES].insert_one(message.to_mongo())
         await db[INVESTIGATIONS].update_one(
@@ -112,7 +118,7 @@ async def _run(
         await pool.enqueue_job(
             "update_chat_memory",
             chat_id=chat_id, user_id=user_id, query=query, response=result.content,
-            files_used=[], files_created=[], requested_at=requested_at,
+            files_used=[], files_created=[], requested_at=requested_at, message_id=message.id,
         )
     except Exception:
         logger.exception(

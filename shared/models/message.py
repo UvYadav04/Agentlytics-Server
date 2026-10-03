@@ -19,4 +19,10 @@ class Message(MongoModel):
     dashboard_ids: list[str] = Field(default_factory=list)
     files_used: list[str] = Field(default_factory=list)
     follow_up_questions: list[str] = Field(default_factory=list)
+    reply_to: Optional[str] = None
+    version: int = 1
+    retry_of: Optional[str] = None
+    retry_mode: Optional[str] = None
+    superseded_by: Optional[str] = None
+    superseded_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)

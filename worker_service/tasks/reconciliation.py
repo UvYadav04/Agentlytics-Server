@@ -90,6 +90,12 @@ async def _backfill_bookkeeping(ctx, db, investigation: Investigation, message_d
     if update.matched_count == 0:
         return
 
+    if investigation.retry_of_message_id:
+        await db[MESSAGES].update_one(
+            {"_id": investigation.retry_of_message_id, "superseded_by": None},
+            {"$set": {"superseded_by": message_doc["_id"], "superseded_at": _now()}},
+        )
+
     if not investigation.usage_counted and investigation.user_id:
         result = await _with_retries(
             lambda: usage.increment_messages(investigation.user_id),
@@ -106,7 +112,8 @@ async def _backfill_bookkeeping(ctx, db, investigation: Investigation, message_d
                 "update_chat_memory",
                 chat_id=investigation.chat_id, user_id=investigation.user_id,
                 query=investigation.objective, response=final_answer,
-                files_used=[], files_created=[],
+                files_used=[], files_created=[], message_id=message_doc["_id"],
+                supersedes=investigation.retry_of_message_id,
             ),
             description=f"reconciliation chat memory enqueue (investigation {investigation.id})",
         )

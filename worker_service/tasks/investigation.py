@@ -46,6 +46,7 @@ from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.observability import get_langfuse_client, get_meter, get_tracer
 from shared.redis_client import get_redis, investigation_answer_key, investigation_channel
+from shared.retry_modes import ORCHESTRATOR_ONLY_MODES, retry_constraints
 from worker_service.tasks.database_access import WorkspaceDatabaseAccess
 from shared.storage import build_chart_key, build_report_key, get_bucket_name, get_s3_client, new_file_id
 
@@ -304,6 +305,40 @@ async def _thread_context(db, chat_id: str) -> dict:
     }
 
 
+def _without_turn(thread_context: dict, message_id: str | None, query: str) -> dict:
+    if not message_id:
+        return thread_context
+    turns = list(thread_context.get("recent_turns", []))
+    kept = [t for t in turns if t.get("message_id") != message_id]
+    if len(kept) == len(turns) and kept and not kept[-1].get("message_id") and kept[-1].get("query") == query:
+        kept = kept[:-1]
+    return {**thread_context, "recent_turns": kept}
+
+
+async def _retry_context(db, investigation_id: str) -> dict:
+    doc = await db[INVESTIGATIONS].find_one(
+        {"_id": investigation_id}, {"reply_to": 1, "retry_of_message_id": 1, "retry_mode": 1},
+    ) or {}
+    retry_of = doc.get("retry_of_message_id")
+    previous = None
+    if retry_of:
+        previous = await db[MESSAGES].find_one({"_id": retry_of}, {"content": 1, "version": 1})
+    return {
+        "reply_to": doc.get("reply_to"),
+        "retry_of": retry_of,
+        "retry_mode": doc.get("retry_mode"),
+        "previous_answer": (previous or {}).get("content"),
+        "previous_version": (previous or {}).get("version") or 1,
+    }
+
+
+async def _supersede(db, old_message_id: str, new_message_id: str) -> None:
+    await db[MESSAGES].update_one(
+        {"_id": old_message_id, "superseded_by": None},
+        {"$set": {"superseded_by": new_message_id, "superseded_at": _now()}},
+    )
+
+
 def _merge_capped(existing: list, new_items: list, cap: int) -> list:
     merged = list(existing)
     for item in new_items or []:
@@ -315,6 +350,7 @@ def _merge_capped(existing: list, new_items: list, cap: int) -> list:
 async def update_chat_memory(
     ctx, chat_id: str, user_id: str, query: str, response: str,
     files_used: list, files_created: list, requested_at: str | None = None,
+    message_id: str | None = None, supersedes: str | None = None,
 ) -> None:
     picked_up_at = log_job_picked_up(
         logger, ctx, "update_chat_memory", requested_at=requested_at, chat_id=chat_id,
@@ -326,8 +362,23 @@ async def update_chat_memory(
             {"_id": chat_id}, {"summary": 1, "recent_turns": 1, "files_used": 1, "files_created": 1},
         ) or {}
 
+        if message_id:
+            current = await db[MESSAGES].find_one({"_id": message_id}, {"superseded_by": 1})
+            if current is not None and current.get("superseded_by"):
+                logger.info(
+                    "update_chat_memory: message %s was superseded before its memory update ran - skipping",
+                    message_id,
+                )
+                log_job_finished(logger, "update_chat_memory", picked_up_at, chat_id=chat_id)
+                return
+
         existing_turns = doc.get("recent_turns", [])
-        combined_turns = existing_turns + [{"query": query, "response": response}]
+        if supersedes:
+            existing_turns = _without_turn({"recent_turns": existing_turns}, supersedes, query)["recent_turns"]
+        new_turn = {"query": query, "response": response}
+        if message_id:
+            new_turn["message_id"] = message_id
+        combined_turns = existing_turns + [new_turn]
         overflow_turns = combined_turns[:-RECENT_TURNS_LIMIT] if len(combined_turns) > RECENT_TURNS_LIMIT else []
         recent_turns = combined_turns[-RECENT_TURNS_LIMIT:]
 
@@ -606,7 +657,7 @@ async def _with_retries(coro_fn, *, attempts: int = 3, base_delay: float = 1.0, 
 
 async def _finalize_investigation_bookkeeping(
     ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
-    files_used: list, artifact_refs: list,
+    files_used: list, artifact_refs: list, message_id: str | None = None, supersedes: str | None = None,
 ) -> None:
     await _with_retries(
         lambda: db[INVESTIGATIONS].update_one(
@@ -636,6 +687,7 @@ async def _finalize_investigation_bookkeeping(
             "update_chat_memory",
             chat_id=chat_id, user_id=user_id, query=query, response=final_answer,
             files_used=files_used, files_created=artifact_refs, requested_at=now_iso(),
+            message_id=message_id, supersedes=supersedes,
         ),
         description=f"chat memory enqueue (investigation {investigation_id})",
     )
@@ -652,11 +704,12 @@ async def _finalize_investigation_bookkeeping(
 
 def _schedule_finalize(
     ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
-    files_used: list, artifact_refs: list,
+    files_used: list, artifact_refs: list, message_id: str | None = None, supersedes: str | None = None,
 ) -> None:
     task = asyncio.create_task(
         _finalize_investigation_bookkeeping(
             ctx, db, investigation_id, chat_id, user_id, query, final_answer, files_used, artifact_refs,
+            message_id, supersedes,
         )
     )
     _background_tasks.add(task)
@@ -686,6 +739,7 @@ async def _run_tabular_direct(
     catalog: FileCatalog, storage: LocalParquetStore, chat_id: str, sandbox_manager,
     workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
     thread_context: dict | None = None, chart_capacity_checker=None, cancel_check=None, ask_user=None,
+    constraints: dict | None = None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "tabular")
     if entries is None:
@@ -698,8 +752,8 @@ async def _run_tabular_direct(
         reports_dir=engine_bootstrap.REPORTS_ROOT, chart_capacity_checker=chart_capacity_checker,
     )
     findings = await agent.run(
-        query, constraints={}, on_event=on_event, thread_context=thread_context, cancel_check=cancel_check,
-        ask_user=ask_user,
+        query, constraints=constraints or {}, on_event=on_event, thread_context=thread_context,
+        cancel_check=cancel_check, ask_user=ask_user,
     )
     result_collector.add_tabular_findings(
         findings, "invoke_tabular_agent", [e.file_id for e in entries],
@@ -714,7 +768,7 @@ async def _run_tabular_direct(
 async def _run_document_direct(
     catalog: FileCatalog, vector_store, query: str, mentioned_file_ids: list, on_event,
     result_collector: FinalResultCollector, thread_context: dict | None = None, cancel_check=None,
-    ask_user=None,
+    ask_user=None, constraints: dict | None = None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "document")
     if entries is None:
@@ -724,7 +778,7 @@ async def _run_document_direct(
     metadata_brief = build_document_metadata_brief(catalog, vector_store, [e.file_id for e in entries])
     agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True)
     findings = await agent.run(
-        query, constraints={}, on_event=on_event, metadata_brief=metadata_brief,
+        query, constraints=constraints or {}, on_event=on_event, metadata_brief=metadata_brief,
         thread_context=thread_context, cancel_check=cancel_check, ask_user=ask_user,
     )
     result_collector.add_document_findings(
@@ -754,6 +808,14 @@ async def run_investigation(
         logger.info("investigation %s: received %d @-mentioned file id(s): %s",
                     investigation_id, len(mentioned_file_ids), mentioned_file_ids)
     db = get_db()
+
+    retry = await _retry_context(db, investigation_id)
+    constraints = retry_constraints(retry["retry_mode"], retry["previous_answer"])
+    if retry["retry_of"]:
+        logger.info(
+            "investigation %s: regenerating message %s (mode=%s)",
+            investigation_id, retry["retry_of"], retry["retry_mode"],
+        )
 
     result_collector = FinalResultCollector()
 
@@ -788,7 +850,13 @@ async def run_investigation(
         logger.exception("investigation %s: failed to load database connections", investigation_id)
         database_connections = []
 
-    direct_route = route if route in ("tabular", "document") and not database_connections else None
+    direct_route = (
+        route
+        if route in ("tabular", "document")
+        and not database_connections
+        and retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES
+        else None
+    )
 
     if skipped_files:
         await on_event({
@@ -849,7 +917,7 @@ async def run_investigation(
             result = await _run_tabular_direct(
                 catalog, storage, chat_id, sandbox_manager, workspace_id, query,
                 mentioned_file_ids, on_event, result_collector, ctx_thread_context,
-                chart_capacity_checker, cancel_check, ask_user,
+                chart_capacity_checker, cancel_check, ask_user, constraints,
             )
             if result is None:
                 logger.info(
@@ -859,7 +927,7 @@ async def run_investigation(
         elif direct_route == "document":
             result = await _run_document_direct(
                 catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
-                ctx_thread_context, cancel_check, ask_user,
+                ctx_thread_context, cancel_check, ask_user, constraints,
             )
             if result is None:
                 logger.info(
@@ -880,7 +948,7 @@ async def run_investigation(
                 chart_capacity_checker=chart_capacity_checker, database_access=database_access,
             )
             result = await orchestrator.run(
-                query, workspace_id=workspace_id, thread_context=ctx_thread_context,
+                query, workspace_id=workspace_id, constraints=constraints, thread_context=ctx_thread_context,
                 on_event=on_event, cancel_check=cancel_check, ask_user=ask_user,
                 database_connections=database_connections,
             )
@@ -895,7 +963,7 @@ async def run_investigation(
             await _set_stage(db, investigation_id, "running")
 
             try:
-                result = await _dispatch(thread_context)
+                result = await _dispatch(_without_turn(thread_context, retry["retry_of"], query))
             except Exception as exc:
                 error_info = classify_llm_error(exc)
                 safe_to_retry = (
@@ -918,7 +986,7 @@ async def run_investigation(
                         {"_id": chat_id}, {"$set": {"summary": new_summary, "recent_turns": kept_turns}},
                     )
                     await _set_stage(db, investigation_id, "running")
-                    result = await _dispatch(thread_context)
+                    result = await _dispatch(_without_turn(thread_context, retry["retry_of"], query))
                 else:
                     raise
         except InvestigationCancelled:
@@ -938,10 +1006,26 @@ async def run_investigation(
                 else f"Something went wrong while investigating: {exc}"
             )
 
+            if retry["retry_of"]:
+                _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "failed"})
+                await _append_event(
+                    db, investigation_id, "error", user_facing,
+                    {"error_type": error_info.kind, "retry_of": retry["retry_of"], "kept_previous": True},
+                )
+                await db[INVESTIGATIONS].update_one(
+                    {"_id": investigation_id},
+                    {"$set": {
+                        "status": "failed", "stage": "failed", "completed_at": _now(),
+                        "error_type": error_info.kind, "error_message": str(exc)[:2000],
+                    }},
+                )
+                return
+
             message = Message(
                 chat_id=chat_id, role="assistant",
                 content=user_facing,
                 investigation_id=investigation_id,
+                reply_to=retry["reply_to"],
             )
             chart_ids: list = []
             report_id = None
@@ -984,6 +1068,10 @@ async def run_investigation(
         message = Message(
             chat_id=chat_id, role="assistant", content=result.final_answer, investigation_id=investigation_id,
             follow_up_questions=result.follow_up_questions, files_used=result.files_used,
+            reply_to=retry["reply_to"],
+            version=retry["previous_version"] + 1 if retry["retry_of"] else 1,
+            retry_of=retry["retry_of"],
+            retry_mode=retry["retry_mode"],
         )
         chart_ids, report_id, csv_file_ids, dashboard_ids = await _persist_artifacts(
             db, workspace_id, investigation_id, message.id, user_id,
@@ -994,10 +1082,15 @@ async def run_investigation(
         message.csv_file_ids = csv_file_ids
         message.dashboard_ids = dashboard_ids
         await db[MESSAGES].insert_one(message.to_mongo())
+        if retry["retry_of"]:
+            await _supersede(db, retry["retry_of"], message.id)
         _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "completed"})
         await _append_event(
             db, investigation_id, "completed", "Investigation complete.",
-            {"message_id": message.id, "chart_ids": chart_ids, "report_id": report_id, "dashboard_ids": dashboard_ids},
+            {
+                "message_id": message.id, "chart_ids": chart_ids, "report_id": report_id,
+                "dashboard_ids": dashboard_ids, "replaces_message_id": retry["retry_of"],
+            },
         )
         logger.info(
             "investigation %s: result sent (message %s, %d chart(s), report=%s, %d csv(s)); "
@@ -1007,7 +1100,7 @@ async def run_investigation(
 
         _schedule_finalize(
             ctx, db, investigation_id, chat_id, user_id, query, result.final_answer,
-            result.files_used, result.artifact_refs,
+            result.files_used, result.artifact_refs, message.id, retry["retry_of"],
         )
     finally:
         log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)

@@ -36,6 +36,9 @@ class Investigation(MongoModel):
     chat_memory_enqueued: bool = False
 
     retry_count: int = 0
+    reply_to: Optional[str] = None
+    retry_of_message_id: Optional[str] = None
+    retry_mode: Optional[str] = None
     last_attempt_at: Optional[datetime] = None
 
     stage: Optional[str] = None

@@ -54,7 +54,7 @@ async def has_message_capacity(user_id: str, email: str | None = None) -> bool:
 async def has_chat_message_capacity(chat_id: str, email: str | None = None) -> bool:
     if is_admin_email(email):
         return True
-    count = await get_db()[MESSAGES].count_documents({"chat_id": chat_id})
+    count = await get_db()[MESSAGES].count_documents({"chat_id": chat_id, "superseded_by": None})
     return count < messages_per_chat_limit()
 
 
