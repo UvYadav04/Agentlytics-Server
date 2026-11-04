@@ -47,11 +47,20 @@ def presign_put(key: str, expires_in: int = 3600) -> str:
     )
 
 
-def presign_get(key: str, expires_in: int = 3600, download_name: str | None = None) -> str:
+def presign_get(
+    key: str,
+    expires_in: int = 3600,
+    download_name: str | None = None,
+    inline: bool = False,
+    content_type: str | None = None,
+) -> str:
     params = {"Bucket": get_bucket_name(), "Key": key}
     if download_name:
         safe_name = download_name.replace('"', "").replace("\\", "")
-        params["ResponseContentDisposition"] = f'attachment; filename="{safe_name}"'
+        disposition = "inline" if inline else "attachment"
+        params["ResponseContentDisposition"] = f'{disposition}; filename="{safe_name}"'
+    if content_type:
+        params["ResponseContentType"] = content_type
     return get_s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=expires_in)
 
 

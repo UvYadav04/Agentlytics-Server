@@ -1,12 +1,15 @@
+import asyncio
 import logging
 import os
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_owned_file, get_owned_workspace
 from shared.db import get_db
+from shared import file_preview
 from shared.dummy_files import ensure_dummy_files, mark_real_upload
 from shared.job_timing import now_iso
 from shared.models.file import COLLECTION as FILES
@@ -460,6 +463,131 @@ async def download_file(file_id: str, user: User = Depends(get_current_user)):
     if file.status in ("pending_upload", "cancelled"):
         raise HTTPException(status_code=409, detail="This file hasn't finished uploading.")
     return DownloadResponse(url=presign_get(file.storage_key, expires_in=300, download_name=file.filename))
+
+
+VIEW_KINDS = {"csv": "table", "xlsx": "table", "pdf": "pdf", "txt": "text"}
+VIEW_CONTENT_TYPES = {"pdf": "application/pdf", "txt": "text/plain; charset=utf-8"}
+MAX_RAW_VIEW_BYTES = 30 * 1024 * 1024
+
+
+class SheetInfo(BaseModel):
+    name: str
+    rows: int | None = None
+    columns: int | None = None
+
+
+class FileViewInfo(BaseModel):
+    id: str
+    filename: str
+    file_type: str
+    kind: str
+    size_bytes: int | None
+    url: str | None = None
+    raw: bool = False
+    dummy: bool = False
+    sheets: list[SheetInfo] = []
+
+
+class TablePage(BaseModel):
+    sheet: str | None
+    columns: list[str]
+    rows: list[list[str]]
+    offset: int
+    limit: int
+    total_rows: int | None
+    has_more: bool
+    truncated_columns: bool
+
+
+class TextChunk(BaseModel):
+    text: str
+    offset: int
+    next_offset: int | None
+    total_bytes: int
+
+
+async def _viewable_file(file_id: str, user: User) -> File:
+    file = await get_owned_file(file_id, user)
+    if file.file_type not in VIEW_KINDS:
+        raise HTTPException(status_code=400, detail="This file type can't be previewed.")
+    if file.status in ("pending_upload", "cancelled") or not file.storage_key:
+        raise HTTPException(status_code=409, detail="This file hasn't finished uploading.")
+    return file
+
+
+async def _preview(fn, *args):
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except file_preview.PreviewUnavailable as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        logger.exception("file preview failed")
+        raise HTTPException(status_code=500, detail="This file couldn't be previewed.")
+
+
+@router.get("/files/{file_id}/view", response_model=FileViewInfo)
+async def view_file(file_id: str, user: User = Depends(get_current_user)):
+    file = await _viewable_file(file_id, user)
+    kind = VIEW_KINDS[file.file_type]
+    info = FileViewInfo(
+        id=file.id, filename=file.filename, file_type=file.file_type, kind=kind, size_bytes=file.size_bytes,
+        dummy=file.dummy,
+    )
+    sample = file_preview.is_sample_key(file.storage_key)
+    if kind == "pdf":
+        if sample:
+            info.raw = True
+        else:
+            info.url = presign_get(
+                file.storage_key, expires_in=900, download_name=file.filename, inline=True,
+                content_type=VIEW_CONTENT_TYPES["pdf"],
+            )
+    elif file.file_type == "xlsx":
+        sheets = await _preview(file_preview.xlsx_sheets, file.storage_key)
+        info.sheets = [SheetInfo(**s) for s in sheets]
+    return info
+
+
+@router.get("/files/{file_id}/view/table", response_model=TablePage)
+async def view_file_table(
+    file_id: str,
+    sheet: str | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(file_preview.DEFAULT_PAGE_ROWS, ge=1, le=file_preview.MAX_PAGE_ROWS),
+    user: User = Depends(get_current_user),
+):
+    file = await _viewable_file(file_id, user)
+    if VIEW_KINDS[file.file_type] != "table":
+        raise HTTPException(status_code=400, detail="Only CSV and Excel files have a table view.")
+    if file.file_type == "xlsx":
+        page = await _preview(file_preview.xlsx_page, file.storage_key, sheet, offset, limit)
+    else:
+        page = await _preview(file_preview.csv_page, file.storage_key, offset, limit)
+    return TablePage(**page)
+
+
+@router.get("/files/{file_id}/view/text", response_model=TextChunk)
+async def view_file_text(
+    file_id: str, offset: int = Query(0, ge=0), user: User = Depends(get_current_user),
+):
+    file = await _viewable_file(file_id, user)
+    if file.file_type != "txt":
+        raise HTTPException(status_code=400, detail="Only text files have a text view.")
+    return TextChunk(**await _preview(file_preview.text_chunk, file.storage_key, offset))
+
+
+@router.get("/files/{file_id}/view/raw")
+async def view_file_raw(file_id: str, user: User = Depends(get_current_user)):
+    file = await _viewable_file(file_id, user)
+    if file.file_type != "pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files can be streamed for viewing.")
+    data = await _preview(file_preview.load_bytes, file.storage_key, MAX_RAW_VIEW_BYTES)
+    safe_name = file.filename.replace('"', "").replace("\\", "")
+    return Response(
+        content=data,
+        media_type=VIEW_CONTENT_TYPES["pdf"],
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"', "Cache-Control": "private, no-store"},
+    )
 
 
 @router.post("/files/{file_id}/retry", response_model=FileOut)
