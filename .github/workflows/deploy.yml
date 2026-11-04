@@ -19,7 +19,7 @@ jobs:
         run: |
           echo "${{ secrets.DOCKER_TOKEN }}" | docker login \
             --username "${{ secrets.DOCKER_USERNAME }}" \
-            --password-stdin
+            --password-stdin ${{ secrets.LIGHTSAIL_SSH_KEY }}
 
       - name: Build WORKER
         run: |
