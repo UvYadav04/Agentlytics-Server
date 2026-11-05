@@ -72,3 +72,4 @@ class TraceSummary:
     total_completion_tokens: int = 0
     tags: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+

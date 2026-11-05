@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api_service.routers import (
-    auth, charts, chats, dashboards, databases, feedback, files, reports, usage, workspaces,
+    auth, charts, chats, dashboards, databases, feedback, files, monitoring, reports, usage, workspaces,
 )
 from shared import intent_router
 from shared.config import get_settings
@@ -59,6 +59,7 @@ app.include_router(dashboards.router, prefix=API_PREFIX)
 app.include_router(usage.router, prefix=API_PREFIX)
 app.include_router(feedback.router, prefix=API_PREFIX)
 app.include_router(databases.router, prefix=API_PREFIX)
+app.include_router(monitoring.router, prefix=API_PREFIX)
 
 
 @app.get("/health")

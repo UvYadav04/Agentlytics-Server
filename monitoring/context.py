@@ -113,3 +113,4 @@ async def async_span_scope(span_id: str) -> AsyncGenerator[str, None]:
         yield span_id
     finally:
         _current_span_id.reset(token)
+

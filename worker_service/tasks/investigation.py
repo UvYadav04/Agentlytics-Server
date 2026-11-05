@@ -938,6 +938,23 @@ async def run_investigation(
         },
     )
     span_cm.__enter__()
+
+    try:
+        from monitoring import trace_scope
+        monitoring_cm = trace_scope(
+            investigation_id,
+            tags={
+                "chat_id": chat_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id or "",
+                "route": direct_route or "orchestrator",
+                "query": query[:250] if query else "",
+            },
+        )
+    except Exception:
+        monitoring_cm = nullcontext()
+
+    monitoring_cm.__enter__()
     try:
         langfuse_cm.__enter__()
     except Exception:
@@ -1151,6 +1168,12 @@ async def run_investigation(
         )
     finally:
         log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)
+        try:
+            monitoring_cm.__exit__(None, None, None)
+            from monitoring import get_monitoring_store
+            get_monitoring_store().export_trace_to_file(investigation_id)
+        except Exception:
+            logger.exception("investigation %s: failed to finalize monitoring trace", investigation_id)
         try:
             langfuse_cm.__exit__(None, None, None)
         except Exception:

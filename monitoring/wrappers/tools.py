@@ -48,3 +48,4 @@ def trace_tool(name: Optional[str] = None, component: str = "agent.tool"):
         return async_wrapper if inspect.iscoroutinefunction(fn) else sync_wrapper
 
     return decorator
+

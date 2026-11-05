@@ -56,3 +56,4 @@ def trace_agent(name: Optional[str] = None, component: str = "agent"):
         return async_wrapper if inspect.iscoroutinefunction(fn) else sync_wrapper
 
     return decorator
+

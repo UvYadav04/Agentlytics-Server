@@ -180,3 +180,4 @@ def trace_step(
         return async_wrapper if inspect.iscoroutinefunction(fn) else sync_wrapper
 
     return decorator
+

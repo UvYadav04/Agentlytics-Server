@@ -302,3 +302,4 @@ def get_monitoring_store() -> MonitoringStore:
     if _global_store is None:
         _global_store = MonitoringStore()
     return _global_store
+

@@ -99,3 +99,4 @@ def safe_json_dumps(obj: Any) -> str:
         return json.dumps(safe_serialize(obj), default=str)
     except Exception as exc:
         return json.dumps({"__error__": f"json serialization failed: {exc}"})
+
