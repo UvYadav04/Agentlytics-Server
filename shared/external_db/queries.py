@@ -172,9 +172,48 @@ def pipeline_placeholders(pipeline: list) -> set[str]:
 
 
 def _bind_pipeline(pipeline: list, params: dict) -> list:
+    start_dt = params.get("start")
+    end_dt = params.get("end")
+    start_iso = start_dt.isoformat() if isinstance(start_dt, datetime.datetime) else None
+    end_iso = end_dt.isoformat() if isinstance(end_dt, datetime.datetime) else None
+
+    def walk_match(match_dict: dict) -> dict:
+        new_match = {}
+        or_clauses = []
+        for k, v in match_dict.items():
+            if isinstance(v, dict) and (v.get("$gte") == "{{start}}" or v.get("$lt") == "{{end}}"):
+                if start_dt and end_dt and v.get("$gte") == "{{start}}" and v.get("$lt") == "{{end}}":
+                    or_clauses.append([
+                        {k: {"$gte": start_dt, "$lt": end_dt}},
+                        {k: {"$gte": start_iso, "$lt": end_iso}},
+                    ])
+                elif start_dt and v.get("$gte") == "{{start}}":
+                    or_clauses.append([
+                        {k: {"$gte": start_dt}},
+                        {k: {"$gte": start_iso}},
+                    ])
+                else:
+                    new_match[k] = walk(v)
+            else:
+                new_match[k] = walk(v)
+
+        if or_clauses:
+            for clause_pair in or_clauses:
+                if "$or" not in new_match:
+                    new_match["$or"] = clause_pair
+                else:
+                    new_match["$and"] = new_match.get("$and", []) + [{"$or": clause_pair}]
+        return new_match
+
     def walk(value):
         if isinstance(value, dict):
-            return {key: walk(child) for key, child in value.items()}
+            res = {}
+            for key, child in value.items():
+                if key == "$match" and isinstance(child, dict):
+                    res[key] = walk_match(child)
+                else:
+                    res[key] = walk(child)
+            return res
         if isinstance(value, list):
             return [walk(child) for child in value]
         if isinstance(value, str):

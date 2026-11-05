@@ -165,6 +165,10 @@ class DashboardService:
 
         now = datetime.now(timezone.utc)
         window = spec.get("time_window")
+        db_type = spec.get("db_type") or (staged.spec.get("db_type") if staged and staged.spec else None) or "mongodb"
+        if db_type not in ("postgresql", "mongodb", "parquet"):
+            db_type = "mongodb"
+
         dashboard = Dashboard(
             workspace_id=workspace_id,
             name=spec.get("title") or staged.title or "Live Dashboard",
@@ -172,7 +176,7 @@ class DashboardService:
             created_by=user_id,
             created_at=now,
             updated_at=now,
-            source=spec.get("db_type", "database"),
+            source=db_type,
             connection_id=staged.connection_id,
             database=spec.get("database"),
             tables=spec.get("tables") or [],
