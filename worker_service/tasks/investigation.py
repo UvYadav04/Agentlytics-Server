@@ -421,7 +421,7 @@ def _artifact_title(path: str) -> str:
 async def _persist_dashboard_bundle(
     db, s3, bucket: str, workspace_id: str, investigation_id: str, message_id: str, user_id: str, manifest_path: str,
     email: str | None = None,
-) -> list:
+) -> tuple[list, str | None]:
 
     folder = os.path.dirname(manifest_path)
     with open(manifest_path, encoding="utf-8") as f:
@@ -469,7 +469,7 @@ async def _persist_dashboard_bundle(
         ))
 
     if not chart_configs:
-        return chart_ids
+        return chart_ids, None
 
     dashboard = Dashboard(
         workspace_id=workspace_id,
@@ -482,7 +482,7 @@ async def _persist_dashboard_bundle(
         last_refreshed_at=datetime.now(timezone.utc),
     )
     await db[DASHBOARDS].insert_one(dashboard.to_mongo())
-    return chart_ids
+    return chart_ids, dashboard.id
 
 
 async def _persist_live_dashboard(
@@ -621,10 +621,13 @@ async def _persist_artifacts(
 
         try:
             if kind == "dashboard_bundle":
-                chart_ids.extend(await _persist_dashboard_bundle(
+                bundle_chart_ids, bundle_dashboard_id = await _persist_dashboard_bundle(
                     db, s3, bucket, workspace_id, investigation_id, message_id, user_id, ref,
                     email,
-                ))
+                )
+                chart_ids.extend(bundle_chart_ids)
+                if bundle_dashboard_id:
+                    dashboard_ids.append(bundle_dashboard_id)
             else:
                 if not await usage.has_report_capacity(user_id, email):
                     await _append_event(
@@ -762,6 +765,7 @@ async def _run_tabular_direct(
     workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
     thread_context: dict | None = None, chart_capacity_checker=None, cancel_check=None, ask_user=None,
     constraints: dict | None = None, visualization_service=None, table_service=None, file_service=None,
+    dashboard_service=None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "tabular")
     if entries is None:
@@ -773,7 +777,7 @@ async def _run_tabular_direct(
         chat_id=chat_id, sandbox_manager=sandbox_manager, direct_route=True,
         reports_dir=engine_bootstrap.REPORTS_ROOT, chart_capacity_checker=chart_capacity_checker,
         visualization_service=visualization_service, table_service=table_service,
-        file_service=file_service,
+        file_service=file_service, dashboard_service=dashboard_service,
     )
     findings = await agent.run(
         query, constraints=constraints or {}, on_event=on_event, thread_context=thread_context,
@@ -951,6 +955,7 @@ async def run_investigation(
                 visualization_service=visualization_service,
                 table_service=table_service,
                 file_service=file_service,
+                dashboard_service=dashboard_service,
             )
             if result is None:
                 logger.info(

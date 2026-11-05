@@ -549,7 +549,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     persist_task = asyncio.gather(
     db[MESSAGES].insert_one(message.to_mongo()),
     db[INVESTIGATIONS].insert_one(investigation.to_mongo()),
-)
+    )
 
     
     route_result, files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
