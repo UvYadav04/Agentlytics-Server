@@ -47,6 +47,7 @@ from shared.models.report import Report
 from shared.observability import get_langfuse_client, get_meter, get_tracer
 from shared.redis_client import get_redis, investigation_answer_key, investigation_channel
 from shared.retry_modes import ORCHESTRATOR_ONLY_MODES, retry_constraints
+from shared.services import DashboardService, FileSystemService, TableArtifactService, VisualizationService
 from worker_service.tasks.database_access import WorkspaceDatabaseAccess
 from shared.storage import build_chart_key, build_report_key, get_bucket_name, get_s3_client, new_file_id
 
@@ -542,6 +543,8 @@ async def _persist_live_dashboard(
 async def _persist_artifacts(
     db, workspace_id: str, investigation_id: str, message_id: str, user_id: str,
     chart_paths: list, artifacts: list, email: str | None = None,
+    visualization_service: VisualizationService | None = None,
+    dashboard_service: DashboardService | None = None,
 ) -> tuple[list, str | None, list, list]:
     s3 = get_s3_client()
     bucket = get_bucket_name()
@@ -554,16 +557,35 @@ async def _persist_artifacts(
         if artifact.get("type") != "live_dashboard":
             continue
         try:
-            dashboard_id = await _persist_live_dashboard(
-                db, workspace_id, investigation_id, message_id, user_id, artifact, email,
-            )
+            dashboard_id = None
+            if dashboard_service and artifact.get("ref"):
+                dashboard_id = await dashboard_service.persist_dashboard(
+                    artifact["ref"], db, workspace_id, message_id, user_id, email,
+                )
+            if not dashboard_id:
+                dashboard_id = await _persist_live_dashboard(
+                    db, workspace_id, investigation_id, message_id, user_id, artifact, email,
+                )
             if dashboard_id:
                 dashboard_ids.append(dashboard_id)
         except Exception:
             logger.exception("failed to persist live dashboard %s", artifact.get("ref"))
 
     for chart in chart_paths:
+        cid = chart.get("chart_id")
         ref = chart.get("location")
+
+        if visualization_service and cid and visualization_service.get_by_id(cid):
+            try:
+                persisted_id = await visualization_service.persist_chart(
+                    cid, db, workspace_id, message_id, user_id, email,
+                )
+                if persisted_id:
+                    chart_ids.append(persisted_id)
+                    continue
+            except Exception:
+                logger.exception("visualization_service failed to persist chart %s", cid)
+
         if not isinstance(ref, str) or not os.path.isfile(ref):
             continue
         try:
@@ -739,7 +761,7 @@ async def _run_tabular_direct(
     catalog: FileCatalog, storage: LocalParquetStore, chat_id: str, sandbox_manager,
     workspace_id: str, query: str, mentioned_file_ids: list, on_event, result_collector: FinalResultCollector,
     thread_context: dict | None = None, chart_capacity_checker=None, cancel_check=None, ask_user=None,
-    constraints: dict | None = None,
+    constraints: dict | None = None, visualization_service=None, table_service=None, file_service=None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "tabular")
     if entries is None:
@@ -750,6 +772,8 @@ async def _run_tabular_direct(
         assigned_files, storage=storage, workspace_id=workspace_id,
         chat_id=chat_id, sandbox_manager=sandbox_manager, direct_route=True,
         reports_dir=engine_bootstrap.REPORTS_ROOT, chart_capacity_checker=chart_capacity_checker,
+        visualization_service=visualization_service, table_service=table_service,
+        file_service=file_service,
     )
     findings = await agent.run(
         query, constraints=constraints or {}, on_event=on_event, thread_context=thread_context,
@@ -768,7 +792,7 @@ async def _run_tabular_direct(
 async def _run_document_direct(
     catalog: FileCatalog, vector_store, query: str, mentioned_file_ids: list, on_event,
     result_collector: FinalResultCollector, thread_context: dict | None = None, cancel_check=None,
-    ask_user=None, constraints: dict | None = None,
+    ask_user=None, constraints: dict | None = None, file_service=None,
 ) -> OrchestratorResult | None:
     entries = _select_direct_route_files(catalog, mentioned_file_ids, "document")
     if entries is None:
@@ -776,7 +800,7 @@ async def _run_document_direct(
 
     assigned_files = [FileRef(file_id=e.file_id) for e in entries]
     metadata_brief = build_document_metadata_brief(catalog, vector_store, [e.file_id for e in entries])
-    agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True)
+    agent = DocumentAgent(assigned_files, vector_store=vector_store, direct_route=True, file_service=file_service)
     findings = await agent.run(
         query, constraints=constraints or {}, on_event=on_event, metadata_brief=metadata_brief,
         thread_context=thread_context, cancel_check=cancel_check, ask_user=ask_user,
@@ -842,6 +866,12 @@ async def run_investigation(
 
     vector_store = ctx["vector_store"]
     memory = LongTermMemory(path=os.path.join(engine_bootstrap.MEMORY_ROOT, f"{user_id}.json"))
+
+    root_parquet = getattr(storage, "root_dir", getattr(engine_bootstrap, "PARQUET_ROOT", "data/parquet"))
+    file_service = FileSystemService(catalog=catalog, db=db, storage_root=root_parquet)
+    visualization_service = VisualizationService(output_dir=engine_bootstrap.REPORTS_ROOT)
+    dashboard_service = DashboardService(output_dir=engine_bootstrap.REPORTS_ROOT)
+    table_service = TableArtifactService(root_dir=root_parquet)
 
     database_access = WorkspaceDatabaseAccess(db, workspace_id)
     try:
@@ -918,6 +948,9 @@ async def run_investigation(
                 catalog, storage, chat_id, sandbox_manager, workspace_id, query,
                 mentioned_file_ids, on_event, result_collector, ctx_thread_context,
                 chart_capacity_checker, cancel_check, ask_user, constraints,
+                visualization_service=visualization_service,
+                table_service=table_service,
+                file_service=file_service,
             )
             if result is None:
                 logger.info(
@@ -928,6 +961,7 @@ async def run_investigation(
             result = await _run_document_direct(
                 catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
                 ctx_thread_context, cancel_check, ask_user, constraints,
+                file_service=file_service,
             )
             if result is None:
                 logger.info(
@@ -946,6 +980,10 @@ async def run_investigation(
                 reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
                 sandbox_manager=sandbox_manager, result_collector=result_collector,
                 chart_capacity_checker=chart_capacity_checker, database_access=database_access,
+                visualization_service=visualization_service,
+                dashboard_service=dashboard_service,
+                table_service=table_service,
+                file_service=file_service,
             )
             result = await orchestrator.run(
                 query, workspace_id=workspace_id, constraints=constraints, thread_context=ctx_thread_context,
@@ -1036,6 +1074,8 @@ async def run_investigation(
                     chart_ids, report_id, csv_file_ids, dashboard_ids = await _persist_artifacts(
                         db, workspace_id, investigation_id, message.id, user_id,
                         result_collector.chart_paths, result_collector.artifacts, email,
+                        visualization_service=visualization_service,
+                        dashboard_service=dashboard_service,
                     )
                 except Exception:
                     logger.exception(
@@ -1076,6 +1116,8 @@ async def run_investigation(
         chart_ids, report_id, csv_file_ids, dashboard_ids = await _persist_artifacts(
             db, workspace_id, investigation_id, message.id, user_id,
             result.chart_paths, result.artifacts, email,
+            visualization_service=visualization_service,
+            dashboard_service=dashboard_service,
         )
         message.chart_ids = chart_ids
         message.report_id = report_id
