@@ -847,7 +847,7 @@ async def run_investigation(
         return await usage.has_chart_capacity(user_id, email)
 
     async def on_event(event: dict) -> None:
-        await _append_event(db, investigation_id, event["type"], event["message"], event.get("data"))
+        await _append_event(db, investigation_id, event.get("type", "status"), event.get("message", ""), event.get("data"))
 
     async def cancel_check() -> bool:
         return await _is_cancelled(db, investigation_id)
