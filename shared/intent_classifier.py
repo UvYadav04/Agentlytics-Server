@@ -15,12 +15,9 @@ logger = logging.getLogger("intent_classifier")
 
 try:
     from monitoring.wrappers.base import trace_step
-    from monitoring.schema import StepType
 except Exception:
     def trace_step(*args, **kwargs):
         return lambda fn: fn
-    class StepType:
-        ROUTER = "router"
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
@@ -111,7 +108,7 @@ def _parse_reply(raw_text: str) -> tuple[str | None, float, str | None]:
     return intent, confidence, None
 
 
-@trace_step(name="classify_intent", component="intent.classifier", step_type=StepType.ROUTER.value)
+@trace_step(name="classify_intent", component="intent.classifier", step_type="router")
 def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
     settings = get_settings()
     model = settings.get("INTENT_CLASSIFIER_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL

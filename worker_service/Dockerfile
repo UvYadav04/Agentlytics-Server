@@ -17,6 +17,7 @@ ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r worker_service/requirements.txt
 
 COPY shared/ shared/
+COPY monitoring/ monitoring/
 COPY analyzerEngine/ analyzerEngine/
 COPY worker_service/ worker_service/
 

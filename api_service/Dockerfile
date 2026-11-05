@@ -9,6 +9,7 @@ COPY api_service/requirements.txt api_service/requirements.txt
 RUN pip install --no-cache-dir -r api_service/requirements.txt
 
 COPY shared/ shared/
+COPY monitoring/ monitoring/
 COPY api_service/ api_service/
 
 ENV PYTHONUNBUFFERED=1
