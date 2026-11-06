@@ -10,12 +10,14 @@ from datetime import datetime, timedelta, timezone
 
 from worker_service import engine_bootstrap  # noqa: F401
 
+from analyzerEngine.agents.database.agent import DatabaseAgent
 from analyzerEngine.agents.document.agent import DocumentAgent
 from analyzerEngine.agents.orchestrator.agent import InvestigationCancelled, OrchestratorAgent
 from analyzerEngine.agents.tabular.agent import TabularAgent
 from analyzerEngine.ingestion.storage.local_store import LocalParquetStore
 from analyzerEngine.llm_provider.errors import classify_llm_error
 from analyzerEngine.sandbox.path_resolver import InvalidArtifactIdError, get_parquet_path
+from analyzerEngine.tools.database.connection_manager import ConnectionManager
 from analyzerEngine.tools.document.metadata import build_document_metadata_brief
 from analyzerEngine.tools.orchestrator.file_catalog import FileCatalog, is_tabular_output_ref, table_catalog_entry
 from analyzerEngine.tools.orchestrator.memory import LongTermMemory
@@ -819,6 +821,38 @@ async def _run_document_direct(
     )
 
 
+async def _run_database_direct(
+    database_access, database_connections: list, query: str, on_event,
+    result_collector: FinalResultCollector, thread_context: dict | None = None,
+    cancel_check=None, ask_user=None, constraints: dict | None = None,
+    visualization_service=None, dashboard_service=None, workspace_id: str = "default",
+) -> OrchestratorResult | None:
+    if not database_connections:
+        return None
+
+    connection_manager = ConnectionManager(database_access)
+    agent = DatabaseAgent(
+        connection_manager=connection_manager,
+        available_connections=database_connections,
+        visualization_service=visualization_service,
+        dashboard_service=dashboard_service,
+        workspace_id=workspace_id,
+        direct_route=True,
+    )
+    findings = await agent.run(
+        query, constraints=constraints or {}, on_event=on_event,
+        thread_context=thread_context, cancel_check=cancel_check, ask_user=ask_user,
+    )
+    result_collector.add_database_findings(
+        findings, "invoke_database_agent", findings.connection_id or "direct",
+    )
+    return OrchestratorResult(
+        final_answer=findings.summary, chart_paths=result_collector.chart_paths,
+        artifacts=result_collector.artifacts, files_used=result_collector.files_used,
+        open_questions=[], follow_up_questions=findings.follow_up_questions,
+    )
+
+
 async def run_investigation(
     ctx, investigation_id: str, chat_id: str, workspace_id: str, user_id: str, query: str,
     file_ids: list[str] | None = None, requested_at: str | None = None, route: str | None = None,
@@ -889,7 +923,13 @@ async def run_investigation(
         if route in ("tabular", "document")
         and not database_connections
         and retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES
-        else None
+        else (
+            "database"
+            if route == "database"
+            and database_connections
+            and retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES
+            else None
+        )
     )
 
     if skipped_files:

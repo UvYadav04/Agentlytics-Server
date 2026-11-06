@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 import boto3
@@ -5,10 +6,14 @@ from botocore.client import Config as BotoConfig
 
 from shared.config import get_settings
 
+logger = logging.getLogger("shared.storage")
 _s3_client = None
 
 
 def get_s3_client():
+    """
+    Returns a boto3 S3 client configured specifically for Cloudflare R2 Object Storage.
+    """
     global _s3_client
     if _s3_client is None:
         settings = get_settings()
@@ -19,38 +24,36 @@ def get_s3_client():
         r2_account_id = settings.get("R2_ACCOUNT_ID")
         r2_endpoint = settings.get("R2_ENDPOINT_URL")
 
-        if r2_access_key and r2_secret_key:
-            endpoint_url = r2_endpoint
-            if not endpoint_url and r2_account_id:
-                endpoint_url = f"https://{r2_account_id.strip()}.r2.cloudflarestorage.com"
+        if not r2_access_key or not r2_secret_key:
+            logger.error("Missing Cloudflare R2 credentials: R2_ACCESS_KEY and R2_SECRET_KEY must be set.")
+            raise ValueError("Cloudflare R2 credentials (R2_ACCESS_KEY, R2_SECRET_KEY) must be set in environment.")
 
-            _s3_client = boto3.client(
-                "s3",
-                endpoint_url=endpoint_url,
-                aws_access_key_id=r2_access_key,
-                aws_secret_access_key=r2_secret_key,
-                region_name=settings.get("R2_REGION", "auto") or "auto",
-                config=BotoConfig(
-                    signature_version="s3v4",
-                    s3={"addressing_style": "path"},
-                ),
-            )
-        else:
-            # Fallback to AWS S3 Storage
-            region = settings.get("AWS_REGION") or "eu-north-1"
-            _s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=settings.get("AWS_ACCESS_KEY"),
-                aws_secret_access_key=settings.get("AWS_ACCESS_SECRET"),
-                region_name=region,
-                config=BotoConfig(signature_version="s3v4"),
-            )
+        endpoint_url = r2_endpoint
+        if not endpoint_url and r2_account_id:
+            endpoint_url = f"https://{r2_account_id.strip()}.r2.cloudflarestorage.com"
+        elif not endpoint_url:
+            raise ValueError("Cloudflare R2 configuration error: R2_ENDPOINT_URL or R2_ACCOUNT_ID must be set.")
+
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url.strip(),
+            aws_access_key_id=r2_access_key.strip(),
+            aws_secret_access_key=r2_secret_key.strip(),
+            region_name=settings.get("R2_REGION", "auto") or "auto",
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+            ),
+        )
     return _s3_client
 
 
 def get_bucket_name() -> str:
     settings = get_settings()
-    return settings.get("R2_BUCKET") or settings.get("AWS_BUCKET", "agentlytics")
+    bucket = settings.get("R2_BUCKET")
+    if not bucket:
+        return "agentlytics-prod"
+    return bucket.strip()
 
 
 def build_upload_key(workspace_id: str, file_id: str, filename: str) -> str:
