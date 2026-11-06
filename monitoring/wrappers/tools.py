@@ -14,7 +14,31 @@ from monitoring.wrappers.base import trace_span
 logger = logging.getLogger("monitoring.wrappers.tools")
 
 
-def trace_tool(name: Optional[str] = None, component: str = "agent.tool"):
+def _record_tool_metrics(span: Any, result: Any) -> None:
+    if not isinstance(result, dict):
+        return
+    if "execution_time_ms" in result:
+        span.set_metric("db_execution_time_ms", result["execution_time_ms"])
+    if "row_count" in result:
+        span.set_metric("row_count", result["row_count"])
+    if "success" in result:
+        span.set_metric("success", result["success"])
+    if "chart_id" in result:
+        span.set_metric("chart_id", result["chart_id"])
+    elif isinstance(result.get("specification"), dict) and "chart_id" in result["specification"]:
+        span.set_metric("chart_id", result["specification"]["chart_id"])
+    if "tables" in result and isinstance(result["tables"], list):
+        span.set_metric("table_count", len(result["tables"]))
+    if "exit_code" in result:
+        span.set_metric("exit_code", result["exit_code"])
+
+
+def trace_tool(
+    name: Optional[str] = None,
+    component: str = "agent.tool",
+    step_type: str = StepType.TOOL.value,
+    tags: Optional[dict[str, Any]] = None,
+):
     """Decorator to trace tool execution invoked by agents."""
     def decorator(fn: Callable):
         tool_name = name or fn.__name__
@@ -27,8 +51,9 @@ def trace_tool(name: Optional[str] = None, component: str = "agent.tool"):
             except Exception:
                 inputs = {"args_count": len(args), "kwargs_keys": list(kwargs.keys())}
 
-            with trace_span(name=tool_name, component=component, step_type=StepType.TOOL.value, inputs=inputs) as span:
+            with trace_span(name=tool_name, component=component, step_type=step_type, inputs=inputs, tags=tags) as span:
                 result = await fn(*args, **kwargs)
+                _record_tool_metrics(span, result)
                 span.set_output("output", safe_serialize(result))
                 return result
 
@@ -40,8 +65,9 @@ def trace_tool(name: Optional[str] = None, component: str = "agent.tool"):
             except Exception:
                 inputs = {"args_count": len(args), "kwargs_keys": list(kwargs.keys())}
 
-            with trace_span(name=tool_name, component=component, step_type=StepType.TOOL.value, inputs=inputs) as span:
+            with trace_span(name=tool_name, component=component, step_type=step_type, inputs=inputs, tags=tags) as span:
                 result = fn(*args, **kwargs)
+                _record_tool_metrics(span, result)
                 span.set_output("output", safe_serialize(result))
                 return result
 

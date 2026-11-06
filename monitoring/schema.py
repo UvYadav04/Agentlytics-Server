@@ -18,6 +18,7 @@ class StepType(str, Enum):
     TOOL = "tool"
     AGENT = "agent"
     ROUTER = "router"
+    DATABASE = "database"
     CUSTOM = "custom"
 
 
