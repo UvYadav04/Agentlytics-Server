@@ -24,7 +24,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - traces_data:/app/traces
+      - ./traces:/app/traces
     depends_on:
       - redis
 
@@ -49,7 +49,7 @@ services:
       - parquet_data:/data/parquet
       - memory_data:/data/memory
       - sandbox_sockets:/data/sandbox_sockets
-      - traces_data:/app/traces
+      - ./traces:/app/traces
     depends_on:
       - redis
 
@@ -62,5 +62,3 @@ volumes:
     name: dataanalyzer_memory_data
   sandbox_sockets:
     name: dataanalyzer_sandbox_sockets
-  traces_data:
-    name: dataanalyzer_traces_data

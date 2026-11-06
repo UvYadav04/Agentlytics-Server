@@ -947,8 +947,9 @@ async def run_investigation(
                 "chat_id": chat_id,
                 "workspace_id": workspace_id,
                 "user_id": user_id or "",
+                "user_email": email or "",
                 "route": direct_route or "orchestrator",
-                "query": query[:250] if query else "",
+                "query": query or "",
             },
         )
     except Exception:
