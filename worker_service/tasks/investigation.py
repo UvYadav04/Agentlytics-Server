@@ -1031,6 +1031,19 @@ async def run_investigation(
                     "investigation %s: document direct-route unsafe (no unambiguous file "
                     "selection) - falling back to the Orchestrator", investigation_id,
                 )
+        elif direct_route == "database":
+            result = await _run_database_direct(
+                database_access, database_connections, query, on_event, result_collector,
+                ctx_thread_context, cancel_check, ask_user, constraints,
+                visualization_service=visualization_service,
+                dashboard_service=dashboard_service,
+                workspace_id=workspace_id,
+            )
+            if result is None:
+                logger.info(
+                    "investigation %s: database direct-route unsafe (no connections available) - "
+                    "falling back to the Orchestrator", investigation_id,
+                )
 
         if result is not None:
             logger.info(
