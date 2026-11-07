@@ -226,10 +226,10 @@ def route_query_intent_fast(query: str) -> RouteResult:
 
 
 def _finish(result: RouteResult, start: float) -> RouteResult:
-    if result.intent in ("tabular", "document") and wants_generated_deliverable(result.query):
+    if result.intent in ("tabular", "document", "database") and wants_generated_deliverable(result.query):
         logger.info(
             "intent_router: query=%r overriding intent %s -> orchestrator (query asks for a "
-            "generated file/export - tabular/document direct routes have no generate_csv/"
+            "generated file/export - tabular/document/database direct routes have no generate_csv/"
             "generate_report tool)",
             result.query, result.intent,
         )

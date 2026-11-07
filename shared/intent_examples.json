@@ -41,6 +41,27 @@
     "review report"
   ],
 
+  "database": [
+    "query database",
+    "inspect database schema",
+    "query postgresql database",
+    "query mongodb collection",
+    "run sql query",
+    "count rows in database table",
+    "list database tables",
+    "fetch database records",
+    "create chart from database",
+    "aggregate database data",
+    "show database collections",
+    "query table records",
+    "inspect collection schema",
+    "database data analysis",
+    "count records in collection",
+    "show data from database",
+    "bar chart from database table",
+    "build live dashboard for database"
+  ],
+
   "orchestrator": [
     "compare pdf with csv",
     "combine document data",

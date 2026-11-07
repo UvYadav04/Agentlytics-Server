@@ -563,7 +563,7 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     )
     has_files = files_doc is not None or connection_doc is not None
     is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
-    route = route_result.intent if route_result.intent in ("tabular", "document", "orchestrator") else None
+    route = route_result.intent if route_result.intent in ("tabular", "document", "database", "orchestrator") else None
 
     if route_result.intent == "greeting":
         light_route = "greeting"
@@ -761,7 +761,7 @@ async def retry_message(message_id: str, body: RetryMessageRequest, user: User =
     await db[INVESTIGATIONS].insert_one(investigation.to_mongo())
 
     route_result = await asyncio.to_thread(route_query_intent_fast, question.content)
-    route = route_result.intent if route_result.intent in ("tabular", "document") else None
+    route = route_result.intent if route_result.intent in ("tabular", "document", "database") else None
 
     pool = await get_arq_pool()
     await pool.enqueue_job(

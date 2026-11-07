@@ -830,6 +830,10 @@ async def _run_database_direct(
     if not database_connections:
         return None
 
+    connection_id = None
+    if len(database_connections) == 1:
+        connection_id = database_connections[0].get("connection_id")
+
     connection_manager = ConnectionManager(database_access)
     agent = DatabaseAgent(
         connection_manager=connection_manager,
@@ -837,14 +841,15 @@ async def _run_database_direct(
         visualization_service=visualization_service,
         dashboard_service=dashboard_service,
         workspace_id=workspace_id,
+        reports_dir=engine_bootstrap.REPORTS_ROOT,
         direct_route=True,
     )
     findings = await agent.run(
-        query, constraints=constraints or {}, on_event=on_event,
+        query, connection_id=connection_id, constraints=constraints or {}, on_event=on_event,
         thread_context=thread_context, cancel_check=cancel_check, ask_user=ask_user,
     )
     result_collector.add_database_findings(
-        findings, "invoke_database_agent", findings.connection_id or "direct",
+        findings, "invoke_database_agent", findings.connection_id or connection_id or "direct",
     )
     return OrchestratorResult(
         final_answer=findings.summary, chart_paths=result_collector.chart_paths,
@@ -918,19 +923,19 @@ async def run_investigation(
         logger.exception("investigation %s: failed to load database connections", investigation_id)
         database_connections = []
 
-    direct_route = (
-        route
-        if route in ("tabular", "document")
-        and not database_connections
-        and retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES
-        else (
-            "database"
-            if route == "database"
-            and database_connections
-            and retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES
-            else None
-        )
-    )
+    direct_route = None
+    if retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES:
+        if route == "database" and database_connections:
+            direct_route = "database"
+        elif route == "document":
+            direct_route = "document"
+        elif route == "tabular":
+            if not database_connections:
+                direct_route = "tabular"
+            elif not catalog.browsable():
+                direct_route = "database"
+        elif not catalog.browsable() and database_connections:
+            direct_route = "database"
 
     if skipped_files:
         await on_event({
