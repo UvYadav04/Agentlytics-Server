@@ -115,8 +115,34 @@ class VisualizationService:
         final_series = series_column or category
         final_z = z_column or (category if chart_type_norm in ("scatter3d", "surface", "heatmap") else None)
 
-        # Validate column names against available_columns if provided
+        # Validate & reconcile column names against available_columns (case-insensitive & whitespace-tolerant)
         if available_columns:
+            def _find_matching_col(col_name: Optional[str]) -> Optional[str]:
+                if not col_name:
+                    return None
+                target = str(col_name).strip().lower()
+                for ac in available_columns:
+                    if str(ac).strip().lower() == target:
+                        return str(ac)
+                return col_name
+
+            final_label = _find_matching_col(final_label)
+            final_x = _find_matching_col(final_x)
+            final_time = _find_matching_col(final_time)
+            final_val_col = _find_matching_col(final_val_col)
+            final_val_cols = [_find_matching_col(c) for c in final_val_cols if _find_matching_col(c)]
+            final_y = _find_matching_col(final_y)
+            final_series = _find_matching_col(final_series)
+            final_z = _find_matching_col(final_z)
+
+            # Auto-fallback for simple 2-column results (e.g. category + count)
+            if len(available_columns) == 2 and (not final_label or final_label not in available_columns or not final_val_col or final_val_col not in available_columns):
+                final_label = available_columns[0]
+                final_x = available_columns[0]
+                final_val_col = available_columns[1]
+                final_val_cols = [available_columns[1]]
+                final_y = available_columns[1]
+
             needed_cols = [c for c in [final_label, final_x, final_time, final_val_col, final_series, final_y, final_z] if c]
             needed_cols.extend(final_val_cols)
             missing = [c for c in needed_cols if c not in available_columns]

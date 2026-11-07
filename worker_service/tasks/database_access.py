@@ -12,7 +12,12 @@ MAX_OBJECTS_IN_SUMMARY = 60
 def _object_names(connection: DatabaseConnection) -> list[str]:
     names = []
     for obj in connection.db_schema.get("objects", [])[:MAX_OBJECTS_IN_SUMMARY]:
-        names.append(f"{obj['schema']}.{obj['name']}" if obj.get("schema") else obj["name"])
+        if connection.db_type == "mongodb":
+            names.append(obj["name"])
+        elif obj.get("schema") and obj.get("schema") not in ("public", connection.database):
+            names.append(f"{obj['schema']}.{obj['name']}")
+        else:
+            names.append(obj["name"])
     return names
 
 

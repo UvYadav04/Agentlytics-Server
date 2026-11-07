@@ -14,7 +14,7 @@ MAX_LIST_ITEMS = 50
 MAX_DICT_KEYS = 50
 
 
-def safe_serialize(obj: Any, depth: int = 4) -> Any:
+def safe_serialize(obj: Any, depth: int = 12) -> Any:
     """Recursively converts objects to JSON-serializable structures with size safety."""
     if depth <= 0:
         return "<max_depth_reached>"
