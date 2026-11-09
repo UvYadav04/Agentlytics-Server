@@ -326,6 +326,49 @@ def run_postgres_queries(connection_string: str, queries: list[dict], window: Op
     return results
 
 
+ISO_DATE_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$")
+
+
+def _parse_iso(val: Any) -> Any:
+    if isinstance(val, str) and ISO_DATE_REGEX.match(val):
+        try:
+            clean = val.replace("Z", "+00:00")
+            dt = datetime.datetime.fromisoformat(clean)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt
+        except Exception:
+            return val
+    return val
+
+
+def normalize_mongo_pipeline(obj: Any) -> Any:
+    """Recursively converts Extended JSON date/oid operators and ISO string dates into real BSON objects."""
+    if isinstance(obj, dict):
+        if len(obj) == 1 and "$date" in obj and isinstance(obj["$date"], str):
+            return _parse_iso(obj["$date"])
+        if len(obj) == 1 and "$oid" in obj and isinstance(obj["$oid"], str) and ObjectId.is_valid(obj["$oid"]):
+            return ObjectId(obj["$oid"])
+        res = {}
+        for k, v in obj.items():
+            if k in ("$gte", "$gt", "$lte", "$lt", "$eq", "$ne") and isinstance(v, str):
+                dt = _parse_iso(v)
+                res[k] = dt if isinstance(dt, datetime.datetime) else v
+            elif k in ("$in", "$nin") and isinstance(v, list):
+                res[k] = [
+                    _parse_iso(item) if (isinstance(item, str) and ISO_DATE_REGEX.match(item)) else normalize_mongo_pipeline(item)
+                    for item in v
+                ]
+            elif k == "_id" and isinstance(v, str) and ObjectId.is_valid(v):
+                res[k] = ObjectId(v)
+            else:
+                res[k] = normalize_mongo_pipeline(v)
+        return res
+    elif isinstance(obj, list):
+        return [normalize_mongo_pipeline(x) for x in obj]
+    return obj
+
+
 def run_mongo_queries(
     connection_string: str, default_database: Optional[str], queries: list[dict], window: Optional[ResolvedWindow],
 ) -> list:
@@ -344,7 +387,8 @@ def run_mongo_queries(
                 database_name = cleaned.get("database") or default_database
                 if not database_name:
                     raise QueryValidationError("The MongoDB query needs a database name.")
-                pipeline = _bind_pipeline(cleaned["pipeline"], params) + [{"$limit": MAX_ROWS + 1}]
+                normalized = normalize_mongo_pipeline(cleaned["pipeline"])
+                pipeline = _bind_pipeline(normalized, params) + [{"$limit": MAX_ROWS + 1}]
                 cursor = client[database_name][cleaned["collection"]].aggregate(
                     pipeline, maxTimeMS=STATEMENT_TIMEOUT_MS, allowDiskUse=False,
                 )
