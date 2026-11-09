@@ -7,7 +7,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import psycopg
+try:
+    import psycopg
+except Exception:
+    psycopg = None
 from bson import Decimal128, ObjectId
 from pymongo import MongoClient
 

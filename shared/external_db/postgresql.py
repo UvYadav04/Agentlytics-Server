@@ -1,4 +1,7 @@
-import psycopg
+try:
+    import psycopg
+except Exception:
+    psycopg = None
 
 from shared.external_db.errors import DatabaseInspectionError
 from shared.external_db.models import MAX_FIELDS_PER_OBJECT, MAX_OBJECTS, InspectionResult
