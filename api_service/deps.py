@@ -42,6 +42,17 @@ async def get_current_user(access_token: str | None = Cookie(default=None, alias
     return user
 
 
+async def get_optional_user(access_token: str | None = Cookie(default=None, alias=ACCESS_TOKEN_COOKIE_NAME)) -> User | None:
+    if not access_token:
+        return None
+    try:
+        payload = decode_access_token(access_token)
+        doc = await get_db()[USERS].find_one({"_id": payload.sub})
+        return User.from_mongo(doc)
+    except Exception:
+        return None
+
+
 async def get_owned_workspace(workspace_id: str, user: User) -> Workspace:
     doc = await get_db()[WORKSPACES].find_one({"_id": workspace_id, "user_id": user.id})
     workspace = Workspace.from_mongo(doc)

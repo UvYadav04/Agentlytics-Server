@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Data Analyzer API", lifespan=lifespan)
 
-_default_cors_origins = "http://localhost:3000,https://agentlytics.duckdns.org"
+_default_cors_origins = "http://localhost:3000,http://localhost:3001,https://agentlytics.duckdns.org"
 _cors_origins = [
     origin.strip().rstrip("/")
     for origin in get_settings().get("CORS_ORIGINS", _default_cors_origins).split(",")

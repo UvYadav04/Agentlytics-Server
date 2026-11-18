@@ -11,6 +11,7 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -348,6 +349,112 @@ class MonitoringStore:
         except Exception:
             logger.exception("Failed to query slowest spans")
             return []
+
+    def get_dashboard_overview(self) -> dict[str, Any]:
+        """Aggregate high-level overview metrics, timeline points, and component stats from real traces."""
+        try:
+            with self._get_connection() as conn:
+                # 1. Trace durations, errors, and counts
+                trace_query = """
+                SELECT
+                    t.trace_id,
+                    ROUND((MAX(t.end_time) - MIN(t.start_time)), 3) as duration_s,
+                    SUM(CASE WHEN t.status = 'error' THEN 1 ELSE 0 END) as error_count,
+                    substr(MIN(t.created_at), 1, 10) as day
+                FROM spans t
+                GROUP BY t.trace_id
+                """
+                rows = conn.execute(trace_query).fetchall()
+                total_traces = len(rows)
+                durations = []
+                failed_traces = 0
+                days_dict: dict[str, list[float]] = {}
+
+                for r in rows:
+                    dur = r["duration_s"]
+                    if dur is not None and dur > 0:
+                        durations.append(dur)
+                        day = r["day"] or "Unknown"
+                        days_dict.setdefault(day, []).append(dur)
+                    if r["error_count"] > 0:
+                        failed_traces += 1
+
+                durations.sort()
+                p50 = round(durations[int(len(durations) * 0.50)], 2) if durations else 0.0
+                p95 = round(durations[int(len(durations) * 0.95)], 2) if durations else 0.0
+                avg_dur = round(sum(durations) / len(durations), 2) if durations else 0.0
+                error_rate_pct = round((failed_traces / total_traces) * 100, 2) if total_traces else 0.0
+
+                # 2. Token counts & total spans
+                span_query = """
+                SELECT
+                    COUNT(*) as total_spans,
+                    SUM(prompt_tokens) as total_prompt_tokens,
+                    SUM(completion_tokens) as total_completion_tokens,
+                    SUM(total_tokens) as total_tokens,
+                    SUM(CASE WHEN step_type = 'llm' THEN 1 ELSE 0 END) as llm_calls,
+                    SUM(CASE WHEN step_type = 'database' THEN 1 ELSE 0 END) as database_calls
+                FROM spans
+                """
+                s_row = conn.execute(span_query).fetchone()
+                total_spans = s_row["total_spans"] or 0
+                prompt_tokens = s_row["total_prompt_tokens"] or 0
+                completion_tokens = s_row["total_completion_tokens"] or 0
+                total_tokens = s_row["total_tokens"] or (prompt_tokens + completion_tokens)
+                llm_calls = s_row["llm_calls"] or 0
+                database_calls = s_row["database_calls"] or 0
+
+                # 3. Timeline by day
+                timeline = []
+                for day in sorted(days_dict.keys()):
+                    day_durs = sorted(days_dict[day])
+                    cnt = len(day_durs)
+                    d_p50 = round(day_durs[int(cnt * 0.50)], 2) if day_durs else 0.0
+                    d_p95 = round(day_durs[int(cnt * 0.95)], 2) if day_durs else 0.0
+                    try:
+                        dt = datetime.strptime(day, "%Y-%m-%d")
+                        label = dt.strftime("%b %d")
+                    except Exception:
+                        label = day
+                    timeline.append({
+                        "time": label,
+                        "date": day,
+                        "count": cnt,
+                        "p50": d_p50,
+                        "p95": d_p95,
+                    })
+
+                metrics = {
+                    "totalTraces": total_traces,
+                    "totalSpans": total_spans,
+                    "p50LatencySec": p50,
+                    "p95LatencySec": p95,
+                    "avgLatencySec": avg_dur,
+                    "errorRatePct": error_rate_pct,
+                    "failedTracesCount": failed_traces,
+                    "totalTokens": total_tokens,
+                    "inputTokens": prompt_tokens,
+                    "outputTokens": completion_tokens,
+                    "llmCallsCount": llm_calls,
+                    "databaseCallsCount": database_calls,
+                }
+
+                return {
+                    "metrics": metrics,
+                    "timeline": timeline,
+                    "componentStats": self.get_component_stats(since_hours=720),
+                    "slowestSpans": self.get_slowest_spans(limit=20),
+                    "recentTraces": self.get_traces_summary(limit=50),
+                }
+        except Exception:
+            logger.exception("Failed to build dashboard overview")
+            return {
+                "metrics": {},
+                "timeline": [],
+                "componentStats": [],
+                "slowestSpans": [],
+                "recentTraces": [],
+            }
 
     def export_trace_to_file(self, trace_id: str) -> Optional[Path]:
         """Save a complete investigation trace as an isolated JSON file in traces/investigations/."""

@@ -37,3 +37,4 @@ logs/
 
 shared/onnx_intent/weights/model.onnx
 traces/
+scripts/

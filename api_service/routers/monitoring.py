@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from api_service.deps import get_current_user
+from api_service.deps import get_current_user, get_optional_user
 from monitoring.storage import get_monitoring_store
 
 logger = logging.getLogger("api_service.monitoring")
@@ -19,12 +19,21 @@ logger = logging.getLogger("api_service.monitoring")
 router = APIRouter(prefix="/monitoring", tags=["monitoring"])
 
 
+@router.get("/overview")
+async def get_overview(
+    user=Depends(get_optional_user),
+) -> dict[str, Any]:
+    """Retrieve full real dashboard overview metrics, timeline, and traces."""
+    store = get_monitoring_store()
+    return store.get_dashboard_overview()
+
+
 @router.get("/traces")
 async def list_traces(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     status_filter: Optional[str] = Query(default=None, alias="status"),
-    user=Depends(get_current_user),
+    user=Depends(get_optional_user),
 ) -> dict[str, Any]:
     """List investigation traces with aggregated durations, token metrics, and error counts."""
     store = get_monitoring_store()
@@ -40,7 +49,7 @@ async def list_traces(
 @router.get("/traces/{trace_id}")
 async def get_trace_detail(
     trace_id: str,
-    user=Depends(get_current_user),
+    user=Depends(get_optional_user),
 ) -> dict[str, Any]:
     """Retrieve full hierarchical waterfall trace tree for a specific investigation."""
     store = get_monitoring_store()
@@ -55,8 +64,8 @@ async def get_trace_detail(
 
 @router.get("/stats")
 async def get_stats(
-    since_hours: int = Query(default=24, ge=1, le=720),
-    user=Depends(get_current_user),
+    since_hours: int = Query(default=720, ge=1, le=720),
+    user=Depends(get_optional_user),
 ) -> dict[str, Any]:
     """Get aggregated latency, TTFT, token usage, and error rates grouped by component and step type."""
     store = get_monitoring_store()
@@ -70,7 +79,7 @@ async def get_stats(
 @router.get("/slowest")
 async def get_slowest(
     limit: int = Query(default=20, ge=1, le=100),
-    user=Depends(get_current_user),
+    user=Depends(get_optional_user),
 ) -> dict[str, Any]:
     """Retrieve the slowest spans across all traces."""
     store = get_monitoring_store()
@@ -84,7 +93,7 @@ async def get_slowest(
 @router.post("/traces/{trace_id}/export")
 async def export_trace(
     trace_id: str,
-    user=Depends(get_current_user),
+    user=Depends(get_optional_user),
 ) -> dict[str, Any]:
     """Export the trace tree to an isolated JSON file in traces/investigations/."""
     store = get_monitoring_store()

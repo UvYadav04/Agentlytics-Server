@@ -7,6 +7,7 @@ from shared.secret_box import SecretBoxError, decrypt_secret
 logger = logging.getLogger("worker.database_access")
 
 MAX_OBJECTS_IN_SUMMARY = 60
+MAX_FIELDS_IN_SUMMARY = 50
 
 
 def _object_names(connection: DatabaseConnection) -> list[str]:
@@ -21,6 +22,32 @@ def _object_names(connection: DatabaseConnection) -> list[str]:
     return names
 
 
+def _compact_schema(
+    connection: DatabaseConnection, max_objects: int = 40, max_fields: int = MAX_FIELDS_IN_SUMMARY,
+) -> dict[str, dict[str, str]]:
+    """Build a compact {table_name: {column_name: type}} mapping for direct agent context."""
+    schema: dict[str, dict[str, str]] = {}
+    for obj in connection.db_schema.get("objects", [])[:max_objects]:
+        raw_name = obj.get("name")
+        if not raw_name:
+            continue
+        if connection.db_type == "mongodb":
+            table_name = raw_name
+        elif obj.get("schema") and obj.get("schema") not in ("public", connection.database):
+            table_name = f"{obj['schema']}.{raw_name}"
+        else:
+            table_name = raw_name
+
+        fields_dict: dict[str, str] = {}
+        for f in obj.get("fields", [])[:max_fields]:
+            fname = f.get("name")
+            ftype = f.get("type", "string")
+            if fname:
+                fields_dict[fname] = ftype
+        schema[table_name] = fields_dict
+    return schema
+
+
 class WorkspaceDatabaseAccess:
     def __init__(self, db, workspace_id: str):
         self.db = db
@@ -29,7 +56,7 @@ class WorkspaceDatabaseAccess:
     async def summaries(self) -> list[dict]:
         docs = await self.db[DATABASE_CONNECTIONS].find(
             {"workspace_id": self.workspace_id, "encrypted_connection_string": {"$ne": None}},
-            {"db_schema.objects.fields": 0, "db_schema.objects.foreign_keys": 0},
+            {"db_schema.objects.foreign_keys": 0},
         ).to_list(length=50)
         summaries = []
         for doc in docs:
@@ -42,6 +69,7 @@ class WorkspaceDatabaseAccess:
                 "db_type": connection.db_type,
                 "database": connection.database,
                 "objects": _object_names(connection),
+                "schema": _compact_schema(connection),
             })
         return summaries
 
@@ -66,4 +94,5 @@ class WorkspaceDatabaseAccess:
             "name": connection.name,
             "db_type": connection.db_type,
             "database": connection.database,
+            "db_schema": connection.db_schema,
         }, connection_string
