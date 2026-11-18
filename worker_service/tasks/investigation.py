@@ -354,6 +354,7 @@ async def update_chat_memory(
     ctx, chat_id: str, user_id: str, query: str, response: str,
     files_used: list, files_created: list, requested_at: str | None = None,
     message_id: str | None = None, supersedes: str | None = None,
+    agent: str | None = None,
 ) -> None:
     picked_up_at = log_job_picked_up(
         logger, ctx, "update_chat_memory", requested_at=requested_at, chat_id=chat_id,
@@ -381,6 +382,8 @@ async def update_chat_memory(
         new_turn = {"query": query, "response": response}
         if message_id:
             new_turn["message_id"] = message_id
+        if agent:
+            new_turn["agent"] = agent
         combined_turns = existing_turns + [new_turn]
         overflow_turns = combined_turns[:-RECENT_TURNS_LIMIT] if len(combined_turns) > RECENT_TURNS_LIMIT else []
         recent_turns = combined_turns[-RECENT_TURNS_LIMIT:]
@@ -685,6 +688,7 @@ async def _with_retries(coro_fn, *, attempts: int = 3, base_delay: float = 1.0, 
 async def _finalize_investigation_bookkeeping(
     ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
     files_used: list, artifact_refs: list, message_id: str | None = None, supersedes: str | None = None,
+    agent: str | None = None,
 ) -> None:
     await _with_retries(
         lambda: db[INVESTIGATIONS].update_one(
@@ -714,7 +718,7 @@ async def _finalize_investigation_bookkeeping(
             "update_chat_memory",
             chat_id=chat_id, user_id=user_id, query=query, response=final_answer,
             files_used=files_used, files_created=artifact_refs, requested_at=now_iso(),
-            message_id=message_id, supersedes=supersedes,
+            message_id=message_id, supersedes=supersedes, agent=agent,
         ),
         description=f"chat memory enqueue (investigation {investigation_id})",
     )
@@ -732,15 +736,33 @@ async def _finalize_investigation_bookkeeping(
 def _schedule_finalize(
     ctx, db, investigation_id: str, chat_id: str, user_id: str, query: str, final_answer: str,
     files_used: list, artifact_refs: list, message_id: str | None = None, supersedes: str | None = None,
+    agent: str | None = None,
 ) -> None:
     task = asyncio.create_task(
         _finalize_investigation_bookkeeping(
             ctx, db, investigation_id, chat_id, user_id, query, final_answer, files_used, artifact_refs,
-            message_id, supersedes,
+            message_id, supersedes, agent=agent,
         )
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+def _resolve_orchestrator_agent(orchestrator) -> str:
+    try:
+        completed = getattr(getattr(getattr(orchestrator, "tools", None), "state", None), "completed_tasks", []) or []
+        agent_types = set()
+        for task in completed:
+            evt = getattr(task, "event_type", None)
+            if evt in ("tabular", "database"):
+                agent_types.add(evt)
+            elif evt in ("document", "document_processor"):
+                agent_types.add("document")
+        if len(agent_types) == 1:
+            return next(iter(agent_types))
+    except Exception:
+        pass
+    return "orchestrator"
 
 
 def _select_direct_route_files(catalog: FileCatalog, mentioned_file_ids: list, kind: str) -> list | None:
@@ -932,9 +954,9 @@ async def run_investigation(
         elif route == "tabular":
             if not database_connections:
                 direct_route = "tabular"
-            elif not catalog.browsable():
+            elif not catalog.browsable() and not mentioned_file_ids:
                 direct_route = "database"
-        elif not catalog.browsable() and database_connections:
+        elif not catalog.browsable() and database_connections and not mentioned_file_ids:
             direct_route = "database"
 
     if skipped_files:
@@ -1050,7 +1072,9 @@ async def run_investigation(
                     "falling back to the Orchestrator", investigation_id,
                 )
 
+        handling_agent = "orchestrator"
         if result is not None:
+            handling_agent = direct_route
             logger.info(
                 "investigation %s: handled directly by the %s agent (Orchestrator skipped)",
                 investigation_id, direct_route,
@@ -1071,7 +1095,8 @@ async def run_investigation(
                 on_event=on_event, cancel_check=cancel_check, ask_user=ask_user,
                 database_connections=database_connections,
             )
-        return result
+            handling_agent = _resolve_orchestrator_agent(orchestrator)
+        return result, handling_agent
 
     try:
         try:
@@ -1082,7 +1107,7 @@ async def run_investigation(
             await _set_stage(db, investigation_id, "running")
 
             try:
-                result = await _dispatch(_without_turn(thread_context, retry["retry_of"], query))
+                result, handling_agent = await _dispatch(_without_turn(thread_context, retry["retry_of"], query))
             except Exception as exc:
                 error_info = classify_llm_error(exc)
                 safe_to_retry = (
@@ -1105,7 +1130,7 @@ async def run_investigation(
                         {"_id": chat_id}, {"$set": {"summary": new_summary, "recent_turns": kept_turns}},
                     )
                     await _set_stage(db, investigation_id, "running")
-                    result = await _dispatch(_without_turn(thread_context, retry["retry_of"], query))
+                    result, handling_agent = await _dispatch(_without_turn(thread_context, retry["retry_of"], query))
                 else:
                     raise
         except InvestigationCancelled:
@@ -1224,6 +1249,7 @@ async def run_investigation(
         _schedule_finalize(
             ctx, db, investigation_id, chat_id, user_id, query, result.final_answer,
             result.files_used, result.artifact_refs, message.id, retry["retry_of"],
+            agent=handling_agent,
         )
     finally:
         log_job_finished(logger, "run_investigation", picked_up_at, investigation_id=investigation_id, chat_id=chat_id)

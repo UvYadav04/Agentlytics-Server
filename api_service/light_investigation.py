@@ -71,69 +71,89 @@ async def _run(
     requested_at: str | None, file_ids: list[str], email: str | None = None,
     reply_to: str | None = None,
 ) -> None:
-    db = get_db()
-    result = None
     try:
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            result = await asyncio.to_thread(generate_light_reply, query, route)
-            if result.content:
-                break
-            logger.warning(
-                "light_investigation: attempt %d/%d failed for investigation %s (%s)",
-                attempt, MAX_ATTEMPTS, investigation_id, result.error,
-            )
-            if attempt < MAX_ATTEMPTS:
-                await _append_event(db, investigation_id, "status", RETRY_STATUS_MESSAGE)
-
-        if result is None or not result.content:
-            await _fallback_to_orchestrator(
-                db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids, email,
-            )
-            return
-
-        message = Message(
-            chat_id=chat_id, role="assistant", content=result.content, investigation_id=investigation_id,
-            reply_to=reply_to,
-        )
-        await db[MESSAGES].insert_one(message.to_mongo())
-        await db[INVESTIGATIONS].update_one(
-            {"_id": investigation_id},
-            {"$set": {
-                "status": "completed", "final_answer": result.content,
-                "completed_at": datetime.now(timezone.utc),
-            }},
-        )
-        await usage.increment_messages(user_id)
-        await _append_event(
-            db, investigation_id, "completed", "Investigation complete.",
-            {"message_id": message.id, "chart_ids": [], "report_id": None},
-        )
-        logger.info(
-            "light_investigation: investigation %s completed via %s route (model=%s, latency_ms=%.1f)",
-            investigation_id, route, result.model, result.latency_ms,
-        )
-
-       
-        pool = await get_arq_pool()
-        await pool.enqueue_job(
-            "update_chat_memory",
-            chat_id=chat_id, user_id=user_id, query=query, response=result.content,
-            files_used=[], files_created=[], requested_at=requested_at, message_id=message.id,
+        from monitoring import trace_scope
+        monitoring_cm = trace_scope(
+            investigation_id,
+            tags={
+                "investigation_id": investigation_id,
+                "chat_id": chat_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id or "",
+                "user_email": email or "",
+                "route": route or "light",
+                "query": query or "",
+            },
         )
     except Exception:
-        logger.exception(
-            "light_investigation: unhandled failure for investigation %s - attempting fallback", investigation_id,
-        )
+        from contextlib import nullcontext
+        monitoring_cm = nullcontext()
+
+    with monitoring_cm:
+        db = get_db()
+        result = None
         try:
-            await _fallback_to_orchestrator(
-                db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids, email,
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                result = await asyncio.to_thread(generate_light_reply, query, route)
+                if result.content:
+                    break
+                logger.warning(
+                    "light_investigation: attempt %d/%d failed for investigation %s (%s)",
+                    attempt, MAX_ATTEMPTS, investigation_id, result.error,
+                )
+                if attempt < MAX_ATTEMPTS:
+                    await _append_event(db, investigation_id, "status", RETRY_STATUS_MESSAGE)
+
+            if result is None or not result.content:
+                await _fallback_to_orchestrator(
+                    db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids, email,
+                )
+                return
+
+            message = Message(
+                chat_id=chat_id, role="assistant", content=result.content, investigation_id=investigation_id,
+                reply_to=reply_to,
+            )
+            await db[MESSAGES].insert_one(message.to_mongo())
+            await db[INVESTIGATIONS].update_one(
+                {"_id": investigation_id},
+                {"$set": {
+                    "status": "completed", "final_answer": result.content,
+                    "completed_at": datetime.now(timezone.utc),
+                }},
+            )
+            await usage.increment_messages(user_id)
+            await _append_event(
+                db, investigation_id, "completed", "Investigation complete.",
+                {"message_id": message.id, "chart_ids": [], "report_id": None},
+            )
+            logger.info(
+                "light_investigation: investigation %s completed via %s route (model=%s, latency_ms=%.1f)",
+                investigation_id, route, result.model, result.latency_ms,
+            )
+
+           
+            pool = await get_arq_pool()
+            await pool.enqueue_job(
+                "update_chat_memory",
+                chat_id=chat_id, user_id=user_id, query=query, response=result.content,
+                files_used=[], files_created=[], requested_at=requested_at, message_id=message.id,
+                agent=route,
             )
         except Exception:
             logger.exception(
-                "light_investigation: fallback enqueue itself failed for investigation %s", investigation_id,
+                "light_investigation: unhandled failure for investigation %s - attempting fallback", investigation_id,
             )
-            await _append_event(db, investigation_id, "error", "Something went wrong generating a reply.")
-            await db[INVESTIGATIONS].update_one(
-                {"_id": investigation_id},
-                {"$set": {"status": "failed", "completed_at": datetime.now(timezone.utc)}},
-            )
+            try:
+                await _fallback_to_orchestrator(
+                    db, investigation_id, chat_id, workspace_id, user_id, query, requested_at, file_ids, email,
+                )
+            except Exception:
+                logger.exception(
+                    "light_investigation: fallback enqueue itself failed for investigation %s", investigation_id,
+                )
+                await _append_event(db, investigation_id, "error", "Something went wrong generating a reply.")
+                await db[INVESTIGATIONS].update_one(
+                    {"_id": investigation_id},
+                    {"$set": {"status": "failed", "completed_at": datetime.now(timezone.utc)}},
+                )

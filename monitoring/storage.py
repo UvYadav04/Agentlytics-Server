@@ -20,15 +20,43 @@ from monitoring.schema import SpanRecord, SpanStatus, StepType
 
 logger = logging.getLogger("monitoring.storage")
 
-# Default trace directory inside Server/traces
-_DEFAULT_BASE_DIR = Path(__file__).resolve().parent.parent / "traces"
-TRACES_DIR = Path(os.environ.get("MONITORING_TRACES_DIR") or _DEFAULT_BASE_DIR).resolve()
-DB_PATH = Path(os.environ.get("MONITORING_DB_PATH") or (TRACES_DIR / "traces.db")).resolve()
+# Trace directory and SQLite DB resolution:
+# 1. MONITORING_DB_PATH / MONITORING_TRACES_DIR environment variables
+# 2. Container bound volume at /app/traces / /app/traces/traces.db
+# 3. Default relative to Server/traces
+def _resolve_traces_dir() -> Path:
+    env_dir = os.environ.get("MONITORING_TRACES_DIR")
+    if env_dir:
+        p = Path(env_dir).resolve()
+        if p.exists() or p.parent.exists():
+            return p
+    docker_dir = Path("/app/traces")
+    if docker_dir.is_dir():
+        return docker_dir.resolve()
+    repo_dir = Path(__file__).resolve().parent.parent / "traces"
+    return repo_dir.resolve()
+
+
+def _resolve_db_path() -> Path:
+    env_db = os.environ.get("MONITORING_DB_PATH")
+    if env_db:
+        p = Path(env_db).resolve()
+        if p.exists() or p.parent.exists():
+            return p
+    docker_db = Path("/app/traces/traces.db")
+    if docker_db.exists():
+        return docker_db.resolve()
+    traces_dir = _resolve_traces_dir()
+    return (traces_dir / "traces.db").resolve()
+
+
+TRACES_DIR = _resolve_traces_dir()
+DB_PATH = _resolve_db_path()
 
 
 class MonitoringStore:
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = db_path or _resolve_db_path()
         self._ensure_dir_and_db()
 
     def _ensure_dir_and_db(self) -> None:
@@ -146,10 +174,15 @@ class MonitoringStore:
 
     def get_trace_spans(self, trace_id: str) -> list[dict[str, Any]]:
         """Retrieve all spans for an investigation trace in execution order."""
-        query = "SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time ASC"
+        query = """
+        SELECT * FROM spans 
+        WHERE trace_id = ? 
+           OR json_extract(tags_json, '$.investigation_id') = ?
+        ORDER BY start_time ASC
+        """
         try:
             with self._get_connection() as conn:
-                rows = conn.execute(query, (trace_id,)).fetchall()
+                rows = conn.execute(query, (trace_id, trace_id)).fetchall()
                 return [self._row_to_dict(r) for r in rows]
         except Exception:
             logger.exception("Failed to query trace %s", trace_id)
@@ -192,7 +225,7 @@ class MonitoringStore:
 
         query = f"""
         SELECT
-            t.trace_id,
+            COALESCE(json_extract(t.tags_json, '$.investigation_id'), t.trace_id) as request_id,
             MIN(t.start_time) as start_time,
             MAX(t.end_time) as end_time,
             ROUND((MAX(t.end_time) - MIN(t.start_time)) * 1000, 2) as total_duration_ms,
@@ -202,13 +235,12 @@ class MonitoringStore:
             SUM(t.completion_tokens) as total_completion_tokens,
             SUM(t.total_tokens) as total_tokens,
             MAX(t.created_at) as created_at,
-            r.step_name as root_step_name,
-            r.component as root_component,
-            r.inputs_json as root_inputs,
-            r.tags_json as root_tags
+            (SELECT s.step_name FROM spans s WHERE (s.trace_id = t.trace_id OR json_extract(s.tags_json, '$.investigation_id') = COALESCE(json_extract(t.tags_json, '$.investigation_id'), t.trace_id)) AND (s.parent_span_id IS NULL OR s.parent_span_id = '') LIMIT 1) as root_step_name,
+            (SELECT s.component FROM spans s WHERE (s.trace_id = t.trace_id OR json_extract(s.tags_json, '$.investigation_id') = COALESCE(json_extract(t.tags_json, '$.investigation_id'), t.trace_id)) AND (s.parent_span_id IS NULL OR s.parent_span_id = '') LIMIT 1) as root_component,
+            (SELECT s.inputs_json FROM spans s WHERE (s.trace_id = t.trace_id OR json_extract(s.tags_json, '$.investigation_id') = COALESCE(json_extract(t.tags_json, '$.investigation_id'), t.trace_id)) AND (s.inputs_json LIKE '%"objective"%' OR s.inputs_json LIKE '%"query"%' OR s.inputs_json LIKE '%"prompt"%') ORDER BY s.start_time ASC LIMIT 1) as query_inputs,
+            (SELECT s.tags_json FROM spans s WHERE (s.trace_id = t.trace_id OR json_extract(s.tags_json, '$.investigation_id') = COALESCE(json_extract(t.tags_json, '$.investigation_id'), t.trace_id)) AND (s.tags_json LIKE '%"query"%' OR s.tags_json LIKE '%"objective"%') ORDER BY s.start_time ASC LIMIT 1) as query_tags
         FROM spans t
-        LEFT JOIN spans r ON r.trace_id = t.trace_id AND (r.parent_span_id IS NULL OR r.parent_span_id = '')
-        GROUP BY t.trace_id
+        GROUP BY request_id
         {where_clause}
         ORDER BY start_time DESC
         LIMIT ? OFFSET ?
@@ -221,29 +253,30 @@ class MonitoringStore:
                 results = []
                 for row in rows:
                     d = dict(row)
+                    d["trace_id"] = d.get("request_id") or d.get("trace_id")
                     step_name = d.get("root_step_name") or ""
                     component = d.get("root_component") or ""
                     inputs = {}
-                    if d.get("root_inputs"):
+                    if d.get("query_inputs"):
                         try:
-                            inputs = json.loads(d["root_inputs"])
+                            inputs = json.loads(d["query_inputs"])
                         except Exception:
                             pass
                     tags = {}
-                    if d.get("root_tags"):
+                    if d.get("query_tags"):
                         try:
-                            tags = json.loads(d["root_tags"])
+                            tags = json.loads(d["query_tags"])
                         except Exception:
                             pass
 
                     # Extract natural query / objective
-                    q = inputs.get("objective") or inputs.get("query") or inputs.get("question") or ""
+                    q = inputs.get("objective") or inputs.get("query") or inputs.get("question") or inputs.get("prompt") or tags.get("query") or tags.get("objective") or ""
                     if not q and "messages" in inputs:
                         msgs = inputs["messages"]
                         if msgs and isinstance(msgs, list):
                             q = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else str(msgs[-1])
                     if not q:
-                        q = "Execution of " + (step_name or component or "data pipeline")
+                        q = "Execution of " + (step_name or component or "Data Query")
 
                     # Classify intent & route based on Quarry architecture
                     if "tabular" in step_name or "tabular" in component:
@@ -354,15 +387,15 @@ class MonitoringStore:
         """Aggregate high-level overview metrics, timeline points, and component stats from real traces."""
         try:
             with self._get_connection() as conn:
-                # 1. Trace durations, errors, and counts
+                # 1. Trace durations, errors, and counts grouped by request
                 trace_query = """
                 SELECT
-                    t.trace_id,
+                    COALESCE(json_extract(t.tags_json, '$.investigation_id'), t.trace_id) as request_id,
                     ROUND((MAX(t.end_time) - MIN(t.start_time)), 3) as duration_s,
                     SUM(CASE WHEN t.status = 'error' THEN 1 ELSE 0 END) as error_count,
                     substr(MIN(t.created_at), 1, 10) as day
                 FROM spans t
-                GROUP BY t.trace_id
+                GROUP BY request_id
                 """
                 rows = conn.execute(trace_query).fetchall()
                 total_traces = len(rows)

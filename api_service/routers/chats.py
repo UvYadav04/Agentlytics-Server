@@ -552,8 +552,13 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     )
 
     
+    history_lines = [
+        f'- "{t.get("query", "").strip().replace(chr(10), " ")[:120]}" [Agent: {t.get("agent", "orchestrator")}]'
+        for t in (chat.recent_turns or [])[-5:]
+    ]
+
     route_result, files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
-        asyncio.to_thread(route_query_intent_fast, body.content),
+        asyncio.to_thread(route_query_intent_fast, body.content, history=history_lines, file_ids=body.file_ids),
         db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
         db[DATABASE_CONNECTIONS].find_one(
             {"workspace_id": chat.workspace_id, "encrypted_connection_string": {"$ne": None}}, {"_id": 1},
@@ -760,7 +765,13 @@ async def retry_message(message_id: str, body: RetryMessageRequest, user: User =
     )
     await db[INVESTIGATIONS].insert_one(investigation.to_mongo())
 
-    route_result = await asyncio.to_thread(route_query_intent_fast, question.content)
+    history_lines = [
+        f'- "{t.get("query", "").strip().replace(chr(10), " ")[:120]}" [Agent: {t.get("agent", "orchestrator")}]'
+        for t in (chat.recent_turns or [])[-5:]
+    ]
+    route_result = await asyncio.to_thread(
+        route_query_intent_fast, question.content, history=history_lines, file_ids=file_ids,
+    )
     route = route_result.intent if route_result.intent in ("tabular", "document", "database") else None
 
     pool = await get_arq_pool()

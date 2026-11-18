@@ -18,6 +18,8 @@ from monitoring.context import (
     get_current_span_id,
     get_current_tags,
     get_current_trace_id,
+    reset_trace_id,
+    set_trace_id,
     span_scope,
 )
 from monitoring.schema import SpanRecord, SpanStatus, StepType
@@ -41,7 +43,8 @@ class TraceSpanContext:
         self.name = name
         self.component = component
         self.step_type = step_type
-        self.trace_id = trace_id or get_current_trace_id() or f"trc_qry_{generate_span_id()[4:12]}"
+        # Inherit active ambient trace ID (e.g. investigation_id) or explicit trace_id, or generate request trace
+        self.trace_id = get_current_trace_id() or trace_id or f"trc_req_{generate_span_id()[4:12]}"
         self.parent_span_id = get_current_span_id()
         self.span_id = generate_span_id()
         self.inputs = inputs or {}
@@ -54,7 +57,8 @@ class TraceSpanContext:
         self.start_time: float = 0.0
         self.end_time: float = 0.0
         self.duration_ms: float = 0.0
-        self._scope_token = None
+        self._trace_token = None
+        self._scope = None
 
     def set_metric(self, key: str, value: Any) -> None:
         self.metrics[key] = value
@@ -67,6 +71,9 @@ class TraceSpanContext:
 
     def __enter__(self) -> TraceSpanContext:
         self.start_time = time.time()
+        # Ensure ambient trace context is propagated to all child steps / LLM calls / tool invocations
+        if get_current_trace_id() != self.trace_id:
+            self._trace_token = set_trace_id(self.trace_id)
         self._scope = span_scope(self.span_id)
         self._scope.__enter__()
         return self
@@ -86,9 +93,17 @@ class TraceSpanContext:
             self.status = SpanStatus.SUCCESS.value
 
         try:
-            self._scope.__exit__(exc_type, exc_val, exc_tb)
+            if self._scope is not None:
+                self._scope.__exit__(exc_type, exc_val, exc_tb)
         except Exception:
             pass
+
+        if self._trace_token is not None:
+            try:
+                reset_trace_id(self._trace_token)
+            except Exception:
+                pass
+            self._trace_token = None
 
         self._flush()
 
@@ -127,11 +142,19 @@ def trace_span(
     name: str,
     component: str,
     step_type: str = StepType.CUSTOM.value,
+    trace_id: Optional[str] = None,
     inputs: Optional[dict[str, Any]] = None,
     tags: Optional[dict[str, Any]] = None,
 ) -> TraceSpanContext:
     """Create a context manager for tracking an execution span."""
-    return TraceSpanContext(name=name, component=component, step_type=step_type, inputs=inputs, tags=tags)
+    return TraceSpanContext(
+        name=name,
+        component=component,
+        step_type=step_type,
+        trace_id=trace_id,
+        inputs=inputs,
+        tags=tags,
+    )
 
 
 def trace_step(

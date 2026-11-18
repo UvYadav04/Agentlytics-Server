@@ -30,6 +30,34 @@ _DELIVERABLE_PATTERN = re.compile(
 def wants_generated_deliverable(query: str) -> bool:
     return bool(_DELIVERABLE_PATTERN.search(query))
 
+
+_FILE_MENTION_PATTERN = re.compile(
+    r"(?:@[\w\-.]+\.(?:pdf|csv|xlsx|xls|parquet|json|txt|docx)\b|[\w\-.]+\.(?:pdf|csv|xlsx|xls|parquet|json|docx)\b)",
+    re.IGNORECASE,
+)
+_DB_KEYWORDS_PATTERN = re.compile(
+    r"\b(?:database|postgres|postgresql|mongodb|sql\b|sql\s+query|db\s+schema|from\s+db|in\s+my\s+db|in\s+the\s+db|database\s+table|database\s+collection)\b",
+    re.IGNORECASE,
+)
+
+
+def has_file_context(query: str, file_ids: list[str] | None = None) -> bool:
+    return bool(file_ids) or bool(_FILE_MENTION_PATTERN.search(query))
+
+
+def has_db_keywords(query: str) -> bool:
+    return bool(_DB_KEYWORDS_PATTERN.search(query))
+
+
+def extract_last_agent(history: list[str] | None) -> str | None:
+    if not history:
+        return None
+    for entry in reversed(history):
+        match = re.search(r"\[(?:Agent|Handled by):\s*(\w+)\]", entry, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+    return None
+
 _EXAMPLES_PATH_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intent_examples.json")
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.60
@@ -156,8 +184,8 @@ def _is_confident(top_similarity: float, margin: float) -> bool:
     return top_similarity >= similarity_threshold() and margin >= margin_threshold()
 
 
-def _llm_fallback(query: str, timeout: float, embedding_fields: dict) -> RouteResult:
-    llm_result = classify_intent(query, timeout=timeout)
+def _llm_fallback(query: str, timeout: float, embedding_fields: dict, history: list[str] | None = None) -> RouteResult:
+    llm_result = classify_intent(query, history=history, timeout=timeout)
     return RouteResult(
         query=query,
         intent=llm_result.top_label,    
@@ -168,7 +196,13 @@ def _llm_fallback(query: str, timeout: float, embedding_fields: dict) -> RouteRe
     )
 
 
-def route_query_intent(query: str, timeout: float = 30.0, llm_fallback: bool = True) -> RouteResult:
+def route_query_intent(
+    query: str,
+    history: list[str] | None = None,
+    file_ids: list[str] | None = None,
+    timeout: float = 30.0,
+    llm_fallback: bool = True,
+) -> RouteResult:
     start = time.perf_counter()
     no_embedding_fields = {
         "top_intent": None, "top_similarity": 0.0,
@@ -177,7 +211,7 @@ def route_query_intent(query: str, timeout: float = 30.0, llm_fallback: bool = T
 
     def _unresolved(error: str | None) -> RouteResult:
         if llm_fallback:
-            result = _llm_fallback(query, timeout, no_embedding_fields)
+            result = _llm_fallback(query, timeout, no_embedding_fields, history=history)
             if error:
                 result.error = error
             return result
@@ -187,7 +221,7 @@ def route_query_intent(query: str, timeout: float = 30.0, llm_fallback: bool = T
         )
 
     if _index is None and not init():
-        return _finish(_unresolved(None), start)
+        return _finish(_unresolved(None), start, history=history, file_ids=file_ids)
 
     try:
         query_vec = _normalize_rows(_embed([query]))[0]
@@ -197,7 +231,7 @@ def route_query_intent(query: str, timeout: float = 30.0, llm_fallback: bool = T
         margin = top_similarity - second_similarity
     except Exception as exc:
         logger.warning("intent_router: embedding call failed (%s)", exc)
-        return _finish(_unresolved(str(exc)), start)
+        return _finish(_unresolved(str(exc)), start, history=history, file_ids=file_ids)
 
     embedding_fields = {
         "top_intent": top_intent, "top_similarity": top_similarity,
@@ -209,23 +243,33 @@ def route_query_intent(query: str, timeout: float = 30.0, llm_fallback: bool = T
             query=query, intent=top_intent, method="embedding", llm_result=None, error=None,
             **embedding_fields,
         )
-        return _finish(result, start)
+        return _finish(result, start, history=history, file_ids=file_ids)
 
     if llm_fallback:
-        result = _llm_fallback(query, timeout, embedding_fields)
+        result = _llm_fallback(query, timeout, embedding_fields, history=history)
     else:
         result = RouteResult(
             query=query, intent=top_intent, method="none", llm_result=None, error=None,
             **embedding_fields,
         )
-    return _finish(result, start)
+    return _finish(result, start, history=history, file_ids=file_ids)
 
 
-def route_query_intent_fast(query: str) -> RouteResult:
-    return route_query_intent(query, llm_fallback=False)
+def route_query_intent_fast(
+    query: str,
+    history: list[str] | None = None,
+    file_ids: list[str] | None = None,
+) -> RouteResult:
+    return route_query_intent(query, history=history, file_ids=file_ids, llm_fallback=False)
 
 
-def _finish(result: RouteResult, start: float) -> RouteResult:
+def _finish(
+    result: RouteResult,
+    start: float,
+    history: list[str] | None = None,
+    file_ids: list[str] | None = None,
+) -> RouteResult:
+    # 1. Deliverable exports override -> orchestrator
     if result.intent in ("tabular", "document", "database") and wants_generated_deliverable(result.query):
         logger.info(
             "intent_router: query=%r overriding intent %s -> orchestrator (query asks for a "
@@ -234,6 +278,26 @@ def _finish(result: RouteResult, start: float) -> RouteResult:
             result.query, result.intent,
         )
         result.intent = "orchestrator"
+
+    # 2. File context / history guardrail against spurious database routing
+    if result.intent == "database" and not has_db_keywords(result.query):
+        if has_file_context(result.query, file_ids):
+            is_spreadsheet = bool(re.search(r"\.(?:csv|xlsx|xls|parquet)\b", result.query, re.IGNORECASE))
+            override_intent = "tabular" if (is_spreadsheet and not wants_generated_deliverable(result.query)) else "orchestrator"
+            logger.info(
+                "intent_router: query=%r overriding intent database -> %s (file context detected without explicit database keywords)",
+                result.query, override_intent,
+            )
+            result.intent = override_intent
+        elif history:
+            recent_agent = extract_last_agent(history)
+            if recent_agent in ("document", "tabular"):
+                override_intent = "tabular" if (recent_agent == "tabular" and not wants_generated_deliverable(result.query)) else "orchestrator"
+                logger.info(
+                    "intent_router: query=%r overriding intent database -> %s (recent turn handled by %s without explicit database keywords)",
+                    result.query, override_intent, recent_agent,
+                )
+                result.intent = override_intent
 
     result.latency_ms = (time.perf_counter() - start) * 1000
     logger.info(

@@ -11,6 +11,7 @@ import inspect
 import logging
 from typing import Any, Callable, Optional
 
+from monitoring.context import get_current_trace_id
 from monitoring.sanitizer import safe_serialize
 from monitoring.schema import StepType
 from monitoring.wrappers.base import trace_span
@@ -27,13 +28,27 @@ def trace_agent(name: Optional[str] = None, component: str = "agent"):
         async def async_wrapper(*args, **kwargs):
             objective = kwargs.get("objective") or kwargs.get("task") or (args[1] if len(args) > 1 else "")
             constraints = kwargs.get("constraints") or {}
+            investigation_id = (
+                kwargs.get("investigation_id")
+                or kwargs.get("trace_id")
+                or (constraints if isinstance(constraints, dict) else {}).get("investigation_id")
+                or get_current_trace_id()
+            )
 
             inputs = {
                 "objective": safe_serialize(objective),
                 "constraints": safe_serialize(constraints),
             }
+            tags = {"objective": str(objective)[:250]} if objective else {}
 
-            with trace_span(name=agent_name, component=component, step_type=StepType.AGENT.value, inputs=inputs) as span:
+            with trace_span(
+                name=agent_name,
+                component=component,
+                step_type=StepType.AGENT.value,
+                trace_id=investigation_id,
+                inputs=inputs,
+                tags=tags,
+            ) as span:
                 result = await fn(*args, **kwargs)
                 span.set_output("result", safe_serialize(result))
                 return result
@@ -42,13 +57,27 @@ def trace_agent(name: Optional[str] = None, component: str = "agent"):
         def sync_wrapper(*args, **kwargs):
             objective = kwargs.get("objective") or kwargs.get("task") or (args[1] if len(args) > 1 else "")
             constraints = kwargs.get("constraints") or {}
+            investigation_id = (
+                kwargs.get("investigation_id")
+                or kwargs.get("trace_id")
+                or (constraints if isinstance(constraints, dict) else {}).get("investigation_id")
+                or get_current_trace_id()
+            )
 
             inputs = {
                 "objective": safe_serialize(objective),
                 "constraints": safe_serialize(constraints),
             }
+            tags = {"objective": str(objective)[:250]} if objective else {}
 
-            with trace_span(name=agent_name, component=component, step_type=StepType.AGENT.value, inputs=inputs) as span:
+            with trace_span(
+                name=agent_name,
+                component=component,
+                step_type=StepType.AGENT.value,
+                trace_id=investigation_id,
+                inputs=inputs,
+                tags=tags,
+            ) as span:
                 result = fn(*args, **kwargs)
                 span.set_output("result", safe_serialize(result))
                 return result

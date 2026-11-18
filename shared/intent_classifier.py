@@ -74,6 +74,11 @@ Categories & Guidelines:
 - Example: "Correlate the executive summary with the database records and export the results to a CSV."
   Output: {"intent": "orchestrator", "reasoning": "Requires cross-referencing document text with database records and exporting a deliverable file.", "response": "", "confidence": 0.98}
 
+7. follow-up & conversation history guidelines
+- When recent conversation turns are provided, use them to resolve ambiguous follow-up requests.
+- If previous turns were handled by "document" or "tabular" analyzing uploaded files (PDFs, spreadsheets), and the user asks a follow-up or asks for a chart/summary on that data without explicitly asking for a database query, classify as "document", "tabular", or "orchestrator" - NEVER "database".
+- If the user request mentions an uploaded file (e.g., @statement.pdf, @file.csv), classify based on the file type (tabular for spreadsheets, document for PDFs/text) or orchestrator if visualization/multi-step is needed - NOT database unless database tables/collections/SQL are explicitly requested.
+
 Return ONLY valid JSON matching this schema:
 {
   "intent": "database",
@@ -119,7 +124,7 @@ def _parse_reply(raw_text: str) -> tuple[str | None, float, str | None]:
 
 
 @trace_step(name="classify_intent", component="intent.classifier", step_type="router")
-def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
+def classify_intent(query: str, history: list[str] | None = None, timeout: float = 30.0) -> IntentResult:
     settings = get_settings()
     model = settings.get("INTENT_CLASSIFIER_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
     api_key = settings.get("DEEPINFRA_API_KEY")
@@ -133,9 +138,15 @@ def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
             latency_ms=latency_ms, error="DEEPINFRA_API_KEY not configured",
         )
 
+    user_content = query
+    if history:
+        history_str = "\n".join(history)
+        user_content = f"Recent conversation turns:\n{history_str}\n\nCurrent user request:\n{query}"
+
     cache_enabled = (settings.get("INTENT_CACHE_ENABLED", "true") or "true").lower() != "false"
+    cache_key = user_content if history else query
     if cache_enabled:
-        cached_value = cached_check(_CACHE_NAME, query, distance_threshold=_CACHE_DISTANCE_THRESHOLD, ttl=_CACHE_TTL_SECONDS)
+        cached_value = cached_check(_CACHE_NAME, cache_key, distance_threshold=_CACHE_DISTANCE_THRESHOLD, ttl=_CACHE_TTL_SECONDS)
         if cached_value is not None:
             intent, _, confidence_str = cached_value.partition("|")
             try:
@@ -159,7 +170,7 @@ def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
             model=model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": query},
+                {"role": "user", "content": user_content},
             ],
             max_tokens=200,
             temperature=0,
@@ -173,7 +184,7 @@ def classify_intent(query: str, timeout: float = 30.0) -> IntentResult:
             top_label, top_score = intent, confidence
             if cache_enabled:
                 cached_store(
-                    _CACHE_NAME, query, f"{intent}|{confidence}",
+                    _CACHE_NAME, cache_key, f"{intent}|{confidence}",
                     distance_threshold=_CACHE_DISTANCE_THRESHOLD, ttl=_CACHE_TTL_SECONDS,
                 )
         error = parse_error

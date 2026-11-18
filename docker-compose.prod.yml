@@ -17,6 +17,8 @@ services:
       - ./shared/.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      MONITORING_TRACES_DIR: /app/traces
+      MONITORING_DB_PATH: /app/traces/traces.db
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -35,6 +37,8 @@ services:
       - ./analyzerEngine/.env
     environment:
       REDIS_URL: redis://redis:6379/0
+      MONITORING_TRACES_DIR: /app/traces
+      MONITORING_DB_PATH: /app/traces/traces.db
       PARQUET_ROOT: /data/parquet
       SANDBOX_SOCKET_ROOT: /data/sandbox_sockets
       MEMORY_ROOT: /data/memory
