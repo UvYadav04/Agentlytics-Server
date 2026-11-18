@@ -12,11 +12,9 @@ from shared import intent_router
 from shared.config import get_settings
 from shared.db import close_client, ensure_indexes, get_db
 from shared.logging_config import configure_logging
-from shared.observability import init_observability, instrument_fastapi
 from shared.redis_client import close_redis, get_redis
 
 configure_logging("api_service")
-init_observability("api_service")
 
 
 @asynccontextmanager
@@ -44,8 +42,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],  
 )
-
-instrument_fastapi(app)
 
 API_PREFIX = "/api"
 

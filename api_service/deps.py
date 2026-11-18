@@ -1,5 +1,7 @@
+import logging
 import jwt
 from fastapi import Cookie, HTTPException, status
+from pymongo.errors import PyMongoError
 
 from shared.auth import ACCESS_TOKEN_COOKIE_NAME, decode_access_token
 from shared.db import get_db
@@ -13,30 +15,31 @@ from shared.models.user import COLLECTION as USERS
 from shared.models.user import User
 from shared.models.workspace import COLLECTION as WORKSPACES
 from shared.models.workspace import Workspace
-from shared.observability import get_tracer
 
-_tracer = get_tracer("api_service.auth")
+logger = logging.getLogger("api_service.deps")
 
 
 async def get_current_user(access_token: str | None = Cookie(default=None, alias=ACCESS_TOKEN_COOKIE_NAME)) -> User:
-    with _tracer.start_as_current_span("auth.authenticate") as span:
-        if not access_token:
-            span.set_attribute("auth.result", "no_token")
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
-        try:
-            payload = decode_access_token(access_token)
-        except jwt.PyJWTError:
-            span.set_attribute("auth.result", "invalid_token")
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired session")
+    if not access_token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
+    try:
+        payload = decode_access_token(access_token)
+    except jwt.PyJWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired session")
 
+    try:
         doc = await get_db()[USERS].find_one({"_id": payload.sub})
-        user = User.from_mongo(doc)
-        if user is None:
-            span.set_attribute("auth.result", "user_missing")
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists")
-        span.set_attribute("auth.result", "ok")
-        span.set_attribute("user.id", user.id)
-        return user
+    except PyMongoError as exc:
+        logger.error("Failed to query application database for user id=%s: %s", payload.sub, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Application database connection failed. Verify application MONGO_URI in .env."
+        )
+
+    user = User.from_mongo(doc)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists")
+    return user
 
 
 async def get_owned_workspace(workspace_id: str, user: User) -> Workspace:

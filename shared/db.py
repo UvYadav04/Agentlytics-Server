@@ -10,7 +10,7 @@ def get_client() -> AsyncIOMotorClient:
     global _client
     if _client is None:
         settings = get_settings()
-        uri = settings.get("MONGO_URI", "mongodb://localhost:27017")
+        uri = settings.get("APP_MONGO_URI") or settings.get("MONGO_URI", "mongodb://localhost:27017")
         _client = AsyncIOMotorClient(uri)
     return _client
 

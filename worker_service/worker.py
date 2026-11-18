@@ -20,28 +20,14 @@ from analyzerEngine.vectordb.chroma_store import ChromaVectorStore
 
 from shared.db import close_client, ensure_indexes
 from shared.logging_config import configure_logging
-from shared.observability import get_meter, init_observability, start_prometheus_metrics_server
 from shared.redis_client import close_redis, get_arq_redis_settings, get_redis
 
 configure_logging("worker_service")
-init_observability("worker_service")
 
 logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
 
 _ARQ_QUEUE_KEY = "arq:queue"
 _queue_size_cache = {"value": 0}
-
-
-def _queue_size_callback(options):
-    from opentelemetry.metrics import Observation
-    yield Observation(_queue_size_cache["value"], {"queue": _ARQ_QUEUE_KEY})
-
-
-_meter = get_meter("worker_service")
-_meter.create_observable_gauge(
-    "worker.queue.size", callbacks=[_queue_size_callback],
-    description="Pending arq job count (polled every ~15s)",
-)
 
 
 async def _poll_queue_size():

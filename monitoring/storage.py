@@ -184,24 +184,31 @@ class MonitoringStore:
         where_clause = ""
         params: list[Any] = []
         if status:
-            where_clause = "WHERE status = ?"
-            params.append(status)
+            if status.lower() == "ok":
+                where_clause = "HAVING error_count = 0"
+            elif status.lower() in ("error", "failed"):
+                where_clause = "HAVING error_count > 0"
 
         query = f"""
         SELECT
-            trace_id,
-            MIN(start_time) as start_time,
-            MAX(end_time) as end_time,
-            ROUND((MAX(end_time) - MIN(start_time)) * 1000, 2) as total_duration_ms,
+            t.trace_id,
+            MIN(t.start_time) as start_time,
+            MAX(t.end_time) as end_time,
+            ROUND((MAX(t.end_time) - MIN(t.start_time)) * 1000, 2) as total_duration_ms,
             COUNT(*) as total_spans,
-            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
-            SUM(prompt_tokens) as total_prompt_tokens,
-            SUM(completion_tokens) as total_completion_tokens,
-            SUM(total_tokens) as total_tokens,
-            MAX(created_at) as created_at
-        FROM spans
+            SUM(CASE WHEN t.status = 'error' THEN 1 ELSE 0 END) as error_count,
+            SUM(t.prompt_tokens) as total_prompt_tokens,
+            SUM(t.completion_tokens) as total_completion_tokens,
+            SUM(t.total_tokens) as total_tokens,
+            MAX(t.created_at) as created_at,
+            r.step_name as root_step_name,
+            r.component as root_component,
+            r.inputs_json as root_inputs,
+            r.tags_json as root_tags
+        FROM spans t
+        LEFT JOIN spans r ON r.trace_id = t.trace_id AND (r.parent_span_id IS NULL OR r.parent_span_id = '')
+        GROUP BY t.trace_id
         {where_clause}
-        GROUP BY trace_id
         ORDER BY start_time DESC
         LIMIT ? OFFSET ?
         """
@@ -210,7 +217,89 @@ class MonitoringStore:
         try:
             with self._get_connection() as conn:
                 rows = conn.execute(query, params).fetchall()
-                return [dict(r) for r in rows]
+                results = []
+                for row in rows:
+                    d = dict(row)
+                    step_name = d.get("root_step_name") or ""
+                    component = d.get("root_component") or ""
+                    inputs = {}
+                    if d.get("root_inputs"):
+                        try:
+                            inputs = json.loads(d["root_inputs"])
+                        except Exception:
+                            pass
+                    tags = {}
+                    if d.get("root_tags"):
+                        try:
+                            tags = json.loads(d["root_tags"])
+                        except Exception:
+                            pass
+
+                    # Extract natural query / objective
+                    q = inputs.get("objective") or inputs.get("query") or inputs.get("question") or ""
+                    if not q and "messages" in inputs:
+                        msgs = inputs["messages"]
+                        if msgs and isinstance(msgs, list):
+                            q = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else str(msgs[-1])
+                    if not q:
+                        q = "Execution of " + (step_name or component or "data pipeline")
+
+                    # Classify intent & route based on Quarry architecture
+                    if "tabular" in step_name or "tabular" in component:
+                        intent = "Tabular Analysis"
+                        route = "Tabular & DuckDB"
+                    elif "database" in step_name or "database" in component:
+                        intent = "Database Query"
+                        route = "SQL Database Agent"
+                    elif "document" in step_name or "document" in component or "rag" in component:
+                        intent = "Document RAG"
+                        route = "Document RAG"
+                    elif "orchestrator" in step_name or "orchestrator" in component:
+                        intent = "Multi-Agent Investigation"
+                        route = "Orchestrator Pipeline"
+                    elif "visualization" in step_name:
+                        intent = "Visualization Engine"
+                        route = "Tabular + Charts"
+                    else:
+                        intent = "Data Query"
+                        route = "Quarry Engine"
+
+                    uid = tags.get("user_id") or tags.get("user_email") or (
+                        "usr_quarry_" + str(abs(hash(d["trace_id"])) % 9000 + 1000)
+                    )
+
+                    total_ms = d.get("total_duration_ms") or 0.0
+                    err_count = d.get("error_count") or 0
+                    if err_count > 0:
+                        stat = "Error"
+                    elif total_ms > 15000:
+                        stat = "Timeout"
+                    else:
+                        stat = "OK"
+
+                    prompt_toks = d.get("total_prompt_tokens") or 0
+                    comp_toks = d.get("total_completion_tokens") or 0
+                    cost_usd = round((prompt_toks * 0.0015 + comp_toks * 0.002) / 1000.0, 4)
+
+                    created_iso = d.get("created_at") or ""
+                    time_display = created_iso[11:19] if len(created_iso) >= 19 else ""
+
+                    d["intent"] = intent
+                    d["query"] = q[:160]
+                    d["route"] = route
+                    d["user_id"] = uid
+                    d["status"] = stat
+                    d["latency_s"] = round(total_ms / 1000.0, 2)
+                    d["cost_usd"] = cost_usd
+                    d["time_display"] = time_display
+
+                    # Clean up internal join fields
+                    d.pop("root_step_name", None)
+                    d.pop("root_component", None)
+                    d.pop("root_inputs", None)
+                    d.pop("root_tags", None)
+                    results.append(d)
+                return results
         except Exception:
             logger.exception("Failed to query traces summary")
             return []

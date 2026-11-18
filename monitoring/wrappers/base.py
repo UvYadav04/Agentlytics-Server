@@ -41,7 +41,7 @@ class TraceSpanContext:
         self.name = name
         self.component = component
         self.step_type = step_type
-        self.trace_id = trace_id or get_current_trace_id() or "untraced"
+        self.trace_id = trace_id or get_current_trace_id() or f"trc_qry_{generate_span_id()[4:12]}"
         self.parent_span_id = get_current_span_id()
         self.span_id = generate_span_id()
         self.inputs = inputs or {}

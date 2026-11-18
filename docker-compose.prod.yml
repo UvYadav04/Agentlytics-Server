@@ -17,8 +17,6 @@ services:
       - ./shared/.env
     environment:
       REDIS_URL: redis://redis:6379/0
-      OTEL_SERVICE_NAME: api_service
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4317
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -37,8 +35,6 @@ services:
       - ./analyzerEngine/.env
     environment:
       REDIS_URL: redis://redis:6379/0
-      OTEL_SERVICE_NAME: worker_service
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4317
       PARQUET_ROOT: /data/parquet
       SANDBOX_SOCKET_ROOT: /data/sandbox_sockets
       MEMORY_ROOT: /data/memory

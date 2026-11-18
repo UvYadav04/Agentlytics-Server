@@ -22,15 +22,6 @@ redisvl
 
 prometheus-client
 
-opentelemetry-sdk
-opentelemetry-exporter-otlp-proto-grpc
-opentelemetry-instrumentation-pymongo
-opentelemetry-instrumentation-redis
-opentelemetry-instrumentation-httpx
-opentelemetry-instrumentation-requests
-opentelemetry-instrumentation-botocore
-opentelemetry-instrumentation-logging
-
 # shared/observability.py imports this directly (LangfuseSpanProcessor, get_client()) and is used
 # by BOTH api_service and worker_service - it used to live only in analyzerEngine/requirements.txt,
 # which worker_service pulls in transitively but api_service does NOT, so api_service silently
