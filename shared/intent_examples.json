@@ -59,7 +59,15 @@
     "count records in collection",
     "show data from database",
     "bar chart from database table",
-    "build live dashboard for database"
+    "build live dashboard for database",
+    "what is the schema of collection",
+    "describe the collection",
+    "how many investigations are there in my db",
+    "how many documents in collection",
+    "what fields are in collection",
+    "show schema of collection",
+    "count documents in collection",
+    "query my db"
   ],
 
   "orchestrator": [
