@@ -12,6 +12,7 @@ from monitoring.context import (
     get_current_span_id,
     get_current_tags,
     get_current_trace_id,
+    get_next_call_order,
     set_span_id,
     set_trace_id,
     span_scope,

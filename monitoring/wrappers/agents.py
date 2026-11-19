@@ -35,10 +35,25 @@ def trace_agent(name: Optional[str] = None, component: str = "agent"):
                 or get_current_trace_id()
             )
 
+            self_obj = args[0] if args and hasattr(args[0], "__class__") and type(args[0]).__name__ not in ("type", "str", "int", "dict") else None
+            assigned_files = getattr(self_obj, "assigned_files", None)
+            connections = getattr(self_obj, "available_connections", None) or getattr(self_obj, "database_connections", None)
+            conn_id = kwargs.get("connection_id") or getattr(self_obj, "connection_id", None)
+            direct_route = getattr(self_obj, "direct_route", False)
+
             inputs = {
                 "objective": safe_serialize(objective),
                 "constraints": safe_serialize(constraints),
             }
+            if assigned_files:
+                inputs["assigned_files"] = safe_serialize(assigned_files)
+            if connections:
+                inputs["database_connections"] = safe_serialize(connections)
+            if conn_id:
+                inputs["connection_id"] = conn_id
+            if direct_route:
+                inputs["direct_route"] = True
+
             tags = {"objective": str(objective)[:250]} if objective else {}
 
             with trace_span(
@@ -64,10 +79,25 @@ def trace_agent(name: Optional[str] = None, component: str = "agent"):
                 or get_current_trace_id()
             )
 
+            self_obj = args[0] if args and hasattr(args[0], "__class__") and type(args[0]).__name__ not in ("type", "str", "int", "dict") else None
+            assigned_files = getattr(self_obj, "assigned_files", None)
+            connections = getattr(self_obj, "available_connections", None) or getattr(self_obj, "database_connections", None)
+            conn_id = kwargs.get("connection_id") or getattr(self_obj, "connection_id", None)
+            direct_route = getattr(self_obj, "direct_route", False)
+
             inputs = {
                 "objective": safe_serialize(objective),
                 "constraints": safe_serialize(constraints),
             }
+            if assigned_files:
+                inputs["assigned_files"] = safe_serialize(assigned_files)
+            if connections:
+                inputs["database_connections"] = safe_serialize(connections)
+            if conn_id:
+                inputs["connection_id"] = conn_id
+            if direct_route:
+                inputs["direct_route"] = True
+
             tags = {"objective": str(objective)[:250]} if objective else {}
 
             with trace_span(

@@ -178,7 +178,7 @@ class MonitoringStore:
         SELECT * FROM spans 
         WHERE trace_id = ? 
            OR json_extract(tags_json, '$.investigation_id') = ?
-        ORDER BY start_time ASC
+        ORDER BY COALESCE(json_extract(tags_json, '$.call_order'), 999999) ASC, start_time ASC
         """
         try:
             with self._get_connection() as conn:
@@ -215,13 +215,25 @@ class MonitoringStore:
         self, limit: int = 50, offset: int = 0, status: Optional[str] = None
     ) -> list[dict[str, Any]]:
         """List investigation traces with aggregated duration, tokens, and errors."""
-        where_clause = ""
+        having_conds = [
+            """NOT (
+                COUNT(*) = 1 AND (
+                    (SELECT s.step_type FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) IN ('llm', 'tool', 'database', 'retriever', 'reranker', 'router')
+                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'deepinfra%'
+                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'openai%'
+                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'execute_%'
+                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'inspect_%'
+                )
+            )"""
+        ]
         params: list[Any] = []
         if status:
             if status.lower() == "ok":
-                where_clause = "HAVING error_count = 0"
+                having_conds.append("error_count = 0")
             elif status.lower() in ("error", "failed"):
-                where_clause = "HAVING error_count > 0"
+                having_conds.append("error_count > 0")
+
+        where_clause = "HAVING " + " AND ".join(having_conds)
 
         query = f"""
         SELECT
@@ -275,8 +287,21 @@ class MonitoringStore:
                         msgs = inputs["messages"]
                         if msgs and isinstance(msgs, list):
                             q = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else str(msgs[-1])
+
+                    # Strictly require a real user query: if empty or starts with "Execution of", it's an internal step
                     if not q:
-                        q = "Execution of " + (step_name or component or "Data Query")
+                        continue
+
+                    q_lower = q.lower().strip()
+                    if (
+                        q_lower.startswith("execution of")
+                        or q_lower.startswith("execute_")
+                        or q_lower.startswith("inspect_")
+                        or q_lower.startswith("list_")
+                        or q_lower.startswith("deepinfra")
+                        or q_lower.startswith("openai")
+                    ):
+                        continue
 
                     # Classify intent & route based on Quarry architecture
                     if "tabular" in step_name or "tabular" in component:
@@ -387,7 +412,7 @@ class MonitoringStore:
         """Aggregate high-level overview metrics, timeline points, and component stats from real traces."""
         try:
             with self._get_connection() as conn:
-                # 1. Trace durations, errors, and counts grouped by request
+                # 1. Trace durations, errors, and counts grouped by user request
                 trace_query = """
                 SELECT
                     COALESCE(json_extract(t.tags_json, '$.investigation_id'), t.trace_id) as request_id,
@@ -396,6 +421,16 @@ class MonitoringStore:
                     substr(MIN(t.created_at), 1, 10) as day
                 FROM spans t
                 GROUP BY request_id
+                HAVING 
+                    NOT (
+                        COUNT(*) = 1 AND (
+                            (SELECT s.step_type FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) IN ('llm', 'tool', 'database', 'retriever', 'reranker', 'router')
+                            OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'deepinfra%'
+                            OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'openai%'
+                            OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'execute_%'
+                            OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'inspect_%'
+                        )
+                    )
                 """
                 rows = conn.execute(trace_query).fetchall()
                 total_traces = len(rows)
@@ -488,6 +523,45 @@ class MonitoringStore:
                 "slowestSpans": [],
                 "recentTraces": [],
             }
+
+    def delete_trace(self, trace_id: str) -> bool:
+        """Delete all spans associated with a given trace_id or investigation_id."""
+        return self.delete_traces([trace_id]) > 0
+
+    def delete_traces(self, trace_ids: list[str]) -> int:
+        """Delete all spans associated with multiple trace IDs or investigation IDs."""
+        if not trace_ids:
+            return 0
+        deleted_count = 0
+        try:
+            with self._get_connection() as conn:
+                for chunk_start in range(0, len(trace_ids), 50):
+                    chunk = trace_ids[chunk_start:chunk_start + 50]
+                    placeholders = ",".join("?" for _ in chunk)
+                    query = f"""
+                    DELETE FROM spans
+                    WHERE trace_id IN ({placeholders})
+                       OR json_extract(tags_json, '$.investigation_id') IN ({placeholders})
+                    """
+                    cursor = conn.execute(query, chunk + chunk)
+                    deleted_count += cursor.rowcount
+                conn.commit()
+
+            # Clean up any exported investigation files
+            inv_dir = TRACES_DIR / "investigations"
+            if inv_dir.exists():
+                for tid in trace_ids:
+                    f = inv_dir / f"{tid}.json"
+                    if f.exists():
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+
+            return deleted_count
+        except Exception:
+            logger.exception("Failed to delete traces: %s", trace_ids)
+            return 0
 
     def export_trace_to_file(self, trace_id: str) -> Optional[Path]:
         """Save a complete investigation trace as an isolated JSON file in traces/investigations/."""

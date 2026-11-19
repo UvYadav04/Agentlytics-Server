@@ -10,6 +10,7 @@ import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 
 from api_service.deps import get_current_user, get_optional_user
 from monitoring.storage import get_monitoring_store
@@ -108,4 +109,40 @@ async def export_trace(
         "exported_file": str(exported_path),
         "status": "exported",
     }
+
+
+class BulkDeleteTracesRequest(BaseModel):
+    trace_ids: list[str]
+
+
+@router.delete("/traces/{trace_id}")
+async def delete_single_trace(
+    trace_id: str,
+    user=Depends(get_optional_user),
+) -> dict[str, Any]:
+    """Delete a single investigation request and its associated execution spans."""
+    store = get_monitoring_store()
+    deleted = store.delete_trace(trace_id)
+    return {
+        "success": True,
+        "trace_id": trace_id,
+        "deleted": deleted,
+    }
+
+
+@router.delete("/traces")
+@router.post("/traces/bulk-delete")
+async def bulk_delete_traces(
+    body: BulkDeleteTracesRequest,
+    user=Depends(get_optional_user),
+) -> dict[str, Any]:
+    """Delete one, multiple, or all specified investigation traces."""
+    store = get_monitoring_store()
+    deleted_count = store.delete_traces(body.trace_ids)
+    return {
+        "success": True,
+        "requested_count": len(body.trace_ids),
+        "deleted_spans_count": deleted_count,
+    }
+
 

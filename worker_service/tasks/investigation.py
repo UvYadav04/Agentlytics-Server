@@ -890,6 +890,25 @@ async def run_investigation(
         investigation_id=investigation_id, chat_id=chat_id,
     )
 
+    try:
+        from monitoring import trace_scope
+        monitoring_cm = trace_scope(
+            investigation_id,
+            tags={
+                "chat_id": chat_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id or "",
+                "user_email": email or "",
+                "route": route or "orchestrator",
+                "query": query or "",
+                "investigation_id": investigation_id,
+            },
+        )
+    except Exception:
+        monitoring_cm = nullcontext()
+
+    monitoring_cm.__enter__()
+
     sandbox_manager = ctx["sandbox_manager"]
 
     mentioned_file_ids = file_ids or []
@@ -1006,23 +1025,6 @@ async def run_investigation(
     )
     span_cm.__enter__()
 
-    try:
-        from monitoring import trace_scope
-        monitoring_cm = trace_scope(
-            investigation_id,
-            tags={
-                "chat_id": chat_id,
-                "workspace_id": workspace_id,
-                "user_id": user_id or "",
-                "user_email": email or "",
-                "route": direct_route or "orchestrator",
-                "query": query or "",
-            },
-        )
-    except Exception:
-        monitoring_cm = nullcontext()
-
-    monitoring_cm.__enter__()
     try:
         langfuse_cm.__enter__()
     except Exception:

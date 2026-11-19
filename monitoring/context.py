@@ -20,6 +20,16 @@ _current_span_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar
 _current_trace_tags: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "monitoring_current_trace_tags", default={}
 )
+_current_span_seq: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "monitoring_current_span_seq", default=0
+)
+
+
+def get_next_call_order() -> int:
+    """Increment and return the strictly monotonic call order for spans in the current trace."""
+    current = _current_span_seq.get() + 1
+    _current_span_seq.set(current)
+    return current
 
 
 def generate_span_id() -> str:
@@ -72,12 +82,14 @@ def trace_scope(trace_id: str, tags: Optional[dict[str, Any]] = None) -> Generat
     merged_tags = {**_current_trace_tags.get(), **(tags or {})}
     tags_token = _current_trace_tags.set(merged_tags)
     s_token = _current_span_id.set(None)
+    seq_token = _current_span_seq.set(0)
     try:
         yield trace_id
     finally:
         _current_trace_id.reset(t_token)
         _current_trace_tags.reset(tags_token)
         _current_span_id.reset(s_token)
+        _current_span_seq.reset(seq_token)
 
 
 @asynccontextmanager
@@ -87,12 +99,14 @@ async def async_trace_scope(trace_id: str, tags: Optional[dict[str, Any]] = None
     merged_tags = {**_current_trace_tags.get(), **(tags or {})}
     tags_token = _current_trace_tags.set(merged_tags)
     s_token = _current_span_id.set(None)
+    seq_token = _current_span_seq.set(0)
     try:
         yield trace_id
     finally:
         _current_trace_id.reset(t_token)
         _current_trace_tags.reset(tags_token)
         _current_span_id.reset(s_token)
+        _current_span_seq.reset(seq_token)
 
 
 @contextmanager

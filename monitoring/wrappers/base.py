@@ -18,6 +18,7 @@ from monitoring.context import (
     get_current_span_id,
     get_current_tags,
     get_current_trace_id,
+    get_next_call_order,
     reset_trace_id,
     set_trace_id,
     span_scope,
@@ -47,8 +48,9 @@ class TraceSpanContext:
         self.trace_id = get_current_trace_id() or trace_id or f"trc_req_{generate_span_id()[4:12]}"
         self.parent_span_id = get_current_span_id()
         self.span_id = generate_span_id()
+        self.call_order = get_next_call_order()
         self.inputs = inputs or {}
-        self.tags = {**get_current_tags(), **(tags or {})}
+        self.tags = {"call_order": self.call_order, **get_current_tags(), **(tags or {})}
         self.metrics: dict[str, Any] = {}
         self.outputs: dict[str, Any] = {}
         self.error: Optional[dict[str, Any]] = None

@@ -552,76 +552,94 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
     )
 
     
-    history_lines = [
-        f'- "{t.get("query", "").strip().replace(chr(10), " ")[:120]}" [Agent: {t.get("agent", "orchestrator")}]'
-        for t in (chat.recent_turns or [])[-5:]
-    ]
-
-    route_result, files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
-        asyncio.to_thread(route_query_intent_fast, body.content, history=history_lines, file_ids=body.file_ids),
-        db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
-        db[DATABASE_CONNECTIONS].find_one(
-            {"workspace_id": chat.workspace_id, "encrypted_connection_string": {"$ne": None}}, {"_id": 1},
-        ),
-        db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
-        ensure_dummy_files(db, chat.workspace_id),
-    )
-    has_files = files_doc is not None or connection_doc is not None
-    is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
-    route = route_result.intent if route_result.intent in ("tabular", "document", "database", "orchestrator") else None
-
-    if route_result.intent == "greeting":
-        light_route = "greeting"
-    elif not has_files:
-        light_route = "no_files"
-    else:
-        light_route = None
-
-    logger.info(
-        "send_message: intent_router method=%s top_intent=%s top_similarity=%.3f margin=%.3f "
-        "route=%s light_route=%s has_files=%s router_latency_ms=%.1f at +%.1fms total "
-        "(chat_id=%s, error=%s)",
-        route_result.method, route_result.top_intent, route_result.top_similarity,
-        route_result.margin, route, light_route, has_files, route_result.latency_ms,
-        (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
-    )
-
-    await persist_task
-    logger.info(
-        "send_message: user message + investigation %s persisted at +%.1fms (chat_id=%s, message_id=%s)",
-        investigation.id, (time.perf_counter() - t0) * 1000, chat_id, message.id,
-    )
-
-    if is_first_message:
-        _schedule_chat_title(chat_id=chat_id, query=body.content)
-        logger.info("send_message: scheduled chat title generation for chat_id=%s (first message)", chat_id)
-
-    if light_route is not None:
-        schedule_light_response(
-            investigation_id=investigation.id, chat_id=chat_id, workspace_id=chat.workspace_id,
-            user_id=user.id, query=body.content, route=light_route,
-            requested_at=request_received_at, file_ids=body.file_ids, email=user.email,
-            reply_to=message.id,
+    try:
+        from monitoring import trace_scope
+        monitoring_cm = trace_scope(
+            investigation.id,
+            tags={
+                "investigation_id": investigation.id,
+                "chat_id": chat_id,
+                "workspace_id": chat.workspace_id,
+                "user_id": user.id,
+                "user_email": user.email,
+                "query": body.content,
+            },
         )
+    except Exception:
+        from contextlib import nullcontext
+        monitoring_cm = nullcontext()
+
+    with monitoring_cm:
+        history_lines = [
+            f'- "{t.get("query", "").strip().replace(chr(10), " ")[:120]}" [Agent: {t.get("agent", "orchestrator")}]'
+            for t in (chat.recent_turns or [])[-5:]
+        ]
+
+        route_result, files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
+            asyncio.to_thread(route_query_intent_fast, body.content, history=history_lines, file_ids=body.file_ids),
+            db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
+            db[DATABASE_CONNECTIONS].find_one(
+                {"workspace_id": chat.workspace_id, "encrypted_connection_string": {"$ne": None}}, {"_id": 1},
+            ),
+            db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
+            ensure_dummy_files(db, chat.workspace_id),
+        )
+        has_files = files_doc is not None or connection_doc is not None
+        is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
+        route = route_result.intent if route_result.intent in ("tabular", "document", "database", "orchestrator") else None
+
+        if route_result.intent == "greeting":
+            light_route = "greeting"
+        elif not has_files:
+            light_route = "no_files"
+        else:
+            light_route = None
+
         logger.info(
-            "send_message: investigation %s dispatched to light-response path (%s) at +%.1fms "
-            "total (chat_id=%s)",
-            investigation.id, light_route, (time.perf_counter() - t0) * 1000, chat_id,
+            "send_message: intent_router method=%s top_intent=%s top_similarity=%.3f margin=%.3f "
+            "route=%s light_route=%s has_files=%s router_latency_ms=%.1f at +%.1fms total "
+            "(chat_id=%s, error=%s)",
+            route_result.method, route_result.top_intent, route_result.top_similarity,
+            route_result.margin, route, light_route, has_files, route_result.latency_ms,
+            (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
         )
-    else:
-        pool = await get_arq_pool()
-        job = await pool.enqueue_job(
-            "run_investigation",
-            investigation_id=investigation.id,
-            chat_id=chat_id,
-            workspace_id=chat.workspace_id,
-            user_id=user.id,
-            email=user.email,
-            query=body.content,
-            file_ids=body.file_ids,
-            requested_at=request_received_at,
-            route=route,
+
+        await persist_task
+        logger.info(
+            "send_message: user message + investigation %s persisted at +%.1fms (chat_id=%s, message_id=%s)",
+            investigation.id, (time.perf_counter() - t0) * 1000, chat_id, message.id,
         )
+
+        if is_first_message:
+            _schedule_chat_title(chat_id=chat_id, query=body.content)
+            logger.info("send_message: scheduled chat title generation for chat_id=%s (first message)", chat_id)
+
+        if light_route is not None:
+            schedule_light_response(
+                investigation_id=investigation.id, chat_id=chat_id, workspace_id=chat.workspace_id,
+                user_id=user.id, query=body.content, route=light_route,
+                requested_at=request_received_at, file_ids=body.file_ids, email=user.email,
+                reply_to=message.id,
+            )
+            logger.info(
+                "send_message: investigation %s dispatched to light-response path (%s) at +%.1fms "
+                "total (chat_id=%s)",
+                investigation.id, light_route, (time.perf_counter() - t0) * 1000, chat_id,
+            )
+        else:
+            pool = await get_arq_pool()
+            job = await pool.enqueue_job(
+                "run_investigation",
+                investigation_id=investigation.id,
+                chat_id=chat_id,
+                workspace_id=chat.workspace_id,
+                user_id=user.id,
+                email=user.email,
+                query=body.content,
+                file_ids=body.file_ids,
+                requested_at=request_received_at,
+                route=route,
+            )
         logger.info(
             "send_message: investigation %s enqueued as arq job %s at +%.1fms total (chat_id=%s)",
             investigation.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000, chat_id,
