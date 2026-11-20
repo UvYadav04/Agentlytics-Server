@@ -640,10 +640,10 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
                 requested_at=request_received_at,
                 route=route,
             )
-        logger.info(
-            "send_message: investigation %s enqueued as arq job %s at +%.1fms total (chat_id=%s)",
-            investigation.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000, chat_id,
-        )
+            logger.info(
+                "send_message: investigation %s enqueued as arq job %s at +%.1fms total (chat_id=%s)",
+                investigation.id, getattr(job, "job_id", None), (time.perf_counter() - t0) * 1000, chat_id,
+            )
 
     return SendMessageResponse(message_id=message.id, investigation_id=investigation.id)
 
