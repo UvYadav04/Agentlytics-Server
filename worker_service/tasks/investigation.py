@@ -31,6 +31,7 @@ from analyzerEngine.tools.tabular.models import FileRef as TabularFileRef
 
 from arq import Retry
 
+from shared import intent_router
 from shared import usage
 from shared.db import get_db
 from shared.job_timing import log_job_finished, log_job_picked_up, now_iso
@@ -965,7 +966,7 @@ async def run_investigation(
         database_connections = []
 
     direct_route = None
-    if retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES:
+    if intent_router.is_enabled() and retry["retry_mode"] not in ORCHESTRATOR_ONLY_MODES and route != "orchestrator":
         if route == "database" and database_connections:
             direct_route = "database"
         elif route == "document":

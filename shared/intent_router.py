@@ -113,6 +113,13 @@ def margin_threshold() -> float:
     return float(_settings().get("INTENT_MARGIN_THRESHOLD", DEFAULT_MARGIN_THRESHOLD) or DEFAULT_MARGIN_THRESHOLD)
 
 
+def is_enabled() -> bool:
+    val = _settings().get("ENABLE_INTENT_ROUTER", "false")
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
 def _load_examples() -> dict[str, list[str]]:
     path = _examples_path()
     with open(path, encoding="utf-8") as f:
@@ -139,7 +146,10 @@ def _embed(texts: list[str]) -> np.ndarray:
 
 
 def init(force: bool = False) -> bool:
-   
+    if not force and not is_enabled():
+        logger.info("intent_router: disabled (ENABLE_INTENT_ROUTER=false) - skipping initialization")
+        return False
+
     global _index
     if _index is not None and not force:
         return True
@@ -202,7 +212,23 @@ def route_query_intent(
     file_ids: list[str] | None = None,
     timeout: float = 30.0,
     llm_fallback: bool = True,
+    force: bool = False,
 ) -> RouteResult:
+    if not force and not is_enabled():
+        return RouteResult(
+            query=query,
+            intent="orchestrator",
+            method="disabled",
+            top_intent=None,
+            top_similarity=0.0,
+            second_intent=None,
+            second_similarity=0.0,
+            margin=0.0,
+            llm_result=None,
+            latency_ms=0.0,
+            error=None,
+        )
+
     start = time.perf_counter()
     no_embedding_fields = {
         "top_intent": None, "top_similarity": 0.0,
@@ -259,8 +285,9 @@ def route_query_intent_fast(
     query: str,
     history: list[str] | None = None,
     file_ids: list[str] | None = None,
+    force: bool = False,
 ) -> RouteResult:
-    return route_query_intent(query, history=history, file_ids=file_ids, llm_fallback=False)
+    return route_query_intent(query, history=history, file_ids=file_ids, llm_fallback=False, force=force)
 
 
 def _finish(

@@ -36,7 +36,7 @@ from shared.models.report import COLLECTION as REPORTS
 from shared.models.report import Report
 from shared.models.user import User
 from shared.query_router import classify as classify_query
-from shared.intent_router import route_query_intent_fast
+from shared.intent_router import is_enabled as is_intent_router_enabled, route_query_intent_fast
 from shared.dummy_files import ensure_dummy_files
 from shared.chat_title import generate_title
 from shared.chat_summary import generate_chat_summary
@@ -575,34 +575,52 @@ async def send_message(chat_id: str, body: SendMessageRequest, user: User = Depe
             for t in (chat.recent_turns or [])[-5:]
         ]
 
-        route_result, files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
-            asyncio.to_thread(route_query_intent_fast, body.content, history=history_lines, file_ids=body.file_ids),
-            db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
-            db[DATABASE_CONNECTIONS].find_one(
-                {"workspace_id": chat.workspace_id, "encrypted_connection_string": {"$ne": None}}, {"_id": 1},
-            ),
-            db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
-            ensure_dummy_files(db, chat.workspace_id),
-        )
-        has_files = files_doc is not None or connection_doc is not None
-        is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
-        route = route_result.intent if route_result.intent in ("tabular", "document", "database", "orchestrator") else None
+        if is_intent_router_enabled():
+            route_result, files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
+                asyncio.to_thread(route_query_intent_fast, body.content, history=history_lines, file_ids=body.file_ids),
+                db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
+                db[DATABASE_CONNECTIONS].find_one(
+                    {"workspace_id": chat.workspace_id, "encrypted_connection_string": {"$ne": None}}, {"_id": 1},
+                ),
+                db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
+                ensure_dummy_files(db, chat.workspace_id),
+            )
+            has_files = files_doc is not None or connection_doc is not None
+            is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
+            route = route_result.intent if route_result.intent in ("tabular", "document", "database", "orchestrator") else None
 
-        if route_result.intent == "greeting":
-            light_route = "greeting"
-        elif not has_files:
-            light_route = "no_files"
+            if route_result.intent == "greeting":
+                light_route = "greeting"
+            elif not has_files:
+                light_route = "no_files"
+            else:
+                light_route = None
+
+            logger.info(
+                "send_message: intent_router method=%s top_intent=%s top_similarity=%.3f margin=%.3f "
+                "route=%s light_route=%s has_files=%s router_latency_ms=%.1f at +%.1fms total "
+                "(chat_id=%s, error=%s)",
+                route_result.method, route_result.top_intent, route_result.top_similarity,
+                route_result.margin, route, light_route, has_files, route_result.latency_ms,
+                (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
+            )
         else:
+            files_doc, connection_doc, prior_message_count, _ = await asyncio.gather(
+                db[FILES].find_one({"workspace_id": chat.workspace_id, "status": "ready"}, {"_id": 1}),
+                db[DATABASE_CONNECTIONS].find_one(
+                    {"workspace_id": chat.workspace_id, "encrypted_connection_string": {"$ne": None}}, {"_id": 1},
+                ),
+                db[MESSAGES].count_documents({"chat_id": chat_id, "_id": {"$ne": message.id}}),
+                ensure_dummy_files(db, chat.workspace_id),
+            )
+            has_files = files_doc is not None or connection_doc is not None
+            is_first_message = prior_message_count == 0 and chat.title == DEFAULT_CHAT_TITLE
+            route = "orchestrator"
             light_route = None
-
-        logger.info(
-            "send_message: intent_router method=%s top_intent=%s top_similarity=%.3f margin=%.3f "
-            "route=%s light_route=%s has_files=%s router_latency_ms=%.1f at +%.1fms total "
-            "(chat_id=%s, error=%s)",
-            route_result.method, route_result.top_intent, route_result.top_similarity,
-            route_result.margin, route, light_route, has_files, route_result.latency_ms,
-            (time.perf_counter() - t0) * 1000, chat_id, route_result.error,
-        )
+            logger.info(
+                "send_message: intent_router disabled -> routing all to orchestrator (chat_id=%s, has_files=%s) at +%.1fms total",
+                chat_id, has_files, (time.perf_counter() - t0) * 1000,
+            )
 
         await persist_task
         logger.info(
@@ -783,14 +801,17 @@ async def retry_message(message_id: str, body: RetryMessageRequest, user: User =
     )
     await db[INVESTIGATIONS].insert_one(investigation.to_mongo())
 
-    history_lines = [
-        f'- "{t.get("query", "").strip().replace(chr(10), " ")[:120]}" [Agent: {t.get("agent", "orchestrator")}]'
-        for t in (chat.recent_turns or [])[-5:]
-    ]
-    route_result = await asyncio.to_thread(
-        route_query_intent_fast, question.content, history=history_lines, file_ids=file_ids,
-    )
-    route = route_result.intent if route_result.intent in ("tabular", "document", "database") else None
+    if is_intent_router_enabled():
+        history_lines = [
+            f'- "{t.get("query", "").strip().replace(chr(10), " ")[:120]}" [Agent: {t.get("agent", "orchestrator")}]'
+            for t in (chat.recent_turns or [])[-5:]
+        ]
+        route_result = await asyncio.to_thread(
+            route_query_intent_fast, question.content, history=history_lines, file_ids=file_ids,
+        )
+        route = route_result.intent if route_result.intent in ("tabular", "document", "database") else None
+    else:
+        route = "orchestrator"
 
     pool = await get_arq_pool()
     await pool.enqueue_job(
