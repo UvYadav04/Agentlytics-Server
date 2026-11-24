@@ -932,7 +932,10 @@ async def run_investigation(
         return await usage.has_chart_capacity(user_id, email)
 
     async def on_event(event: dict) -> None:
-        await _append_event(db, investigation_id, event.get("type", "status"), event.get("message", ""), event.get("data"))
+        data = event.get("data")
+        if data is None:
+            data = {k: v for k, v in event.items() if k not in ("type", "message")}
+        await _append_event(db, investigation_id, event.get("type", "status"), event.get("message", ""), data)
 
     async def cancel_check() -> bool:
         return await _is_cancelled(db, investigation_id)
@@ -1035,70 +1038,91 @@ async def run_investigation(
 
     async def _dispatch(ctx_thread_context: dict):
         result = None
-        if direct_route == "tabular":
-            result = await _run_tabular_direct(
-                catalog, storage, chat_id, sandbox_manager, workspace_id, query,
-                mentioned_file_ids, on_event, result_collector, ctx_thread_context,
-                chart_capacity_checker, cancel_check, ask_user, constraints,
-                visualization_service=visualization_service,
-                table_service=table_service,
-                file_service=file_service,
-                dashboard_service=dashboard_service,
-            )
-            if result is None:
-                logger.info(
-                    "investigation %s: tabular direct-route unsafe (no unambiguous file "
-                    "selection) - falling back to the Orchestrator", investigation_id,
-                )
-        elif direct_route == "document":
-            result = await _run_document_direct(
-                catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
-                ctx_thread_context, cancel_check, ask_user, constraints,
-                file_service=file_service,
-            )
-            if result is None:
-                logger.info(
-                    "investigation %s: document direct-route unsafe (no unambiguous file "
-                    "selection) - falling back to the Orchestrator", investigation_id,
-                )
-        elif direct_route == "database":
-            result = await _run_database_direct(
-                database_access, database_connections, query, on_event, result_collector,
-                ctx_thread_context, cancel_check, ask_user, constraints,
-                visualization_service=visualization_service,
-                dashboard_service=dashboard_service,
-                workspace_id=workspace_id,
-            )
-            if result is None:
-                logger.info(
-                    "investigation %s: database direct-route unsafe (no connections available) - "
-                    "falling back to the Orchestrator", investigation_id,
-                )
+        target_agent = direct_route or "orchestrator"
 
-        handling_agent = "orchestrator"
-        if result is not None:
-            handling_agent = direct_route
-            logger.info(
-                "investigation %s: handled directly by the %s agent (Orchestrator skipped)",
-                investigation_id, direct_route,
+        try:
+            from monitoring.wrappers.base import trace_span
+            from monitoring.schema import StepType
+            assign_span_cm = trace_span(
+                name=f"assign_agent_{target_agent}",
+                component="workflow.dispatcher",
+                step_type=StepType.ROUTER.value,
+                inputs={"target_agent": target_agent, "direct_route": direct_route, "query": query},
+                tags={"assigned_agent": target_agent, "route": target_agent, "query": query},
             )
-        else:
-            orchestrator = OrchestratorAgent(
-                catalog, vector_store=vector_store, memory=memory, storage=storage,
-                reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
-                sandbox_manager=sandbox_manager, result_collector=result_collector,
-                chart_capacity_checker=chart_capacity_checker, database_access=database_access,
-                visualization_service=visualization_service,
-                dashboard_service=dashboard_service,
-                table_service=table_service,
-                file_service=file_service,
-            )
-            result = await orchestrator.run(
-                query, workspace_id=workspace_id, constraints=constraints, thread_context=ctx_thread_context,
-                on_event=on_event, cancel_check=cancel_check, ask_user=ask_user,
-                database_connections=database_connections,
-            )
-            handling_agent = _resolve_orchestrator_agent(orchestrator)
+        except Exception:
+            assign_span_cm = nullcontext()
+
+        with assign_span_cm as assign_span:
+            if direct_route == "tabular":
+                result = await _run_tabular_direct(
+                    catalog, storage, chat_id, sandbox_manager, workspace_id, query,
+                    mentioned_file_ids, on_event, result_collector, ctx_thread_context,
+                    chart_capacity_checker, cancel_check, ask_user, constraints,
+                    visualization_service=visualization_service,
+                    table_service=table_service,
+                    file_service=file_service,
+                    dashboard_service=dashboard_service,
+                )
+                if result is None:
+                    logger.info(
+                        "investigation %s: tabular direct-route unsafe (no unambiguous file "
+                        "selection) - falling back to the Orchestrator", investigation_id,
+                    )
+            elif direct_route == "document":
+                result = await _run_document_direct(
+                    catalog, vector_store, query, mentioned_file_ids, on_event, result_collector,
+                    ctx_thread_context, cancel_check, ask_user, constraints,
+                    file_service=file_service,
+                )
+                if result is None:
+                    logger.info(
+                        "investigation %s: document direct-route unsafe (no unambiguous file "
+                        "selection) - falling back to the Orchestrator", investigation_id,
+                    )
+            elif direct_route == "database":
+                result = await _run_database_direct(
+                    database_access, database_connections, query, on_event, result_collector,
+                    ctx_thread_context, cancel_check, ask_user, constraints,
+                    visualization_service=visualization_service,
+                    dashboard_service=dashboard_service,
+                    workspace_id=workspace_id,
+                )
+                if result is None:
+                    logger.info(
+                        "investigation %s: database direct-route unsafe (no connections available) - "
+                        "falling back to the Orchestrator", investigation_id,
+                    )
+
+            handling_agent = "orchestrator"
+            if result is not None:
+                handling_agent = direct_route
+                logger.info(
+                    "investigation %s: handled directly by the %s agent (Orchestrator skipped)",
+                    investigation_id, direct_route,
+                )
+            else:
+                orchestrator = OrchestratorAgent(
+                    catalog, vector_store=vector_store, memory=memory, storage=storage,
+                    reports_dir=engine_bootstrap.REPORTS_ROOT, chat_id=chat_id,
+                    sandbox_manager=sandbox_manager, result_collector=result_collector,
+                    chart_capacity_checker=chart_capacity_checker, database_access=database_access,
+                    visualization_service=visualization_service,
+                    dashboard_service=dashboard_service,
+                    table_service=table_service,
+                    file_service=file_service,
+                )
+                result = await orchestrator.run(
+                    query, workspace_id=workspace_id, constraints=constraints, thread_context=ctx_thread_context,
+                    on_event=on_event, cancel_check=cancel_check, ask_user=ask_user,
+                    database_connections=database_connections,
+                )
+                handling_agent = _resolve_orchestrator_agent(orchestrator)
+
+            if assign_span and hasattr(assign_span, "set_output"):
+                assign_span.set_output("assigned_agent", handling_agent)
+                assign_span.set_output("status", "completed")
+
         return result, handling_agent
 
     try:
@@ -1152,12 +1176,44 @@ async def run_investigation(
                 if error_info.kind != "unknown"
                 else f"Something went wrong while investigating: {exc}"
             )
+            failed_step = direct_route or "orchestrator"
+
+            # Record explicit failed step span in monitoring traces
+            try:
+                import traceback
+                from monitoring.wrappers.base import trace_span
+                from monitoring.schema import SpanStatus
+                with trace_span(
+                    name=f"failed_step_{failed_step}",
+                    component="investigation.error",
+                    step_type="custom",
+                    trace_id=investigation_id,
+                    inputs={"query": query, "failed_step": failed_step, "error_type": error_info.kind},
+                    tags={"investigation_id": investigation_id, "query": query, "error_type": error_info.kind},
+                ) as err_span:
+                    err_span.status = SpanStatus.ERROR.value
+                    err_span.error = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "error_type": error_info.kind,
+                        "user_message": user_facing,
+                    }
+            except Exception:
+                logger.exception("failed to record error span for investigation %s", investigation_id)
 
             if retry["retry_of"]:
                 _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "failed"})
                 await _append_event(
                     db, investigation_id, "error", user_facing,
-                    {"error_type": error_info.kind, "retry_of": retry["retry_of"], "kept_previous": True},
+                    {
+                        "error_type": error_info.kind,
+                        "error_message": str(exc)[:2000],
+                        "failed_step": failed_step,
+                        "reason": str(exc),
+                        "retry_of": retry["retry_of"],
+                        "kept_previous": True,
+                    },
                 )
                 await db[INVESTIGATIONS].update_one(
                     {"_id": investigation_id},
@@ -1202,7 +1258,15 @@ async def run_investigation(
             message.files_used = result_collector.files_used
 
             _investigation_outcomes.add(1, {"route": direct_route or "orchestrator", "outcome": "failed"})
-            await _append_event(db, investigation_id, "error", user_facing, {"error_type": error_info.kind})
+            await _append_event(
+                db, investigation_id, "error", user_facing,
+                {
+                    "error_type": error_info.kind,
+                    "error_message": str(exc)[:2000],
+                    "failed_step": failed_step,
+                    "reason": str(exc),
+                },
+            )
             await db[INVESTIGATIONS].update_one(
                 {"_id": investigation_id},
                 {"$set": {

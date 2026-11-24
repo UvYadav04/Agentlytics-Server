@@ -15,22 +15,48 @@ logger = logging.getLogger("monitoring.wrappers.tools")
 
 
 def _record_tool_metrics(span: Any, result: Any) -> None:
-    if not isinstance(result, dict):
-        return
-    if "execution_time_ms" in result:
-        span.set_metric("db_execution_time_ms", result["execution_time_ms"])
-    if "row_count" in result:
-        span.set_metric("row_count", result["row_count"])
-    if "success" in result:
-        span.set_metric("success", result["success"])
-    if "chart_id" in result:
-        span.set_metric("chart_id", result["chart_id"])
-    elif isinstance(result.get("specification"), dict) and "chart_id" in result["specification"]:
-        span.set_metric("chart_id", result["specification"]["chart_id"])
-    if "tables" in result and isinstance(result["tables"], list):
-        span.set_metric("table_count", len(result["tables"]))
-    if "exit_code" in result:
-        span.set_metric("exit_code", result["exit_code"])
+    from monitoring.schema import SpanStatus
+
+    if isinstance(result, dict):
+        if "execution_time_ms" in result:
+            span.set_metric("db_execution_time_ms", result["execution_time_ms"])
+        if "row_count" in result:
+            span.set_metric("row_count", result["row_count"])
+        if "success" in result:
+            span.set_metric("success", result["success"])
+            if result["success"] is False:
+                span.status = SpanStatus.ERROR.value
+                span.error = {
+                    "type": "ToolExecutionError",
+                    "message": str(result.get("error") or "Tool execution failed"),
+                }
+        elif result.get("error"):
+            span.status = SpanStatus.ERROR.value
+            span.error = {
+                "type": "ToolExecutionError",
+                "message": str(result.get("error")),
+            }
+
+        if "chart_id" in result:
+            span.set_metric("chart_id", result["chart_id"])
+        elif isinstance(result.get("specification"), dict) and "chart_id" in result["specification"]:
+            span.set_metric("chart_id", result["specification"]["chart_id"])
+        if "tables" in result and isinstance(result["tables"], list):
+            span.set_metric("table_count", len(result["tables"]))
+        if "exit_code" in result:
+            span.set_metric("exit_code", result["exit_code"])
+            if result["exit_code"] != 0:
+                span.status = SpanStatus.ERROR.value
+                span.error = {
+                    "type": "SandboxExecutionError",
+                    "message": str(result.get("error") or result.get("stderr") or f"Command failed with exit code {result['exit_code']}"),
+                }
+    elif hasattr(result, "error") and getattr(result, "error", None):
+        span.status = SpanStatus.ERROR.value
+        span.error = {
+            "type": "ToolExecutionError",
+            "message": str(getattr(result, "error")),
+        }
 
 
 def trace_tool(

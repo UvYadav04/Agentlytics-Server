@@ -216,13 +216,16 @@ class MonitoringStore:
     ) -> list[dict[str, Any]]:
         """List investigation traces with aggregated duration, tokens, and errors."""
         having_conds = [
-            """NOT (
-                COUNT(*) = 1 AND (
-                    (SELECT s.step_type FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) IN ('llm', 'tool', 'database', 'retriever', 'reranker', 'router')
-                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'deepinfra%'
-                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'openai%'
-                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'execute_%'
-                    OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'inspect_%'
+            """(
+                SUM(CASE WHEN t.status = 'error' THEN 1 ELSE 0 END) > 0 OR
+                NOT (
+                    COUNT(*) = 1 AND (
+                        (SELECT s.step_type FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) IN ('llm', 'tool', 'database', 'retriever', 'reranker', 'router')
+                        OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'deepinfra%'
+                        OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'openai%'
+                        OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'execute_%'
+                        OR (SELECT s.step_name FROM spans s WHERE s.trace_id = t.trace_id LIMIT 1) LIKE 'inspect_%'
+                    )
                 )
             )"""
         ]
@@ -290,7 +293,10 @@ class MonitoringStore:
 
                     # Strictly require a real user query: if empty or starts with "Execution of", it's an internal step
                     if not q:
-                        continue
+                        if d.get("error_count", 0) > 0:
+                            q = tags.get("query") or tags.get("objective") or tags.get("investigation_id") or d.get("request_id") or "Failed Investigation"
+                        else:
+                            continue
 
                     q_lower = q.lower().strip()
                     if (

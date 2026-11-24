@@ -86,12 +86,13 @@ class TraceSpanContext:
 
         if exc_val is not None:
             self.status = SpanStatus.ERROR.value
-            self.error = {
-                "type": exc_type.__name__ if exc_type else "Exception",
-                "message": str(exc_val),
-                "traceback": traceback.format_exc(),
-            }
-        else:
+            if not self.error:
+                self.error = {
+                    "type": exc_type.__name__ if exc_type else "Exception",
+                    "message": str(exc_val),
+                    "traceback": traceback.format_exc(),
+                }
+        elif self.status != SpanStatus.ERROR.value and not self.error:
             self.status = SpanStatus.SUCCESS.value
 
         try:

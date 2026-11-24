@@ -2,10 +2,14 @@ import os
 import sys
 from pathlib import Path
 
-_ENGINE_DIR = (Path(__file__).resolve().parent.parent / "analyzerEngine").resolve()
+_SERVER_DIR = Path(__file__).resolve().parent.parent.resolve()
+_ENGINE_DIR = (_SERVER_DIR / "analyzerEngine").resolve()
 
 def _env_or_default(env_var: str, default: Path) -> str:
     return os.environ.get(env_var) or str(default.resolve())
+
+if str(_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVER_DIR))
 
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
