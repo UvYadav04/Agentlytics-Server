@@ -28,6 +28,9 @@ services:
       - "8000:8000"
     volumes:
       - ./traces:/app/traces
+      - ./shared:/app/shared
+      - ./api_service:/app/api_service
+      - ./monitoring:/app/monitoring
     depends_on:
       - redis
 
@@ -56,6 +59,10 @@ services:
       - memory_data:/data/memory
       - sandbox_sockets:/data/sandbox_sockets
       - ./traces:/app/traces
+      - ./shared:/app/shared
+      - ./analyzerEngine:/app/analyzerEngine
+      - ./worker_service:/app/worker_service
+      - ./monitoring:/app/monitoring
     depends_on:
       - redis
 
