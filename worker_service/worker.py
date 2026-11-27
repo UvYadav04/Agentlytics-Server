@@ -40,6 +40,20 @@ async def _poll_queue_size():
         await asyncio.sleep(15)
 
 
+async def _warm_vector_store(vector_store: ChromaVectorStore) -> None:
+    warm_start = time.perf_counter()
+    try:
+        await asyncio.to_thread(vector_store.warmup)
+        logging.getLogger("worker").info(
+            "vector store warmed in %.1fms", (time.perf_counter() - warm_start) * 1000,
+        )
+    except Exception:
+        logging.getLogger("worker").exception(
+            "failed to warm vector store at startup - continuing without it; "
+            "vector operations will retry connecting on demand"
+        )
+
+
 async def on_startup(ctx):
     try:
         await ensure_indexes()
@@ -75,6 +89,8 @@ async def on_startup(ctx):
         )
         raise
 
+    ctx["vector_store_warm_task"] = asyncio.create_task(_warm_vector_store(ctx["vector_store"]))
+
     warm_start = time.perf_counter()
     try:
         await asyncio.to_thread(sandbox_manager.warm_pool)
@@ -92,9 +108,10 @@ async def on_startup(ctx):
 
 
 async def on_shutdown(ctx):
-    poll_task = ctx.get("queue_size_poll_task")
-    if poll_task is not None:
-        poll_task.cancel()
+    for task_key in ("queue_size_poll_task", "vector_store_warm_task"):
+        task = ctx.get(task_key)
+        if task is not None:
+            task.cancel()
     sandbox_manager = ctx.get("sandbox_manager")
     if sandbox_manager is not None:
         await asyncio.to_thread(sandbox_manager.shutdown_all)
