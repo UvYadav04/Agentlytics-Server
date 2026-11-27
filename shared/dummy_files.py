@@ -7,6 +7,7 @@ from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
 from shared.models.workspace import COLLECTION as WORKSPACES
 from shared.redis_client import get_arq_pool
+from shared.workspace_cache import invalidate_file_catalog
 
 logger = logging.getLogger("shared.dummy_files")
 
@@ -77,3 +78,4 @@ async def mark_real_upload(db, workspace_id: str) -> None:
     )
     if result.modified_count:
         await db[FILES].delete_many({"workspace_id": workspace_id, "dummy": True})
+        await invalidate_file_catalog(workspace_id)

@@ -43,6 +43,7 @@ from shared.chat_summary import generate_chat_summary
 from api_service.light_investigation import schedule_light_response
 from shared.admin import is_admin_email
 from shared.job_timing import now_iso
+from shared.workspace_cache import invalidate_file_catalog
 from shared.models.base import utcnow
 from shared.redis_client import get_arq_pool, get_redis, investigation_answer_key, investigation_channel
 from shared.storage import delete_object, presign_get
@@ -365,6 +366,7 @@ async def delete_chat(chat_id: str, user: User = Depends(get_current_user)):
                     except Exception:
                         pass
             await db[FILES].delete_many({"_id": {"$in": list(orphaned_file_ids)}})
+            await invalidate_file_catalog(chat.workspace_id)
 
     await db[INVESTIGATIONS].delete_many({"chat_id": chat_id})
     await db[QUERY_SHADOW_LOGS].delete_many({"chat_id": chat_id})

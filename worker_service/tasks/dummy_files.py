@@ -15,6 +15,7 @@ from shared.dummy_files import DUMMY_FILES, TEMPLATE_WORKSPACE_ID, dummy_file_id
 from shared.job_timing import log_job_finished, log_job_picked_up
 from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
+from shared.workspace_cache import invalidate_file_catalog
 
 logger = logging.getLogger("worker.dummy_files")
 
@@ -140,6 +141,8 @@ async def clone_dummy_files(ctx, workspace_id: str, requested_at: str | None = N
             except DuplicateKeyError:
                 continue
 
+        if cloned:
+            await invalidate_file_catalog(workspace_id)
         logger.info("clone_dummy_files: cloned %d/%d sample file(s) into workspace %s",
                     cloned, len(DUMMY_FILES), workspace_id)
         status_for_log = "success"

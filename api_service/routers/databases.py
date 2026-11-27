@@ -19,6 +19,7 @@ from shared.models.database_connection import (
 from shared.models.user import User
 from shared.redis_client import get_redis
 from shared.secret_box import SecretBoxError, decrypt_secret, encrypt_secret
+from shared.workspace_cache import invalidate_db_summaries
 
 logger = logging.getLogger("api.databases")
 
@@ -150,6 +151,7 @@ async def _expire_if_needed(connection: DatabaseConnection) -> DatabaseConnectio
         {"_id": connection.id},
         {"$set": {"encrypted_connection_string": None, "status": "expired", "updated_at": utcnow()}},
     )
+    await invalidate_db_summaries(connection.workspace_id)
     return connection.model_copy(update={"encrypted_connection_string": None, "status": "expired"})
 
 
@@ -185,6 +187,7 @@ async def _save_inspection(
         updates["remember"] = effective_remember
         updates["expires_at"] = expiry_for(effective_remember, now)
     await get_db()[DATABASE_CONNECTIONS].update_one({"_id": connection.id}, {"$set": updates})
+    await invalidate_db_summaries(connection.workspace_id)
     return connection.model_copy(update=updates)
 
 
@@ -262,6 +265,7 @@ async def create_connection(workspace_id: str, body: CreateConnectionRequest, us
         updated_at=now,
     )
     await get_db()[DATABASE_CONNECTIONS].insert_one(connection.to_mongo())
+    await invalidate_db_summaries(workspace_id)
     logger.info(
         "database connection saved: id=%s workspace=%s db_type=%s host=%s remember=%s",
         connection.id, workspace_id, body.db_type, parsed.host_label, body.remember,
@@ -293,6 +297,7 @@ async def refresh_schema(connection_id: str, user: User = Depends(get_current_us
             {"_id": connection.id},
             {"$set": {"status": "failed", "last_error": str(exc), "last_tested_at": now, "updated_at": now}},
         )
+        await invalidate_db_summaries(connection.workspace_id)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from None
     return _detail(await _save_inspection(connection, parsed, result, None, None))
 
@@ -327,6 +332,7 @@ async def update_connection(connection_id: str, body: UpdateConnectionRequest, u
     if updates:
         updates["updated_at"] = utcnow()
         await get_db()[DATABASE_CONNECTIONS].update_one({"_id": connection.id}, {"$set": updates})
+        await invalidate_db_summaries(connection.workspace_id)
         connection = connection.model_copy(update=updates)
     return _out(connection)
 
@@ -335,5 +341,6 @@ async def update_connection(connection_id: str, body: UpdateConnectionRequest, u
 async def delete_connection(connection_id: str, user: User = Depends(get_current_user)):
     connection = await get_owned_connection(connection_id, user)
     await get_db()[DATABASE_CONNECTIONS].delete_one({"_id": connection.id})
+    await invalidate_db_summaries(connection.workspace_id)
     logger.info("database connection deleted: id=%s workspace=%s", connection.id, connection.workspace_id)
     return {"ok": True}

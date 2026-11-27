@@ -16,6 +16,7 @@ from shared.models.file import COLLECTION as FILES
 from shared.models.file import File
 from shared.storage import delete_object, get_bucket_name, get_s3_client
 from shared.upload_limits import describe_limit, max_size_bytes
+from shared.workspace_cache import invalidate_file_catalog
 
 logger = logging.getLogger("worker.ingestion")
 
@@ -124,6 +125,7 @@ async def purge_file_artifacts(ctx, workspace_id: str, file_id: str, cleanup: di
     for ref in {r for r in refs if r}:
         _delete_parquet_output(storage, workspace_id, ref)
     await _clear_vectors(ctx["vector_store"], file_id)
+    await invalidate_file_catalog(workspace_id)
     logger.info("purge_file_artifacts: cleaned %d parquet output(s) and vectors for deleted file %s", len(refs), file_id)
 
 
@@ -173,6 +175,8 @@ async def _rollback_batch_siblings(ctx, db, file: File) -> list[str]:
             sibling.id, sibling.filename, file.batch_id, file.id,
         )
 
+    if rolled_back:
+        await invalidate_file_catalog(file.workspace_id)
     return rolled_back
 
 
@@ -285,6 +289,7 @@ async def run_ingestion(ctx, file_id: str, requested_at: str | None = None) -> N
             "previous_columns": None,
         }
         await db[FILES].update_one({"_id": file.id}, {"$set": update})
+        await invalidate_file_catalog(file.workspace_id)
         logger.info("ingestion complete for file %s (status=%s)", file.id, result.status)
         status_for_log = result.status
         if has_previous:

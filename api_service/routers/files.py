@@ -26,6 +26,7 @@ from shared.storage import (
     presign_put,
 )
 from shared.upload_limits import describe_limit, is_supported_upload_extension, max_size_bytes
+from shared.workspace_cache import invalidate_file_catalog
 
 logger = logging.getLogger("api.files")
 
@@ -368,6 +369,7 @@ async def replace_file_confirm(file_id: str, user: User = Depends(get_current_us
     update = _reingest_update(file)
     update.update({"previous_storage_key": None, "replace_backup": None})
     await get_db()[FILES].update_one({"_id": file.id}, {"$set": update})
+    await invalidate_file_catalog(file.workspace_id)
     for key, value in update.items():
         setattr(file, key, value)
 
@@ -400,6 +402,7 @@ async def patch_csv_file(file_id: str, body: PatchCsvRequest, user: User = Depen
     update = _reingest_update(file)
     update["size_bytes"] = len(data)
     await get_db()[FILES].update_one({"_id": file.id}, {"$set": update})
+    await invalidate_file_catalog(file.workspace_id)
     for key, value in update.items():
         setattr(file, key, value)
 
@@ -451,6 +454,7 @@ async def rename_file(file_id: str, body: RenameFileRequest, user: User = Depend
     if len(name) > MAX_FILENAME_LENGTH:
         raise HTTPException(status_code=400, detail=f"File names can be at most {MAX_FILENAME_LENGTH} characters.")
     await get_db()[FILES].update_one({"_id": file.id}, {"$set": {"filename": name}})
+    await invalidate_file_catalog(file.workspace_id)
     file.filename = name
     return _out(file)
 
@@ -630,6 +634,7 @@ async def delete_file(file_id: str, user: User = Depends(get_current_user)):
 
     cleanup = _cleanup_snapshot(file)
     await get_db()[FILES].delete_one({"_id": file.id})
+    await invalidate_file_catalog(file.workspace_id)
     if cleanup:
         try:
             pool = await get_arq_pool()

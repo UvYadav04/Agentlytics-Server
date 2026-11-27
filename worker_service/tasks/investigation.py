@@ -33,6 +33,7 @@ from arq import Retry
 
 from shared import intent_router
 from shared import usage
+from shared.workspace_cache import get_cached_file_catalog, set_cached_file_catalog
 from shared.db import get_db
 from shared.job_timing import log_job_finished, log_job_picked_up, now_iso
 from shared.models.chart import COLLECTION as CHARTS
@@ -94,7 +95,59 @@ def _artifact_exists(storage: LocalParquetStore, workspace_id: str, file_id: str
     return storage.exists(path)
 
 
+def _serialize_catalog_entry(entry: FileCatalogEntry) -> dict:
+    uploaded_at = entry.uploaded_at
+    if isinstance(uploaded_at, datetime):
+        uploaded_str = uploaded_at.isoformat()
+    else:
+        uploaded_str = str(uploaded_at) if uploaded_at is not None else _now().isoformat()
+    return {
+        "file_id": entry.file_id,
+        "filename": entry.filename,
+        "file_type": entry.file_type,
+        "uploaded_at": uploaded_str,
+        "size_bytes": entry.size_bytes,
+        "output_ref": entry.output_ref,
+        "row_count": entry.row_count,
+        "page_count": entry.page_count,
+        "columns": entry.columns,
+        "tags": entry.tags,
+    }
+
+
+def _deserialize_catalog_entry(data: dict) -> FileCatalogEntry:
+    uploaded_raw = data.get("uploaded_at")
+    try:
+        uploaded_at = datetime.fromisoformat(uploaded_raw) if uploaded_raw else _now()
+    except (TypeError, ValueError):
+        uploaded_at = _now()
+    return FileCatalogEntry(
+        file_id=data["file_id"],
+        filename=data["filename"],
+        file_type=data["file_type"],
+        uploaded_at=uploaded_at,
+        size_bytes=data.get("size_bytes") or 0,
+        output_ref=data.get("output_ref") or "",
+        row_count=data.get("row_count"),
+        page_count=data.get("page_count"),
+        columns=data.get("columns"),
+        tags=data.get("tags"),
+    )
+
+
 async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> tuple[FileCatalog, list[str]]:
+    cached = await get_cached_file_catalog(workspace_id)
+    if cached is not None:
+        catalog = FileCatalog()
+        for item in cached:
+            try:
+                catalog.add_entry(_deserialize_catalog_entry(item))
+            except (KeyError, TypeError):
+                logger.warning("_build_catalog: invalid cached entry for workspace=%s; rebuilding", workspace_id)
+                catalog = None
+                break
+        if catalog is not None:
+            return catalog, []
 
     catalog = FileCatalog()
     stale_ids: list[str] = []
@@ -162,6 +215,12 @@ async def _build_catalog(db, workspace_id: str, storage: LocalParquetStore) -> t
         ))
         for entry in table_entries:
             catalog.add_entry(entry)
+
+    if not skipped_filenames:
+        await set_cached_file_catalog(
+            workspace_id,
+            [_serialize_catalog_entry(entry) for entry in catalog.all()],
+        )
 
     return catalog, skipped_filenames
 
